@@ -236,13 +236,16 @@ detect_telemt() {
             _inspect=$(docker inspect "$_cname" 2>/dev/null) || continue
 
             local _is_telemt=false
-            if echo "$_inspect" | grep -qiE '"Image".*telemt' | grep -viE 'panel'; then
+
+            # Проверяем образ, команду, маунты — исключая panel
+            local _inspect_no_panel
+            _inspect_no_panel=$(echo "$_inspect" | grep -viE 'panel')
+
+            if echo "$_inspect_no_panel" | grep -qiE '"Image".*telemt'; then
                 _is_telemt=true
-            fi
-            if [ "$_is_telemt" = "false" ] && echo "$_inspect" | grep -qiE 'telemt\.toml|telemt/telemt' | grep -viE 'panel'; then
+            elif echo "$_inspect_no_panel" | grep -qiE 'telemt\.toml|telemt/telemt'; then
                 _is_telemt=true
-            fi
-            if [ "$_is_telemt" = "false" ] && echo "$_inspect" | grep -qiE '"Cmd".*telemt' | grep -viE 'panel'; then
+            elif echo "$_inspect_no_panel" | grep -qiE '"Cmd".*telemt'; then
                 _is_telemt=true
             fi
 
