@@ -178,6 +178,21 @@ _toml_safe_set() {
 }
 
 # ── Обнаружение Telemt ────────────────────────────────────────
+# Пути которые НЕ являются конфигом telemt
+_is_excluded_path() {
+    local _path="$1"
+    case "$_path" in
+        *telemt-panel*|*telemt_panel*) return 0 ;;
+    esac
+    return 1
+}
+
+# Проверяет что файл похож на конфиг telemt
+_looks_like_telemt_config() {
+    local _file="$1"
+    [ -f "$_file" ] || return 1
+    grep -qE '^\[access\.users\]|^\[censorship\]|^\[general\.modes\]|^tls_domain[[:space:]]*=' "$_file" 2>/dev/null
+}
 
 detect_telemt() {
     DETECTED_MODE="unknown"
@@ -186,24 +201,6 @@ detect_telemt() {
     DETECTED_IP=""
     DETECTED_PORT=""
     DETECTED_NETWORK_MODE=""
-
-    # Пути которые НЕ являются конфигом telemt
-    # telemt-panel — отдельный продукт со своим config.toml
-    _is_excluded_path() {
-        local _path="$1"
-        case "$_path" in
-            *telemt-panel*|*telemt_panel*) return 0 ;;
-        esac
-        return 1
-    }
-
-    # Проверяет что файл похож на конфиг telemt (есть [access.users] или [server] с port)
-    _looks_like_telemt_config() {
-        local _file="$1"
-        [ -f "$_file" ] || return 1
-        # Должен содержать хотя бы одну из ключевых секций telemt
-        grep -qE '^\[access\.users\]|^\[censorship\]|^\[general\.modes\]|^tls_domain[[:space:]]*=' "$_file" 2>/dev/null
-    }
 
     # 1. MTProxyMax
     if [ -f /opt/mtproxymax/settings.conf ] && command -v mtproxymax &>/dev/null; then
