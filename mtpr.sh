@@ -6,7 +6,7 @@
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
