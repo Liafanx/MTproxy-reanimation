@@ -356,65 +356,6 @@ detect_telemt() {
     return 1
 }
 
-    # 3. Локальный процесс telemt (systemd / ручной запуск)
-    if pgrep -x telemt &>/dev/null || systemctl is-active telemt.service &>/dev/null 2>&1; then
-        DETECTED_MODE="local"
-        DETECTED_NETWORK_MODE="host"
-
-        # Ищем конфиг из аргументов процесса
-        local _args
-        _args=$(ps -eo args 2>/dev/null | grep -m1 '[t]elemt' | grep -oE '/[^ ]+\.toml' | head -1)
-        if [ -n "$_args" ] && [ -f "$_args" ]; then
-            DETECTED_CONFIG_PATH="$_args"
-        fi
-
-        # Перебираем стандартные пути если не нашли
-        if [ -z "$DETECTED_CONFIG_PATH" ]; then
-            local _cf
-            for _cf in \
-                /etc/telemt/telemt.toml \
-                /etc/telemt/config.toml \
-                /etc/telemt.toml \
-                /opt/telemt/config.toml \
-                /opt/telemt/telemt.toml; do
-                if [ -f "$_cf" ]; then
-                    DETECTED_CONFIG_PATH="$_cf"
-                    break
-                fi
-            done
-        fi
-
-        if [ -f "$DETECTED_CONFIG_PATH" ]; then
-            local _p
-            _p=$(_toml_get_value "port" "$DETECTED_CONFIG_PATH")
-            [ -n "$_p" ] && DETECTED_PORT="$_p"
-        fi
-        return 0
-    fi
-
-    # 4. Только конфиг (процесс не запущен, но файлы есть)
-    local _cf
-    for _cf in \
-        /etc/telemt/telemt.toml \
-        /etc/telemt/config.toml \
-        /etc/telemt.toml \
-        /opt/telemt/config.toml \
-        /opt/telemt/telemt.toml \
-        /opt/mtproxymax/mtproxy/config.toml; do
-        if [ -f "$_cf" ]; then
-            DETECTED_CONFIG_PATH="$_cf"
-            DETECTED_MODE="config_only"
-            DETECTED_NETWORK_MODE="host"
-            local _p
-            _p=$(_toml_get_value "port" "$_cf")
-            [ -n "$_p" ] && DETECTED_PORT="$_p"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
 detect_public_ip() {
     local _ip=""
     _ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null) ||
