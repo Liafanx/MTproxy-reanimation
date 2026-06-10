@@ -8,5 +8,6 @@ mkdir -p /opt/mtproxy-reanimation
 curl -fsSL "$SCRIPT_URL" -o /opt/mtproxy-reanimation/mtpr.sh
 chmod +x /opt/mtproxy-reanimation/mtpr.sh
 ln -sf /opt/mtproxy-reanimation/mtpr.sh /usr/local/bin/mtpr
-echo "MTproxy-reanimation установлен. Запуск: mtpr"
-mtpr
+echo "MTproxy-reanimation установлен."
+# Запускаем скрипт с stdin от терминала
+exec /opt/mtproxy-reanimation/mtpr.sh </dev/tty
