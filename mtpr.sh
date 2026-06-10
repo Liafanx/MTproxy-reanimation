@@ -12,7 +12,7 @@ SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
 SYSTEMD_UNIT="mtpr-syn-limit.service"
 
-# ── Colors ────────────────────────────────────────────────────
+# ── Цвета ─────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -22,15 +22,14 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-# ── Default settings ─────────────────────────────────────────
-DETECTED_MODE=""          # mtproxymax / docker / local / unknown
-DETECTED_CONTAINER=""     # container name if docker
-DETECTED_CONFIG_PATH=""   # path to config.toml
+# ── Настройки по умолчанию ────────────────────────────────────
+DETECTED_MODE=""
+DETECTED_CONTAINER=""
+DETECTED_CONFIG_PATH=""
 DETECTED_IP=""
 DETECTED_PORT=""
-DETECTED_NETWORK_MODE=""  # host / bridge
+DETECTED_NETWORK_MODE=""
 
-# User settings (saved to settings.conf)
 SERVER_IP=""
 SERVER_PORT=""
 NFT_RATE="1/second"
@@ -44,33 +43,45 @@ TUNING_CLIENT_KEEPALIVE="60"
 TUNING_APPLIED="false"
 NFT_SERVICE_ENABLED="false"
 
-# Additional rules: RULE_<N>_PORT, RULE_<N>_IP, RULE_<N>_RATE, etc.
 declare -A EXTRA_RULES_PORT
 declare -A EXTRA_RULES_IP
 declare -A EXTRA_RULES_RATE
 declare -A EXTRA_RULES_BURST
 EXTRA_RULES_COUNT=0
 
-# ── Logging ───────────────────────────────────────────────────
+# ── Логирование ───────────────────────────────────────────────
 log_info()    { echo -e "  ${BLUE}[i]${NC} $1"; }
 log_success() { echo -e "  ${GREEN}[✓]${NC} $1"; }
 log_warn()    { echo -e "  ${YELLOW}[!]${NC} $1" >&2; }
 log_error()   { echo -e "  ${RED}[✗]${NC} $1" >&2; }
 
-# ── Root check ────────────────────────────────────────────────
+# ── Проверка root ─────────────────────────────────────────────
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        log_error "Must be run as root"
+        log_error "Требуются права root"
         exit 1
     fi
 }
 
-# ── Save / Load settings ─────────────────────────────────────
+# ── Вспомогательная функция для чтения ввода ──────────────────
+# Решает проблему с конфликтом переменных при read
+_read_input() {
+    local _prompt="$1" _default="$2" _result
+    echo -en "$_prompt"
+    read -r _result
+    if [ -z "$_result" ]; then
+        echo "$_default"
+    else
+        echo "$_result"
+    fi
+}
+
+# ── Сохранение / Загрузка настроек ────────────────────────────
 save_settings() {
     mkdir -p "$INSTALL_DIR"
     cat > "$SETTINGS_FILE" << EOF
-# MTproxy-reanimation settings — v${VERSION}
-# Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+# MTproxy-reanimation — настройки v${VERSION}
+# Создано: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 SERVER_IP='${SERVER_IP}'
 SERVER_PORT='${SERVER_PORT}'
 NFT_RATE='${NFT_RATE}'
@@ -85,13 +96,13 @@ TUNING_APPLIED='${TUNING_APPLIED}'
 NFT_SERVICE_ENABLED='${NFT_SERVICE_ENABLED}'
 EXTRA_RULES_COUNT='${EXTRA_RULES_COUNT}'
 EOF
-    local i
-    for i in $(seq 1 "$EXTRA_RULES_COUNT"); do
+    local _i
+    for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
         cat >> "$SETTINGS_FILE" << EOF
-EXTRA_RULES_${i}_PORT='${EXTRA_RULES_PORT[$i]:-}'
-EXTRA_RULES_${i}_IP='${EXTRA_RULES_IP[$i]:-}'
-EXTRA_RULES_${i}_RATE='${EXTRA_RULES_RATE[$i]:-1/second}'
-EXTRA_RULES_${i}_BURST='${EXTRA_RULES_BURST[$i]:-1}'
+EXTRA_RULES_${_i}_PORT='${EXTRA_RULES_PORT[$_i]:-}'
+EXTRA_RULES_${_i}_IP='${EXTRA_RULES_IP[$_i]:-}'
+EXTRA_RULES_${_i}_RATE='${EXTRA_RULES_RATE[$_i]:-1/second}'
+EXTRA_RULES_${_i}_BURST='${EXTRA_RULES_BURST[$_i]:-1}'
 EOF
     done
     chmod 600 "$SETTINGS_FILE"
@@ -99,33 +110,33 @@ EOF
 
 load_settings() {
     [ -f "$SETTINGS_FILE" ] || return 0
-    while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-        if [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=\'([^\']*)\'$ ]]; then
-            local key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
-            case "$key" in
+    while IFS= read -r _line; do
+        [[ "$_line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$_line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$_line" =~ ^([A-Z_][A-Z0-9_]*)=\'([^\']*)\'$ ]]; then
+            local _key="${BASH_REMATCH[1]}" _val="${BASH_REMATCH[2]}"
+            case "$_key" in
                 SERVER_IP|SERVER_PORT|NFT_RATE|NFT_BURST|NFT_METER_TIMEOUT|\
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
                 EXTRA_RULES_COUNT)
-                    printf -v "$key" '%s' "$val"
+                    printf -v "$_key" '%s' "$_val"
                     ;;
                 EXTRA_RULES_*_PORT)
-                    local idx="${key#EXTRA_RULES_}"; idx="${idx%_PORT}"
-                    EXTRA_RULES_PORT[$idx]="$val"
+                    local _idx="${_key#EXTRA_RULES_}"; _idx="${_idx%_PORT}"
+                    EXTRA_RULES_PORT[$_idx]="$_val"
                     ;;
                 EXTRA_RULES_*_IP)
-                    local idx="${key#EXTRA_RULES_}"; idx="${idx%_IP}"
-                    EXTRA_RULES_IP[$idx]="$val"
+                    local _idx="${_key#EXTRA_RULES_}"; _idx="${_idx%_IP}"
+                    EXTRA_RULES_IP[$_idx]="$_val"
                     ;;
                 EXTRA_RULES_*_RATE)
-                    local idx="${key#EXTRA_RULES_}"; idx="${idx%_RATE}"
-                    EXTRA_RULES_RATE[$idx]="$val"
+                    local _idx="${_key#EXTRA_RULES_}"; _idx="${_idx%_RATE}"
+                    EXTRA_RULES_RATE[$_idx]="$_val"
                     ;;
                 EXTRA_RULES_*_BURST)
-                    local idx="${key#EXTRA_RULES_}"; idx="${idx%_BURST}"
-                    EXTRA_RULES_BURST[$idx]="$val"
+                    local _idx="${_key#EXTRA_RULES_}"; _idx="${_idx%_BURST}"
+                    EXTRA_RULES_BURST[$_idx]="$_val"
                     ;;
             esac
         fi
@@ -133,7 +144,7 @@ load_settings() {
     [[ "$EXTRA_RULES_COUNT" =~ ^[0-9]+$ ]] || EXTRA_RULES_COUNT=0
 }
 
-# ── Detection ─────────────────────────────────────────────────
+# ── Обнаружение Telemt ────────────────────────────────────────
 
 detect_telemt() {
     DETECTED_MODE="unknown"
@@ -143,19 +154,16 @@ detect_telemt() {
     DETECTED_PORT=""
     DETECTED_NETWORK_MODE=""
 
-    # 1. Check MTProxyMax
+    # 1. MTProxyMax
     if [ -f /opt/mtproxymax/settings.conf ] && command -v mtproxymax &>/dev/null; then
         DETECTED_MODE="mtproxymax"
         DETECTED_CONFIG_PATH="/opt/mtproxymax/mtproxy/config.toml"
-        # Extract port from MTProxyMax settings
         local _port
         _port=$(awk -F"'" '/^PROXY_PORT=/{print $2; exit}' /opt/mtproxymax/settings.conf 2>/dev/null)
         [ -n "$_port" ] && DETECTED_PORT="$_port"
-        # Extract custom IP
         local _ip
         _ip=$(awk -F"'" '/^CUSTOM_IP=/{print $2; exit}' /opt/mtproxymax/settings.conf 2>/dev/null)
         [ -n "$_ip" ] && DETECTED_IP="$_ip"
-        # Check container network mode
         if docker inspect -f '{{.HostConfig.NetworkMode}}' mtproxymax 2>/dev/null | grep -q "host"; then
             DETECTED_NETWORK_MODE="host"
         else
@@ -165,28 +173,23 @@ detect_telemt() {
         return 0
     fi
 
-    # 2. Check Docker containers with telemt
+    # 2. Docker-контейнер с telemt
     if command -v docker &>/dev/null; then
-        local cname
-        for cname in $(docker ps --format '{{.Names}}' 2>/dev/null); do
-            # Check if container runs telemt binary
-            if docker inspect "$cname" 2>/dev/null | grep -qiE '"telemt|telemt.toml'; then
+        local _cname
+        for _cname in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+            if docker inspect "$_cname" 2>/dev/null | grep -qiE '"telemt|telemt.toml'; then
                 DETECTED_MODE="docker"
-                DETECTED_CONTAINER="$cname"
-                # Try to find config path
+                DETECTED_CONTAINER="$_cname"
                 local _mount
-                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$cname" 2>/dev/null)
+                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
                 [ -n "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
-                # Check for config dir mount
                 if [ -z "$DETECTED_CONFIG_PATH" ]; then
-                    _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt"}}{{.Source}}{{end}}{{end}}' "$cname" 2>/dev/null)
+                    _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
                     [ -n "$_mount" ] && [ -f "${_mount}/config.toml" ] && DETECTED_CONFIG_PATH="${_mount}/config.toml"
                 fi
-                # Network mode
                 local _nm
-                _nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cname" 2>/dev/null)
+                _nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$_cname" 2>/dev/null)
                 DETECTED_NETWORK_MODE="${_nm:-bridge}"
-                # Extract port from config
                 if [ -f "$DETECTED_CONFIG_PATH" ]; then
                     local _p
                     _p=$(awk '/^\[server\]/,/^\[/' "$DETECTED_CONFIG_PATH" 2>/dev/null | awk '/^port[[:space:]]*=/{gsub(/[^0-9]/,"",$NF); print $NF; exit}')
@@ -197,11 +200,10 @@ detect_telemt() {
         done
     fi
 
-    # 3. Check local telemt process
+    # 3. Локальный процесс telemt
     if pgrep -x telemt &>/dev/null; then
         DETECTED_MODE="local"
         DETECTED_NETWORK_MODE="host"
-        # Try to find config from process args
         local _args
         _args=$(ps -eo args 2>/dev/null | grep -m1 '[t]elemt' | grep -oE '/[^ ]+\.toml')
         if [ -n "$_args" ] && [ -f "$_args" ]; then
@@ -219,7 +221,7 @@ detect_telemt() {
         return 0
     fi
 
-    # 4. Check common config paths even if no process found
+    # 4. Поиск конфигов
     local _cf
     for _cf in /etc/telemt.toml /etc/telemt/config.toml /opt/telemt/config.toml /opt/mtproxymax/mtproxy/config.toml; do
         if [ -f "$_cf" ]; then
@@ -236,103 +238,98 @@ detect_telemt() {
     return 1
 }
 
-# Detect public IP
 detect_public_ip() {
-    local ip=""
-    ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null) ||
-    ip=$(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null) ||
-    ip=$(curl -4 -fsS --max-time 5 https://icanhazip.com 2>/dev/null) ||
-    ip=""
-    echo "$ip"
+    local _ip=""
+    _ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null) ||
+    _ip=$(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null) ||
+    _ip=$(curl -4 -fsS --max-time 5 https://icanhazip.com 2>/dev/null) ||
+    _ip=""
+    echo "$_ip"
 }
 
-# Read current tuning values from config.toml
 read_config_value() {
-    local key="$1" file="$2"
-    [ -f "$file" ] || return 0
-    awk -v k="$key" '$1==k && $2=="=" {gsub(/[^0-9]/,"",$3); print $3; exit}' "$file" 2>/dev/null
+    local _key="$1" _file="$2"
+    [ -f "$_file" ] || return 0
+    awk -v k="$_key" '$1==k && $2=="=" {gsub(/[^0-9]/,"",$3); print $3; exit}' "$_file" 2>/dev/null
 }
 
-# ── Dependencies ──────────────────────────────────────────────
+# ── Зависимости ──────────────────────────────────────────────
 
 install_dependencies() {
-    log_info "Checking dependencies..."
-    local missing=()
-    command -v nft &>/dev/null || missing+=("nftables")
-    command -v curl &>/dev/null || missing+=("curl")
+    log_info "Проверка зависимостей..."
+    local _missing=()
+    command -v nft &>/dev/null || _missing+=("nftables")
+    command -v curl &>/dev/null || _missing+=("curl")
 
-    if [ ${#missing[@]} -gt 0 ]; then
-        log_info "Installing: ${missing[*]}"
+    if [ ${#_missing[@]} -gt 0 ]; then
+        log_info "Установка: ${_missing[*]}"
         if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y -qq "${missing[@]}"
+            apt-get update -qq && apt-get install -y -qq "${_missing[@]}"
         elif command -v yum &>/dev/null; then
-            yum install -y -q "${missing[@]}"
+            yum install -y -q "${_missing[@]}"
         elif command -v dnf &>/dev/null; then
-            dnf install -y -q "${missing[@]}"
+            dnf install -y -q "${_missing[@]}"
         elif command -v apk &>/dev/null; then
-            apk add --no-cache "${missing[@]}"
+            apk add --no-cache "${_missing[@]}"
         else
-            log_error "Cannot install ${missing[*]} — install manually"
+            log_error "Не удалось установить ${_missing[*]} — установите вручную"
             return 1
         fi
     fi
-    log_success "Dependencies OK"
+    log_success "Зависимости в порядке"
 }
 
-# ── Telemt Tuning ─────────────────────────────────────────────
+# ── Тюнинг Telemt ─────────────────────────────────────────────
 
 apply_tuning() {
-    log_info "Applying Telemt tuning..."
+    log_info "Применение тюнинга Telemt..."
 
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
-        log_info "Mode: MTProxyMax — using mtproxymax tune commands"
-        local changed=false
+        log_info "Режим: MTProxyMax — используем команды mtproxymax tune"
+        local _changed=false
 
-        # tg_connect
         local _cur
         _cur=$(mtproxymax tune get tg_connect 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
         if [ "$_cur" != "$TUNING_TG_CONNECT" ]; then
             echo "n" | mtproxymax tune set tg_connect "$TUNING_TG_CONNECT" &>/dev/null || true
-            changed=true
+            _changed=true
             log_success "tg_connect = $TUNING_TG_CONNECT"
         else
-            log_info "tg_connect already $TUNING_TG_CONNECT"
+            log_info "tg_connect уже $TUNING_TG_CONNECT"
         fi
 
-        # client_handshake
         _cur=$(mtproxymax tune get client_handshake 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
         if [ "$_cur" != "$TUNING_CLIENT_HANDSHAKE" ]; then
             echo "n" | mtproxymax tune set client_handshake "$TUNING_CLIENT_HANDSHAKE" &>/dev/null || true
-            changed=true
+            _changed=true
             log_success "client_handshake = $TUNING_CLIENT_HANDSHAKE"
         else
-            log_info "client_handshake already $TUNING_CLIENT_HANDSHAKE"
+            log_info "client_handshake уже $TUNING_CLIENT_HANDSHAKE"
         fi
 
-        # client_keepalive
         _cur=$(mtproxymax tune get client_keepalive 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
         if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
             echo "n" | mtproxymax tune set client_keepalive "$TUNING_CLIENT_KEEPALIVE" &>/dev/null || true
-            changed=true
+            _changed=true
             log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
         else
-            log_info "client_keepalive already $TUNING_CLIENT_KEEPALIVE"
+            log_info "client_keepalive уже $TUNING_CLIENT_KEEPALIVE"
         fi
 
-        if [ "$changed" = "true" ]; then
-            log_info "Restarting MTProxyMax..."
-            mtproxymax restart &>/dev/null || log_warn "Restart failed"
+        if [ "$_changed" = "true" ]; then
+            log_info "Перезапуск MTProxyMax..."
+            mtproxymax restart &>/dev/null || log_warn "Не удалось перезапустить"
         fi
         TUNING_APPLIED="true"
         save_settings
         return 0
     fi
 
-    # For docker / local — edit config.toml directly
+    # Для docker / local — редактируем config.toml напрямую
     if [ -z "$DETECTED_CONFIG_PATH" ] || [ ! -f "$DETECTED_CONFIG_PATH" ]; then
-        log_warn "Config file not found — cannot apply tuning automatically"
+        log_warn "Файл конфигурации не найден — невозможно применить тюнинг автоматически"
         echo ""
-        echo -e "  ${BOLD}Add these to your config.toml manually:${NC}"
+        echo -e "  ${BOLD}Добавьте в config.toml вручную:${NC}"
         echo ""
         echo "  [general]"
         echo "  tg_connect = $TUNING_TG_CONNECT"
@@ -346,53 +343,50 @@ apply_tuning() {
         return 0
     fi
 
-    local cfg="$DETECTED_CONFIG_PATH"
-    local changed=false
+    local _cfg="$DETECTED_CONFIG_PATH"
+    local _changed=false
 
-    # tg_connect is in [general] or [timeouts] depending on version
     local _cur
-    _cur=$(read_config_value "tg_connect" "$cfg")
+    _cur=$(read_config_value "tg_connect" "$_cfg")
     if [ "$_cur" != "$TUNING_TG_CONNECT" ]; then
-        if grep -qE '^tg_connect[[:space:]]*=' "$cfg"; then
-            sed -i "s/^tg_connect[[:space:]]*=.*/tg_connect = $TUNING_TG_CONNECT/" "$cfg"
+        if grep -qE '^tg_connect[[:space:]]*=' "$_cfg"; then
+            sed -i "s/^tg_connect[[:space:]]*=.*/tg_connect = $TUNING_TG_CONNECT/" "$_cfg"
         else
-            # Add after [general] section
-            sed -i "/^\[general\]/a tg_connect = $TUNING_TG_CONNECT" "$cfg"
+            sed -i "/^\[general\]/a tg_connect = $TUNING_TG_CONNECT" "$_cfg"
         fi
-        changed=true
+        _changed=true
         log_success "tg_connect = $TUNING_TG_CONNECT"
     fi
 
-    _cur=$(read_config_value "client_handshake" "$cfg")
+    _cur=$(read_config_value "client_handshake" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_HANDSHAKE" ]; then
-        if grep -qE '^client_handshake[[:space:]]*=' "$cfg"; then
-            sed -i "s/^client_handshake[[:space:]]*=.*/client_handshake = $TUNING_CLIENT_HANDSHAKE/" "$cfg"
+        if grep -qE '^client_handshake[[:space:]]*=' "$_cfg"; then
+            sed -i "s/^client_handshake[[:space:]]*=.*/client_handshake = $TUNING_CLIENT_HANDSHAKE/" "$_cfg"
         else
-            sed -i "/^\[timeouts\]/a client_handshake = $TUNING_CLIENT_HANDSHAKE" "$cfg"
+            sed -i "/^\[timeouts\]/a client_handshake = $TUNING_CLIENT_HANDSHAKE" "$_cfg"
         fi
-        changed=true
+        _changed=true
         log_success "client_handshake = $TUNING_CLIENT_HANDSHAKE"
     fi
 
-    _cur=$(read_config_value "client_keepalive" "$cfg")
+    _cur=$(read_config_value "client_keepalive" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
-        if grep -qE '^client_keepalive[[:space:]]*=' "$cfg"; then
-            sed -i "s/^client_keepalive[[:space:]]*=.*/client_keepalive = $TUNING_CLIENT_KEEPALIVE/" "$cfg"
+        if grep -qE '^client_keepalive[[:space:]]*=' "$_cfg"; then
+            sed -i "s/^client_keepalive[[:space:]]*=.*/client_keepalive = $TUNING_CLIENT_KEEPALIVE/" "$_cfg"
         else
-            sed -i "/^\[timeouts\]/a client_keepalive = $TUNING_CLIENT_KEEPALIVE" "$cfg"
+            sed -i "/^\[timeouts\]/a client_keepalive = $TUNING_CLIENT_KEEPALIVE" "$_cfg"
         fi
-        changed=true
+        _changed=true
         log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
     fi
 
-    if [ "$changed" = "true" ]; then
-        # Restart container or process
+    if [ "$_changed" = "true" ]; then
         if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
-            log_info "Restarting container $DETECTED_CONTAINER..."
-            docker restart "$DETECTED_CONTAINER" &>/dev/null || log_warn "Container restart failed"
+            log_info "Перезапуск контейнера $DETECTED_CONTAINER..."
+            docker restart "$DETECTED_CONTAINER" &>/dev/null || log_warn "Не удалось перезапустить контейнер"
         elif [ "$DETECTED_MODE" = "local" ]; then
-            log_info "Sending SIGHUP to telemt..."
-            pkill -HUP telemt 2>/dev/null || log_warn "Could not signal telemt"
+            log_info "Отправка SIGHUP процессу telemt..."
+            pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал"
         fi
     fi
 
@@ -400,61 +394,60 @@ apply_tuning() {
     save_settings
 }
 
-# ── NFT Rules ─────────────────────────────────────────────────
+# ── NFT правила ───────────────────────────────────────────────
 
 generate_nft_script() {
-    local ip="${SERVER_IP:-}"
-    local port="${SERVER_PORT:-443}"
-    local rate="${NFT_RATE:-1/second}"
-    local burst="${NFT_BURST:-1}"
-    local timeout="${NFT_METER_TIMEOUT:-60s}"
-    local table="${NFT_TABLE:-telemt_limit}"
-    local hook="${NFT_HOOK:-input}"
+    local _ip="${SERVER_IP:-}"
+    local _port="${SERVER_PORT:-443}"
+    local _rate="${NFT_RATE:-1/second}"
+    local _burst="${NFT_BURST:-1}"
+    local _timeout="${NFT_METER_TIMEOUT:-60s}"
+    local _table="${NFT_TABLE:-telemt_limit}"
+    local _hook="${NFT_HOOK:-input}"
 
     cat > "$NFT_SCRIPT" << NFTEOF
 #!/bin/sh
 set -eu
 
-TABLE="$table"
-CHAIN="$hook"
+TABLE="${_table}"
+CHAIN="${_hook}"
 
 nft delete table inet "\$TABLE" 2>/dev/null || true
 nft add table inet "\$TABLE"
-nft "add chain inet \$TABLE \$CHAIN { type filter hook $hook priority 0; policy accept; }"
+nft "add chain inet \$TABLE \$CHAIN { type filter hook ${_hook} priority 0; policy accept; }"
 
-# Main rule
+# Основное правило
 nft "add rule inet \$TABLE \$CHAIN \\
-$([ -n "$ip" ] && echo "ip daddr $ip " || echo "")tcp dport $port \\
+$([ -n "$_ip" ] && echo "ip daddr ${_ip} " || echo "")tcp dport ${_port} \\
 tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_main { ip saddr timeout $timeout limit rate over $rate burst $burst packets } \\
-counter drop comment \\"mtpr_main_${rate}_burst_${burst}\\""
+meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } \\
+counter drop comment \\"mtpr_main_${_rate}_burst_${_burst}\\""
 
 NFTEOF
 
-    # Add extra rules
-    local i
-    for i in $(seq 1 "$EXTRA_RULES_COUNT"); do
-        local eport="${EXTRA_RULES_PORT[$i]:-}"
-        local eip="${EXTRA_RULES_IP[$i]:-}"
-        local erate="${EXTRA_RULES_RATE[$i]:-1/second}"
-        local eburst="${EXTRA_RULES_BURST[$i]:-1}"
-        [ -z "$eport" ] && continue
+    local _i
+    for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
+        local _eport="${EXTRA_RULES_PORT[$_i]:-}"
+        local _eip="${EXTRA_RULES_IP[$_i]:-}"
+        local _erate="${EXTRA_RULES_RATE[$_i]:-1/second}"
+        local _eburst="${EXTRA_RULES_BURST[$_i]:-1}"
+        [ -z "$_eport" ] && continue
 
         cat >> "$NFT_SCRIPT" << EXTRAEOF
 
-# Extra rule $i — port $eport
+# Доп. правило ${_i} — порт ${_eport}
 nft "add rule inet \$TABLE \$CHAIN \\
-$([ -n "$eip" ] && echo "ip daddr $eip " || echo "")tcp dport $eport \\
+$([ -n "$_eip" ] && echo "ip daddr ${_eip} " || echo "")tcp dport ${_eport} \\
 tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_extra_${i} { ip saddr timeout $timeout limit rate over $erate burst $eburst packets } \\
-counter drop comment \\"mtpr_extra_${i}_${erate}_burst_${eburst}\\""
+meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } \\
+counter drop comment \\"mtpr_extra_${_i}_${_erate}_burst_${_eburst}\\""
 
 EXTRAEOF
     done
 
     cat >> "$NFT_SCRIPT" << 'TAILEOF'
 
-echo "MTproxy-reanimation: nft rules applied"
+echo "MTproxy-reanimation: nft правила применены"
 nft list chain inet "$TABLE" "$CHAIN"
 TAILEOF
 
@@ -464,24 +457,24 @@ TAILEOF
 apply_nft_rules() {
     generate_nft_script
     if /bin/sh "$NFT_SCRIPT"; then
-        log_success "NFT rules applied"
+        log_success "NFT правила применены"
     else
-        log_error "Failed to apply NFT rules"
+        log_error "Не удалось применить NFT правила"
         return 1
     fi
 }
 
 remove_nft_rules() {
-    local table="${NFT_TABLE:-telemt_limit}"
-    nft delete table inet "$table" 2>/dev/null || true
-    log_success "NFT rules removed"
+    local _table="${NFT_TABLE:-telemt_limit}"
+    nft delete table inet "$_table" 2>/dev/null || true
+    log_success "NFT правила удалены"
 }
 
-# ── Systemd Service ───────────────────────────────────────────
+# ── Systemd сервис ────────────────────────────────────────────
 
 install_service() {
     generate_nft_script
-    local table="${NFT_TABLE:-telemt_limit}"
+    local _table="${NFT_TABLE:-telemt_limit}"
 
     cat > "/etc/systemd/system/${SYSTEMD_UNIT}" << SVCEOF
 [Unit]
@@ -492,7 +485,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/bin/sh ${NFT_SCRIPT}
-ExecStop=/bin/sh -c '/usr/sbin/nft delete table inet ${table} 2>/dev/null || true'
+ExecStop=/bin/sh -c '/usr/sbin/nft delete table inet ${_table} 2>/dev/null || true'
 RemainAfterExit=yes
 
 [Install]
@@ -504,7 +497,7 @@ SVCEOF
     systemctl restart "$SYSTEMD_UNIT" 2>/dev/null
     NFT_SERVICE_ENABLED="true"
     save_settings
-    log_success "Service installed and started"
+    log_success "Служба установлена и запущена"
 }
 
 remove_service() {
@@ -513,14 +506,14 @@ remove_service() {
     systemctl daemon-reload 2>/dev/null || true
     NFT_SERVICE_ENABLED="false"
     save_settings
-    log_success "Service removed"
+    log_success "Служба удалена"
 }
 
-# ── Presets ────────────────────────────────────────────────────
+# ── Пресеты ───────────────────────────────────────────────────
 
 apply_preset() {
-    local preset="$1"
-    case "$preset" in
+    local _preset="$1"
+    case "$_preset" in
         hard)
             NFT_RATE="1/second"; NFT_BURST="1"
             ;;
@@ -531,49 +524,49 @@ apply_preset() {
             NFT_RATE="2/second"; NFT_BURST="5"
             ;;
         *)
-            log_error "Unknown preset: $preset"
+            log_error "Неизвестный пресет: $_preset"
             return 1
             ;;
     esac
     save_settings
-    log_success "Preset applied: $preset (rate=$NFT_RATE burst=$NFT_BURST)"
+    log_success "Пресет применён: $_preset (rate=$NFT_RATE burst=$NFT_BURST)"
 }
 
-# ── Drop counter ──────────────────────────────────────────────
+# ── Счётчик дропов ────────────────────────────────────────────
 
 show_drop_counter() {
-    local table="${NFT_TABLE:-telemt_limit}"
-    local hook="${NFT_HOOK:-input}"
+    local _table="${NFT_TABLE:-telemt_limit}"
+    local _hook="${NFT_HOOK:-input}"
 
-    if ! nft list table inet "$table" &>/dev/null; then
-        log_warn "No active NFT rules found"
+    if ! nft list table inet "$_table" &>/dev/null; then
+        log_warn "Активных NFT правил не найдено"
         return 1
     fi
 
     echo ""
-    echo -e "  ${BOLD}Drop counters (Ctrl+C to stop):${NC}"
+    echo -e "  ${BOLD}Счётчик дропов (Ctrl+C для выхода):${NC}"
     echo ""
-    watch -n 2 "nft list chain inet $table $hook 2>/dev/null | grep -E 'counter|comment'"
+    watch -n 2 "nft list chain inet $_table $_hook 2>/dev/null | grep -E 'counter|comment'"
 }
 
-# ── Full uninstall ────────────────────────────────────────────
+# ── Полное удаление ───────────────────────────────────────────
 
 full_uninstall() {
     echo ""
-    echo -e "  ${RED}${BOLD}UNINSTALL MTproxy-reanimation${NC}"
+    echo -e "  ${RED}${BOLD}УДАЛЕНИЕ MTproxy-reanimation${NC}"
     echo ""
-    echo -e "  This will remove:"
-    echo -e "  ${DIM}- NFT rules${NC}"
-    echo -e "  ${DIM}- Systemd service${NC}"
-    echo -e "  ${DIM}- All config and scripts${NC}"
-    echo -e "  ${DIM}- /usr/local/bin/mtpr symlink${NC}"
+    echo -e "  Будет удалено:"
+    echo -e "  ${DIM}- NFT правила${NC}"
+    echo -e "  ${DIM}- Systemd служба${NC}"
+    echo -e "  ${DIM}- Все настройки и скрипты${NC}"
+    echo -e "  ${DIM}- Симлинк /usr/local/bin/mtpr${NC}"
     echo ""
-    echo -e "  ${YELLOW}Telemt tuning values will NOT be reverted.${NC}"
+    echo -e "  ${YELLOW}Значения тюнинга Telemt НЕ будут откачены.${NC}"
     echo ""
-    echo -en "  ${BOLD}Type 'yes' to confirm:${NC} "
-    local confirm
-    read -r confirm
-    [ "$confirm" != "yes" ] && { log_info "Cancelled"; return; }
+    echo -en "  ${BOLD}Введите 'yes' для подтверждения:${NC} "
+    local _confirm
+    read -r _confirm
+    [ "$_confirm" != "yes" ] && { log_info "Отменено"; return; }
 
     remove_nft_rules 2>/dev/null || true
     remove_service 2>/dev/null || true
@@ -582,11 +575,11 @@ full_uninstall() {
     rm -rf "$INSTALL_DIR"
 
     echo ""
-    log_success "MTproxy-reanimation fully uninstalled"
+    log_success "MTproxy-reanimation полностью удалён"
 
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
         echo ""
-        echo -e "  ${DIM}To revert Telemt tuning in MTProxyMax:${NC}"
+        echo -e "  ${DIM}Для отката тюнинга Telemt в MTProxyMax:${NC}"
         echo -e "  ${CYAN}mtproxymax tune clear tg_connect${NC}"
         echo -e "  ${CYAN}mtproxymax tune clear client_handshake${NC}"
         echo -e "  ${CYAN}mtproxymax tune clear client_keepalive${NC}"
@@ -596,51 +589,56 @@ full_uninstall() {
     exit 0
 }
 
-# ── TUI ───────────────────────────────────────────────────────
+# ── Интерфейс ─────────────────────────────────────────────────
 
 show_header() {
     clear 2>/dev/null || printf '\033[2J\033[H'
     echo ""
     echo -e "  ${CYAN}${BOLD}MTproxy-reanimation${NC} ${DIM}v${VERSION}${NC}"
-    echo -e "  ${DIM}Telemt inbound SYN limiter + tuning${NC}"
+    echo -e "  ${DIM}Telemt inbound SYN limiter + тюнинг${NC}"
     echo -e "  ${DIM}────────────────────────────────────────${NC}"
     echo ""
 
-    # Current status
-    local nft_status="${RED}inactive${NC}"
+    local _nft_status="${RED}неактивно${NC}"
     if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then
-        nft_status="${GREEN}active${NC}"
+        _nft_status="${GREEN}активно${NC}"
     fi
 
-    local svc_status="${DIM}not installed${NC}"
-    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null; then
-        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null; then
-            svc_status="${GREEN}enabled + running${NC}"
+    local _svc_status="${DIM}не установлена${NC}"
+    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
+        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
+            _svc_status="${GREEN}вкл + работает${NC}"
         else
-            svc_status="${YELLOW}enabled + stopped${NC}"
+            _svc_status="${YELLOW}вкл + остановлена${NC}"
         fi
     fi
 
-    echo -e "  ${BOLD}Detection:${NC}     ${DETECTED_MODE}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
-    echo -e "  ${BOLD}Network:${NC}       ${DETECTED_NETWORK_MODE:-unknown} → hook ${NFT_HOOK}"
-    echo -e "  ${BOLD}Config:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}not found${NC}}"
-    echo -e "  ${BOLD}NFT rules:${NC}     ${nft_status}"
-    echo -e "  ${BOLD}Service:${NC}       ${svc_status}"
+    local _tuning_status="${DIM}не применён${NC}"
+    case "$TUNING_APPLIED" in
+        true)   _tuning_status="${GREEN}применён${NC}" ;;
+        manual) _tuning_status="${YELLOW}вручную${NC}" ;;
+    esac
+
+    echo -e "  ${BOLD}Обнаружение:${NC}   ${DETECTED_MODE:-не найден}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
+    echo -e "  ${BOLD}Сеть:${NC}          ${DETECTED_NETWORK_MODE:-неизвестно} → hook ${NFT_HOOK}"
+    echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
+    echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
+    echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"
     echo ""
-    echo -e "  ${BOLD}IP:${NC}            ${SERVER_IP:-${DIM}any${NC}}"
-    echo -e "  ${BOLD}Port:${NC}          ${SERVER_PORT:-${DIM}not set${NC}}"
+    echo -e "  ${BOLD}IP:${NC}            ${SERVER_IP:-${DIM}любой${NC}}"
+    echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
     echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
     echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
     echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
     echo ""
-    echo -e "  ${BOLD}Tuning:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${TUNING_APPLIED})"
+    echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
 
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""
-        echo -e "  ${BOLD}Extra rules:${NC}"
-        local i
-        for i in $(seq 1 "$EXTRA_RULES_COUNT"); do
-            echo -e "    ${DIM}[$i]${NC} port=${EXTRA_RULES_PORT[$i]:-?} ip=${EXTRA_RULES_IP[$i]:-any} rate=${EXTRA_RULES_RATE[$i]:-?} burst=${EXTRA_RULES_BURST[$i]:-?}"
+        echo -e "  ${BOLD}Доп. правила:${NC}"
+        local _i
+        for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
+            echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?} ip=${EXTRA_RULES_IP[$_i]:-любой} rate=${EXTRA_RULES_RATE[$_i]:-?} burst=${EXTRA_RULES_BURST[$_i]:-?}"
         done
     fi
 
@@ -652,34 +650,34 @@ show_main_menu() {
     while true; do
         show_header
 
-        echo -e "  ${CYAN}[1]${NC}  Apply NFT rules"
-        echo -e "  ${CYAN}[2]${NC}  Apply Telemt tuning"
-        echo -e "  ${CYAN}[3]${NC}  Settings"
-        echo -e "  ${CYAN}[4]${NC}  Rate presets (hard / medium / soft)"
-        echo -e "  ${CYAN}[5]${NC}  Watch drop counter"
-        echo -e "  ${CYAN}[6]${NC}  Service management"
-        echo -e "  ${CYAN}[7]${NC}  Extra rules (add port)"
-        echo -e "  ${CYAN}[8]${NC}  Re-detect Telemt"
+        echo -e "  ${CYAN}[1]${NC}  Применить NFT правила"
+        echo -e "  ${CYAN}[2]${NC}  Применить тюнинг Telemt"
+        echo -e "  ${CYAN}[3]${NC}  Настройки"
+        echo -e "  ${CYAN}[4]${NC}  Пресеты (жёсткий / средний / мягкий)"
+        echo -e "  ${CYAN}[5]${NC}  Счётчик дропов"
+        echo -e "  ${CYAN}[6]${NC}  Управление службой"
+        echo -e "  ${CYAN}[7]${NC}  Доп. правила (добавить порт)"
+        echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
         echo ""
-        echo -e "  ${RED}[u]${NC}  Uninstall"
-        echo -e "  ${CYAN}[0]${NC}  Exit"
+        echo -e "  ${RED}[u]${NC}  Удалить"
+        echo -e "  ${CYAN}[0]${NC}  Выход"
         echo ""
-        echo -en "  Choice: "
-        local choice
-        read -r choice
+        echo -en "  Выбор: "
+        local _choice
+        read -r _choice
 
-        case "$choice" in
+        case "$_choice" in
             1)
                 if [ -z "$SERVER_PORT" ]; then
-                    log_error "Port not set — configure in Settings first"
+                    log_error "Порт не задан — настройте в разделе Настройки"
                     read -rsn1; continue
                 fi
                 apply_nft_rules || true
-                echo ""; read -rsn1 -p "  Press any key..."
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             2)
                 apply_tuning || true
-                echo ""; read -rsn1 -p "  Press any key..."
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             3) show_settings_menu ;;
             4) show_preset_menu ;;
@@ -690,20 +688,16 @@ show_main_menu() {
             7) show_extra_rules_menu ;;
             8)
                 detect_telemt || true
-                # Auto-fill from detection if not set
                 [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
-                if [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ]; then
-                    SERVER_IP="$DETECTED_IP"
-                fi
-                # Determine hook from network mode
+                [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
                 if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
                     NFT_HOOK="forward"
                 else
                     NFT_HOOK="input"
                 fi
                 save_settings
-                log_success "Re-detected: mode=$DETECTED_MODE port=$DETECTED_PORT"
-                echo ""; read -rsn1 -p "  Press any key..."
+                log_success "Обнаружено: режим=$DETECTED_MODE порт=$DETECTED_PORT"
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             u|U) full_uninstall ;;
             0|q|Q) exit 0 ;;
@@ -714,89 +708,89 @@ show_main_menu() {
 show_settings_menu() {
     while true; do
         show_header
-        echo -e "  ${BOLD}Settings${NC}"
+        echo -e "  ${BOLD}Настройки${NC}"
         echo ""
-        echo -e "  ${DIM}[1]${NC} Server IP      [${SERVER_IP:-any}]"
-        echo -e "  ${DIM}[2]${NC} Server Port    [${SERVER_PORT:-not set}]"
-        echo -e "  ${DIM}[3]${NC} Rate           [${NFT_RATE}]"
-        echo -e "  ${DIM}[4]${NC} Burst          [${NFT_BURST}]"
-        echo -e "  ${DIM}[5]${NC} Meter timeout  [${NFT_METER_TIMEOUT}]"
-        echo -e "  ${DIM}[6]${NC} tg_connect     [${TUNING_TG_CONNECT}]"
+        echo -e "  ${DIM}[1]${NC} IP сервера      [${SERVER_IP:-любой}]"
+        echo -e "  ${DIM}[2]${NC} Порт            [${SERVER_PORT:-не задан}]"
+        echo -e "  ${DIM}[3]${NC} Rate             [${NFT_RATE}]"
+        echo -e "  ${DIM}[4]${NC} Burst            [${NFT_BURST}]"
+        echo -e "  ${DIM}[5]${NC} Meter timeout    [${NFT_METER_TIMEOUT}]"
+        echo -e "  ${DIM}[6]${NC} tg_connect       [${TUNING_TG_CONNECT}]"
         echo -e "  ${DIM}[7]${NC} client_handshake [${TUNING_CLIENT_HANDSHAKE}]"
         echo -e "  ${DIM}[8]${NC} client_keepalive [${TUNING_CLIENT_KEEPALIVE}]"
-        echo -e "  ${DIM}[9]${NC} Auto-detect IP from internet"
-        echo -e "  ${DIM}[c]${NC} Clear IP (apply to all addresses)"
-        echo -e "  ${DIM}[0]${NC} Back"
+        echo -e "  ${DIM}[9]${NC} Определить IP из интернета"
+        echo -e "  ${DIM}[c]${NC} Очистить IP (применять ко всем адресам)"
+        echo -e "  ${DIM}[0]${NC} Назад"
         echo ""
-        echo -en "  Choice: "
-        local choice
-        read -r choice
+        echo -en "  Выбор: "
+        local _choice
+        read -r _choice
 
-        case "$choice" in
+        case "$_choice" in
             1)
-                echo -en "  New IP [${SERVER_IP:-empty}]: "
-                local v; read -r v
-                [ -n "$v" ] && SERVER_IP="$v"
+                echo -en "  Новый IP [${SERVER_IP:-пусто}]: "
+                local _val; read -r _val
+                [ -n "$_val" ] && SERVER_IP="$_val"
                 save_settings
                 ;;
             2)
-                echo -en "  New port [${SERVER_PORT:-}]: "
-                local v; read -r v
-                if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 65535 ]; then
-                    SERVER_PORT="$v"
+                echo -en "  Новый порт [${SERVER_PORT:-}]: "
+                local _val; read -r _val
+                if [[ "$_val" =~ ^[0-9]+$ ]] && [ "$_val" -ge 1 ] && [ "$_val" -le 65535 ]; then
+                    SERVER_PORT="$_val"
                     save_settings
-                elif [ -n "$v" ]; then
-                    log_error "Invalid port"
+                elif [ -n "$_val" ]; then
+                    log_error "Некорректный порт"
                 fi
                 ;;
             3)
-                echo -en "  New rate (e.g. 1/second, 2/second): "
-                local v; read -r v
-                [ -n "$v" ] && NFT_RATE="$v" && save_settings
+                echo -en "  Новый rate (напр. 1/second, 2/second): "
+                local _val; read -r _val
+                [ -n "$_val" ] && NFT_RATE="$_val" && save_settings
                 ;;
             4)
-                echo -en "  New burst: "
-                local v; read -r v
-                [[ "$v" =~ ^[0-9]+$ ]] && NFT_BURST="$v" && save_settings
+                echo -en "  Новый burst: "
+                local _val; read -r _val
+                [[ "$_val" =~ ^[0-9]+$ ]] && NFT_BURST="$_val" && save_settings
                 ;;
             5)
-                echo -en "  New meter timeout (e.g. 30s, 60s, 120s): "
-                local v; read -r v
-                [ -n "$v" ] && NFT_METER_TIMEOUT="$v" && save_settings
+                echo -en "  Новый meter timeout (напр. 30s, 60s, 120s): "
+                local _val; read -r _val
+                [ -n "$_val" ] && NFT_METER_TIMEOUT="$_val" && save_settings
                 ;;
             6)
                 echo -en "  tg_connect [${TUNING_TG_CONNECT}]: "
-                local v; read -r v
-                [[ "$v" =~ ^[0-9]+$ ]] && TUNING_TG_CONNECT="$v" && save_settings
+                local _val; read -r _val
+                [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_TG_CONNECT="$_val" && save_settings
                 ;;
             7)
                 echo -en "  client_handshake [${TUNING_CLIENT_HANDSHAKE}]: "
-                local v; read -r v
-                [[ "$v" =~ ^[0-9]+$ ]] && TUNING_CLIENT_HANDSHAKE="$v" && save_settings
+                local _val; read -r _val
+                [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_CLIENT_HANDSHAKE="$_val" && save_settings
                 ;;
             8)
                 echo -en "  client_keepalive [${TUNING_CLIENT_KEEPALIVE}]: "
-                local v; read -r v
-                [[ "$v" =~ ^[0-9]+$ ]] && TUNING_CLIENT_KEEPALIVE="$v" && save_settings
+                local _val; read -r _val
+                [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_CLIENT_KEEPALIVE="$_val" && save_settings
                 ;;
             9)
-                log_info "Detecting public IP..."
-                local ip
-                ip=$(detect_public_ip)
-                if [ -n "$ip" ]; then
-                    SERVER_IP="$ip"
+                log_info "Определение публичного IP..."
+                local _detected_ip
+                _detected_ip=$(detect_public_ip)
+                if [ -n "$_detected_ip" ]; then
+                    SERVER_IP="$_detected_ip"
                     save_settings
-                    log_success "IP detected: $ip"
+                    log_success "IP определён: $_detected_ip"
                 else
-                    log_error "Could not detect public IP"
+                    log_error "Не удалось определить публичный IP"
                 fi
-                echo ""; read -rsn1 -p "  Press any key..."
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             c|C)
                 SERVER_IP=""
                 save_settings
-                log_success "IP cleared — rules will apply to all addresses"
-                echo ""; read -rsn1 -p "  Press any key..."
+                log_success "IP очищен — правила будут применяться ко всем адресам"
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             0|"") return ;;
         esac
@@ -805,161 +799,158 @@ show_settings_menu() {
 
 show_preset_menu() {
     show_header
-    echo -e "  ${BOLD}Rate Presets${NC}"
+    echo -e "  ${BOLD}Пресеты скорости${NC}"
     echo ""
-    echo -e "  ${RED}[1]${NC} Hard    — 1/second burst 1   ${DIM}(most restrictive)${NC}"
-    echo -e "  ${YELLOW}[2]${NC} Medium  — 1/second burst 3   ${DIM}(balanced)${NC}"
-    echo -e "  ${GREEN}[3]${NC} Soft    — 2/second burst 5   ${DIM}(most permissive)${NC}"
-    echo -e "  ${DIM}[4]${NC} Custom"
-    echo -e "  ${DIM}[0]${NC} Back"
+    echo -e "  ${RED}[1]${NC} Жёсткий  — 1/second burst 1   ${DIM}(макс. ограничение)${NC}"
+    echo -e "  ${YELLOW}[2]${NC} Средний  — 1/second burst 3   ${DIM}(баланс)${NC}"
+    echo -e "  ${GREEN}[3]${NC} Мягкий   — 2/second burst 5   ${DIM}(мин. ограничение)${NC}"
+    echo -e "  ${DIM}[4]${NC} Свой вариант"
+    echo -e "  ${DIM}[0]${NC} Назад"
     echo ""
-    echo -en "  Choice: "
-    local choice
-    read -r choice
+    echo -en "  Выбор: "
+    local _choice
+    read -r _choice
 
-    case "$choice" in
+    case "$_choice" in
         1) apply_preset hard ;;
         2) apply_preset medium ;;
         3) apply_preset soft ;;
         4)
-            echo -en "  Rate (e.g. 1/second): "
-            local r; read -r r
+            echo -en "  Rate (напр. 1/second): "
+            local _r; read -r _r
             echo -en "  Burst: "
-            local b; read -r b
-            [ -n "$r" ] && NFT_RATE="$r"
-            [[ "$b" =~ ^[0-9]+$ ]] && NFT_BURST="$b"
+            local _b; read -r _b
+            [ -n "$_r" ] && NFT_RATE="$_r"
+            [[ "$_b" =~ ^[0-9]+$ ]] && NFT_BURST="$_b"
             save_settings
-            log_success "Custom rate=$NFT_RATE burst=$NFT_BURST"
+            log_success "Свой вариант: rate=$NFT_RATE burst=$NFT_BURST"
             ;;
         0|"") return ;;
     esac
 
-    # Ask to apply immediately
     echo ""
-    echo -en "  Apply NFT rules now? [Y/n]: "
-    local yn; read -r yn
-    if [[ ! "$yn" =~ ^[nN] ]]; then
+    echo -en "  Применить NFT правила сейчас? [Y/n]: "
+    local _yn; read -r _yn
+    if [[ ! "$_yn" =~ ^[nN] ]]; then
         apply_nft_rules || true
-        # Rebuild service if enabled
         [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service
     fi
-    echo ""; read -rsn1 -p "  Press any key..."
+    echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
 
 show_service_menu() {
     show_header
-    echo -e "  ${BOLD}Service Management${NC}"
+    echo -e "  ${BOLD}Управление службой${NC}"
     echo ""
 
-    local status="${DIM}not installed${NC}"
-    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null; then
-        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null; then
-            status="${GREEN}enabled + running${NC}"
+    local _status="${DIM}не установлена${NC}"
+    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
+        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
+            _status="${GREEN}вкл + работает${NC}"
         else
-            status="${YELLOW}enabled + stopped${NC}"
+            _status="${YELLOW}вкл + остановлена${NC}"
         fi
     fi
-    echo -e "  Status: ${status}"
+    echo -e "  Статус: ${_status}"
     echo ""
-    echo -e "  ${DIM}[1]${NC} Install & enable service"
-    echo -e "  ${DIM}[2]${NC} Remove service"
-    echo -e "  ${DIM}[3]${NC} Restart service"
-    echo -e "  ${DIM}[4]${NC} Stop service (keep rules)"
-    echo -e "  ${DIM}[5]${NC} View service logs"
-    echo -e "  ${DIM}[0]${NC} Back"
+    echo -e "  ${DIM}[1]${NC} Установить и включить службу"
+    echo -e "  ${DIM}[2]${NC} Удалить службу"
+    echo -e "  ${DIM}[3]${NC} Перезапустить службу"
+    echo -e "  ${DIM}[4]${NC} Остановить службу (правила сохранятся)"
+    echo -e "  ${DIM}[5]${NC} Логи службы"
+    echo -e "  ${DIM}[0]${NC} Назад"
     echo ""
-    echo -en "  Choice: "
-    local choice
-    read -r choice
+    echo -en "  Выбор: "
+    local _choice
+    read -r _choice
 
-    case "$choice" in
+    case "$_choice" in
         1)
             if [ -z "$SERVER_PORT" ]; then
-                log_error "Port not set — configure in Settings first"
+                log_error "Порт не задан — настройте в разделе Настройки"
             else
                 install_service
             fi
             ;;
         2) remove_service ;;
-        3) systemctl restart "$SYSTEMD_UNIT" 2>/dev/null && log_success "Service restarted" || log_error "Restart failed" ;;
-        4) systemctl stop "$SYSTEMD_UNIT" 2>/dev/null && log_success "Service stopped" || log_error "Stop failed" ;;
+        3) systemctl restart "$SYSTEMD_UNIT" 2>/dev/null && log_success "Служба перезапущена" || log_error "Не удалось перезапустить" ;;
+        4) systemctl stop "$SYSTEMD_UNIT" 2>/dev/null && log_success "Служба остановлена" || log_error "Не удалось остановить" ;;
         5)
             echo ""
-            journalctl -u "$SYSTEMD_UNIT" -n 20 --no-pager 2>/dev/null || log_warn "No logs"
+            journalctl -u "$SYSTEMD_UNIT" -n 20 --no-pager 2>/dev/null || log_warn "Логов нет"
             ;;
         0|"") return ;;
     esac
-    echo ""; read -rsn1 -p "  Press any key..."
+    echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
 
 show_extra_rules_menu() {
     while true; do
         show_header
-        echo -e "  ${BOLD}Extra Rules${NC}"
+        echo -e "  ${BOLD}Дополнительные правила${NC}"
         echo ""
 
         if [ "$EXTRA_RULES_COUNT" -eq 0 ]; then
-            echo -e "  ${DIM}No extra rules configured${NC}"
+            echo -e "  ${DIM}Нет дополнительных правил${NC}"
         else
-            local i
-            for i in $(seq 1 "$EXTRA_RULES_COUNT"); do
-                echo -e "  ${DIM}[$i]${NC} port=${EXTRA_RULES_PORT[$i]:-?}  ip=${EXTRA_RULES_IP[$i]:-any}  rate=${EXTRA_RULES_RATE[$i]:-?}  burst=${EXTRA_RULES_BURST[$i]:-?}"
+            local _i
+            for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
+                echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?}  ip=${EXTRA_RULES_IP[$_i]:-любой}  rate=${EXTRA_RULES_RATE[$_i]:-?}  burst=${EXTRA_RULES_BURST[$_i]:-?}"
             done
         fi
 
         echo ""
-        echo -e "  ${DIM}[a]${NC} Add extra rule"
-        echo -e "  ${DIM}[d]${NC} Delete extra rule"
-        echo -e "  ${DIM}[0]${NC} Back"
+        echo -e "  ${DIM}[a]${NC} Добавить правило"
+        echo -e "  ${DIM}[d]${NC} Удалить правило"
+        echo -e "  ${DIM}[0]${NC} Назад"
         echo ""
-        echo -en "  Choice: "
-        local choice
-        read -r choice
+        echo -en "  Выбор: "
+        local _choice
+        read -r _choice
 
-        case "$choice" in
+        case "$_choice" in
             a|A)
-                echo -en "  Port: "
-                local p; read -r p
-                if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
-                    log_error "Invalid port"; echo ""; read -rsn1 -p "  Press any key..."; continue
+                echo -en "  Порт: "
+                local _p; read -r _p
+                if ! [[ "$_p" =~ ^[0-9]+$ ]] || [ "$_p" -lt 1 ] || [ "$_p" -gt 65535 ]; then
+                    log_error "Некорректный порт"; echo ""; read -rsn1 -p "  Нажмите любую клавишу..."; continue
                 fi
-                echo -en "  IP (empty = any): "
-                local ip; read -r ip
+                echo -en "  IP (пусто = любой): "
+                local _eip; read -r _eip
                 echo -en "  Rate [1/second]: "
-                local r; read -r r; [ -z "$r" ] && r="1/second"
+                local _r; read -r _r; [ -z "$_r" ] && _r="1/second"
                 echo -en "  Burst [1]: "
-                local b; read -r b; [ -z "$b" ] && b="1"
+                local _b; read -r _b; [ -z "$_b" ] && _b="1"
 
                 EXTRA_RULES_COUNT=$((EXTRA_RULES_COUNT + 1))
-                local idx=$EXTRA_RULES_COUNT
-                EXTRA_RULES_PORT[$idx]="$p"
-                EXTRA_RULES_IP[$idx]="$ip"
-                EXTRA_RULES_RATE[$idx]="$r"
-                EXTRA_RULES_BURST[$idx]="$b"
+                local _idx=$EXTRA_RULES_COUNT
+                EXTRA_RULES_PORT[$_idx]="$_p"
+                EXTRA_RULES_IP[$_idx]="$_eip"
+                EXTRA_RULES_RATE[$_idx]="$_r"
+                EXTRA_RULES_BURST[$_idx]="$_b"
                 save_settings
-                log_success "Extra rule $idx added"
+                log_success "Доп. правило $_idx добавлено"
 
-                echo -en "  Apply rules now? [Y/n]: "
-                local yn; read -r yn
-                if [[ ! "$yn" =~ ^[nN] ]]; then
+                echo -en "  Применить правила сейчас? [Y/n]: "
+                local _yn; read -r _yn
+                if [[ ! "$_yn" =~ ^[nN] ]]; then
                     apply_nft_rules || true
                     [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service
                 fi
-                echo ""; read -rsn1 -p "  Press any key..."
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             d|D)
-                [ "$EXTRA_RULES_COUNT" -eq 0 ] && { log_info "No rules to delete"; echo ""; read -rsn1 -p "  Press any key..."; continue; }
-                echo -en "  Rule number to delete: "
-                local idx; read -r idx
-                if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "$EXTRA_RULES_COUNT" ]; then
-                    # Shift rules down
-                    local i
-                    for i in $(seq "$idx" $((EXTRA_RULES_COUNT - 1))); do
-                        local next=$((i + 1))
-                        EXTRA_RULES_PORT[$i]="${EXTRA_RULES_PORT[$next]:-}"
-                        EXTRA_RULES_IP[$i]="${EXTRA_RULES_IP[$next]:-}"
-                        EXTRA_RULES_RATE[$i]="${EXTRA_RULES_RATE[$next]:-}"
-                        EXTRA_RULES_BURST[$i]="${EXTRA_RULES_BURST[$next]:-}"
+                [ "$EXTRA_RULES_COUNT" -eq 0 ] && { log_info "Нет правил для удаления"; echo ""; read -rsn1 -p "  Нажмите любую клавишу..."; continue; }
+                echo -en "  Номер правила для удаления: "
+                local _idx; read -r _idx
+                if [[ "$_idx" =~ ^[0-9]+$ ]] && [ "$_idx" -ge 1 ] && [ "$_idx" -le "$EXTRA_RULES_COUNT" ]; then
+                    local _i
+                    for _i in $(seq "$_idx" $((EXTRA_RULES_COUNT - 1))); do
+                        local _next=$((_i + 1))
+                        EXTRA_RULES_PORT[$_i]="${EXTRA_RULES_PORT[$_next]:-}"
+                        EXTRA_RULES_IP[$_i]="${EXTRA_RULES_IP[$_next]:-}"
+                        EXTRA_RULES_RATE[$_i]="${EXTRA_RULES_RATE[$_next]:-}"
+                        EXTRA_RULES_BURST[$_i]="${EXTRA_RULES_BURST[$_next]:-}"
                     done
                     unset "EXTRA_RULES_PORT[$EXTRA_RULES_COUNT]"
                     unset "EXTRA_RULES_IP[$EXTRA_RULES_COUNT]"
@@ -967,152 +958,159 @@ show_extra_rules_menu() {
                     unset "EXTRA_RULES_BURST[$EXTRA_RULES_COUNT]"
                     EXTRA_RULES_COUNT=$((EXTRA_RULES_COUNT - 1))
                     save_settings
-                    log_success "Rule deleted"
+                    log_success "Правило удалено"
 
-                    echo -en "  Re-apply rules now? [Y/n]: "
-                    local yn; read -r yn
-                    if [[ ! "$yn" =~ ^[nN] ]]; then
+                    echo -en "  Применить правила заново? [Y/n]: "
+                    local _yn; read -r _yn
+                    if [[ ! "$_yn" =~ ^[nN] ]]; then
                         apply_nft_rules || true
                         [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service
                     fi
                 else
-                    log_error "Invalid rule number"
+                    log_error "Некорректный номер правила"
                 fi
-                echo ""; read -rsn1 -p "  Press any key..."
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             0|"") return ;;
         esac
     done
 }
 
-# ── First run wizard ──────────────────────────────────────────
+# ── Мастер первого запуска ────────────────────────────────────
 
 first_run_wizard() {
     clear 2>/dev/null || printf '\033[2J\033[H'
     echo ""
     echo -e "  ${CYAN}${BOLD}MTproxy-reanimation${NC} ${DIM}v${VERSION}${NC}"
-    echo -e "  ${DIM}First-time setup wizard${NC}"
+    echo -e "  ${DIM}Мастер первоначальной настройки${NC}"
     echo ""
     echo -e "  ${DIM}────────────────────────────────────────${NC}"
     echo ""
 
-    # Step 1: Detect
-    log_info "Detecting Telemt installation..."
+    # Шаг 1: Обнаружение
+    log_info "Поиск установленного Telemt..."
     if detect_telemt; then
-        log_success "Found: ${DETECTED_MODE}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
-        [ -n "$DETECTED_CONFIG_PATH" ] && log_info "Config: ${DETECTED_CONFIG_PATH}"
-        [ -n "$DETECTED_PORT" ] && log_info "Port: ${DETECTED_PORT}"
-        [ -n "$DETECTED_NETWORK_MODE" ] && log_info "Network: ${DETECTED_NETWORK_MODE}"
+        log_success "Найден: ${DETECTED_MODE}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
+        [ -n "$DETECTED_CONFIG_PATH" ] && log_info "Конфиг: ${DETECTED_CONFIG_PATH}"
+        [ -n "$DETECTED_PORT" ] && log_info "Порт: ${DETECTED_PORT}"
+        [ -n "$DETECTED_NETWORK_MODE" ] && log_info "Сеть: ${DETECTED_NETWORK_MODE}"
     else
-        log_warn "Telemt not detected automatically"
+        log_warn "Telemt не обнаружен автоматически"
     fi
 
-    # Determine hook
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         NFT_HOOK="forward"
     else
         NFT_HOOK="input"
     fi
 
-    # Step 2: Dependencies
+    # Шаг 2: Зависимости
     echo ""
     install_dependencies || exit 1
 
-    # Step 3: Port
+    # Шаг 3: Порт
     echo ""
     SERVER_PORT="${DETECTED_PORT:-443}"
-    echo -en "  ${BOLD}Proxy port [${SERVER_PORT}]:${NC} "
-    local v; read -r v
-    [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 65535 ] && SERVER_PORT="$v"
+    echo -en "  ${BOLD}Порт прокси [${SERVER_PORT}]:${NC} "
+    local _port_input
+    read -r _port_input
+    if [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -ge 1 ] && [ "$_port_input" -le 65535 ]; then
+        SERVER_PORT="$_port_input"
+    fi
 
-    # Step 4: IP
+    # Шаг 4: IP
     echo ""
     if [ -n "$DETECTED_IP" ]; then
         SERVER_IP="$DETECTED_IP"
-        log_info "IP from config: $SERVER_IP"
+        log_info "IP из конфига: $SERVER_IP"
     else
-        log_info "Detecting public IP..."
+        log_info "Определение публичного IP..."
         SERVER_IP=$(detect_public_ip)
-        [ -n "$SERVER_IP" ] && log_success "Detected: $SERVER_IP" || log_warn "Could not detect IP"
+        [ -n "$SERVER_IP" ] && log_success "Определён: $SERVER_IP" || log_warn "Не удалось определить IP"
     fi
-    echo -en "  ${BOLD}Server IP [${SERVER_IP:-leave empty for any}]:${NC} "
-    read -r v
-    [ -n "$v" ] && SERVER_IP="$v"
+    echo -en "  ${BOLD}IP сервера [${SERVER_IP:-оставьте пустым для всех}]:${NC} "
+    local _ip_input
+    read -r _ip_input
+    [ -n "$_ip_input" ] && SERVER_IP="$_ip_input"
 
-    # Step 5: Preset
+    # Шаг 5: Пресет
     echo ""
-    echo -e "  ${BOLD}Rate preset:${NC}"
-    echo -e "    ${RED}[1]${NC} Hard    — 1/sec burst 1  ${DIM}(recommended)${NC}"
-    echo -e "    ${YELLOW}[2]${NC} Medium  — 1/sec burst 3"
-    echo -e "    ${GREEN}[3]${NC} Soft    — 2/sec burst 5"
+    echo -e "  ${BOLD}Пресет ограничения:${NC}"
+    echo -e "    ${RED}[1]${NC} Жёсткий  — 1/sec burst 1  ${DIM}(рекомендуется)${NC}"
+    echo -e "    ${YELLOW}[2]${NC} Средний  — 1/sec burst 3"
+    echo -e "    ${GREEN}[3]${NC} Мягкий   — 2/sec burst 5"
     echo ""
-    echo -en "  Choice [1]: "
-    local preset; read -r preset
-    case "$preset" in
+    echo -en "  Выбор [1]: "
+    local _preset_input
+    read -r _preset_input
+    case "$_preset_input" in
         2) apply_preset medium ;;
         3) apply_preset soft ;;
         *) apply_preset hard ;;
     esac
 
-    # Save
+    # Сохранить
     save_settings
 
-    # Step 6: Apply tuning
+    # Шаг 6: Применить тюнинг
     echo ""
-    echo -en "  ${BOLD}Apply Telemt tuning? [Y/n]:${NC} "
-    local yn; read -r yn
-    if [[ ! "$yn" =~ ^[nN] ]]; then
+    echo -en "  ${BOLD}Применить тюнинг Telemt? [Y/n]:${NC} "
+    local _yn_tuning
+    read -r _yn_tuning
+    if [[ ! "$_yn_tuning" =~ ^[nN] ]]; then
         apply_tuning || true
     fi
 
-    # Step 7: Apply NFT
+    # Шаг 7: Применить NFT
     echo ""
-    echo -en "  ${BOLD}Apply NFT rules now? [Y/n]:${NC} "
-    read -r yn
-    if [[ ! "$yn" =~ ^[nN] ]]; then
+    echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
+    local _yn_nft
+    read -r _yn_nft
+    if [[ ! "$_yn_nft" =~ ^[nN] ]]; then
         apply_nft_rules || true
     fi
 
-    # Step 8: Install service
+    # Шаг 8: Установить службу
     echo ""
-    echo -en "  ${BOLD}Install as systemd service (auto-start on boot)? [Y/n]:${NC} "
-    read -r yn
-    if [[ ! "$yn" =~ ^[nN] ]]; then
+    echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
+    local _yn_svc
+    read -r _yn_svc
+    if [[ ! "$_yn_svc" =~ ^[nN] ]]; then
         install_service || true
     fi
 
     echo ""
-    log_success "Setup complete!"
+    log_success "Настройка завершена!"
     echo ""
-    echo -e "  ${DIM}Run ${CYAN}mtpr${DIM} anytime to manage${NC}"
+    echo -e "  ${DIM}Запускайте ${CYAN}mtpr${DIM} в любое время для управления${NC}"
     echo ""
-    read -rsn1 -p "  Press any key to open menu..."
+    read -rsn1 -p "  Нажмите любую клавишу для входа в меню..."
 }
 
-# ── Main entry ────────────────────────────────────────────────
+# ── Главная точка входа ───────────────────────────────────────
 
 main() {
     check_root
 
     mkdir -p "$INSTALL_DIR"
 
-    # Copy self to install dir if running from elsewhere
-    local self="${BASH_SOURCE[0]}"
-    if [ -f "$self" ] && [ "$(realpath "$self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
-        cp "$self" "${INSTALL_DIR}/mtpr.sh"
+    # Копируем себя в директорию установки
+    local _self="${BASH_SOURCE[0]}"
+    if [ -f "$_self" ] && [ "$(realpath "$_self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
+        cp "$_self" "${INSTALL_DIR}/mtpr.sh"
         chmod +x "${INSTALL_DIR}/mtpr.sh"
     fi
 
-    # Create symlink
+    # Создаём симлинк
     ln -sf "${INSTALL_DIR}/mtpr.sh" /usr/local/bin/mtpr 2>/dev/null || true
 
-    # Load settings
+    # Загружаем настройки
     load_settings
 
-    # Detect telemt
+    # Обнаруживаем telemt
     detect_telemt || true
 
-    # Auto-fill from detection
+    # Автозаполнение из обнаружения
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
     [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
@@ -1121,12 +1119,12 @@ main() {
         NFT_HOOK="input"
     fi
 
-    # First run?
+    # Первый запуск?
     if [ ! -f "$SETTINGS_FILE" ]; then
         first_run_wizard
     fi
 
-    # Show menu
+    # Показать меню
     show_main_menu
 }
 
