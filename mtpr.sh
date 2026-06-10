@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.0
+#  MTproxy-reanimation v1.0.1
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -60,19 +60,6 @@ check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         log_error "Требуются права root"
         exit 1
-    fi
-}
-
-# ── Вспомогательная функция для чтения ввода ──────────────────
-# Решает проблему с конфликтом переменных при read
-_read_input() {
-    local _prompt="$1" _default="$2" _result
-    echo -en "$_prompt"
-    read -r _result
-    if [ -z "$_result" ]; then
-        echo "$_default"
-    else
-        echo "$_result"
     fi
 }
 
@@ -144,6 +131,52 @@ load_settings() {
     [[ "$EXTRA_RULES_COUNT" =~ ^[0-9]+$ ]] || EXTRA_RULES_COUNT=0
 }
 
+# ── Безопасное чтение значения из TOML ────────────────────────
+# Читает числовое значение ключа, учитывая секцию
+_toml_get_value() {
+    local _key="$1" _file="$2"
+    [ -f "$_file" ] || return 0
+    awk -v k="$_key" '
+        /^[[:space:]]*#/ { next }
+        $1 == k && $2 == "=" { gsub(/[^0-9]/, "", $3); print $3; exit }
+    ' "$_file" 2>/dev/null
+}
+
+# Проверяет, есть ли секция в файле
+_toml_has_section() {
+    local _section="$1" _file="$2"
+    grep -qE "^\\[${_section}\\]" "$_file" 2>/dev/null
+}
+
+# Проверяет, есть ли ключ в файле (любая секция)
+_toml_has_key() {
+    local _key="$1" _file="$2"
+    grep -qE "^${_key}[[:space:]]*=" "$_file" 2>/dev/null
+}
+
+# Безопасно устанавливает значение: заменяет если есть, добавляет в секцию если нет
+# НЕ создаёт секцию если её нет — возвращает 1
+_toml_safe_set() {
+    local _key="$1" _value="$2" _section="$3" _file="$4"
+
+    [ -f "$_file" ] || return 1
+
+    # Если ключ уже существует — заменяем
+    if _toml_has_key "$_key" "$_file"; then
+        sed -i "s/^${_key}[[:space:]]*=.*/${_key} = ${_value}/" "$_file"
+        return 0
+    fi
+
+    # Если секция существует — добавляем после неё
+    if _toml_has_section "$_section" "$_file"; then
+        sed -i "/^\\[${_section}\\]/a ${_key} = ${_value}" "$_file"
+        return 0
+    fi
+
+    # Секции нет — не трогаем файл
+    return 1
+}
+
 # ── Обнаружение Telemt ────────────────────────────────────────
 
 detect_telemt() {
@@ -164,10 +197,14 @@ detect_telemt() {
         local _ip
         _ip=$(awk -F"'" '/^CUSTOM_IP=/{print $2; exit}' /opt/mtproxymax/settings.conf 2>/dev/null)
         [ -n "$_ip" ] && DETECTED_IP="$_ip"
-        if docker inspect -f '{{.HostConfig.NetworkMode}}' mtproxymax 2>/dev/null | grep -q "host"; then
-            DETECTED_NETWORK_MODE="host"
+        if command -v docker &>/dev/null && docker inspect mtproxymax &>/dev/null 2>&1; then
+            if docker inspect -f '{{.HostConfig.NetworkMode}}' mtproxymax 2>/dev/null | grep -q "host"; then
+                DETECTED_NETWORK_MODE="host"
+            else
+                DETECTED_NETWORK_MODE="bridge"
+            fi
         else
-            DETECTED_NETWORK_MODE="bridge"
+            DETECTED_NETWORK_MODE="host"
         fi
         DETECTED_CONTAINER="mtproxymax"
         return 0
@@ -177,59 +214,121 @@ detect_telemt() {
     if command -v docker &>/dev/null; then
         local _cname
         for _cname in $(docker ps --format '{{.Names}}' 2>/dev/null); do
-            if docker inspect "$_cname" 2>/dev/null | grep -qiE '"telemt|telemt.toml'; then
-                DETECTED_MODE="docker"
-                DETECTED_CONTAINER="$_cname"
-                local _mount
-                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
-                [ -n "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
-                if [ -z "$DETECTED_CONFIG_PATH" ]; then
-                    _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
-                    [ -n "$_mount" ] && [ -f "${_mount}/config.toml" ] && DETECTED_CONFIG_PATH="${_mount}/config.toml"
-                fi
-                local _nm
-                _nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$_cname" 2>/dev/null)
-                DETECTED_NETWORK_MODE="${_nm:-bridge}"
-                if [ -f "$DETECTED_CONFIG_PATH" ]; then
-                    local _p
-                    _p=$(awk '/^\[server\]/,/^\[/' "$DETECTED_CONFIG_PATH" 2>/dev/null | awk '/^port[[:space:]]*=/{gsub(/[^0-9]/,"",$NF); print $NF; exit}')
-                    [ -n "$_p" ] && DETECTED_PORT="$_p"
-                fi
-                return 0
+            local _inspect
+            _inspect=$(docker inspect "$_cname" 2>/dev/null) || continue
+
+            # Проверяем: образ содержит telemt, или аргументы содержат telemt, или монтирован telemt.toml
+            local _is_telemt=false
+            if echo "$_inspect" | grep -qiE '"Image".*telemt'; then
+                _is_telemt=true
+            elif echo "$_inspect" | grep -qiE 'telemt\.toml|telemt/telemt'; then
+                _is_telemt=true
+            elif echo "$_inspect" | grep -qiE '"Cmd".*telemt'; then
+                _is_telemt=true
             fi
+
+            [ "$_is_telemt" = "false" ] && continue
+
+            DETECTED_MODE="docker"
+            DETECTED_CONTAINER="$_cname"
+
+            # Ищем конфиг по маунтам
+            local _mount
+            # Вариант 1: /etc/telemt.toml
+            _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
+            [ -n "$_mount" ] && [ -f "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
+
+            # Вариант 2: /etc/telemt/ (Docker Compose стиль)
+            if [ -z "$DETECTED_CONFIG_PATH" ]; then
+                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
+                if [ -n "$_mount" ]; then
+                    [ -f "${_mount}/config.toml" ] && DETECTED_CONFIG_PATH="${_mount}/config.toml"
+                    [ -f "${_mount}/telemt.toml" ] && DETECTED_CONFIG_PATH="${_mount}/telemt.toml"
+                fi
+            fi
+
+            # Вариант 3: /etc/telemt/telemt.toml
+            if [ -z "$DETECTED_CONFIG_PATH" ]; then
+                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
+                [ -n "$_mount" ] && [ -f "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
+            fi
+
+            # Вариант 4: /app/config.toml (docker run без compose)
+            if [ -z "$DETECTED_CONFIG_PATH" ]; then
+                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/config.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
+                [ -n "$_mount" ] && [ -f "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
+            fi
+
+            # Сеть
+            local _nm
+            _nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$_cname" 2>/dev/null)
+            DETECTED_NETWORK_MODE="${_nm:-bridge}"
+            # docker compose default network выглядит как "projectname_default"
+            if [ "$_nm" != "host" ] && [ "$_nm" != "none" ]; then
+                DETECTED_NETWORK_MODE="bridge"
+            fi
+
+            # Порт из конфига
+            if [ -f "$DETECTED_CONFIG_PATH" ]; then
+                local _p
+                _p=$(_toml_get_value "port" "$DETECTED_CONFIG_PATH")
+                [ -n "$_p" ] && DETECTED_PORT="$_p"
+            fi
+            return 0
         done
     fi
 
-    # 3. Локальный процесс telemt
-    if pgrep -x telemt &>/dev/null; then
+    # 3. Локальный процесс telemt (systemd / ручной запуск)
+    if pgrep -x telemt &>/dev/null || systemctl is-active telemt.service &>/dev/null 2>&1; then
         DETECTED_MODE="local"
         DETECTED_NETWORK_MODE="host"
+
+        # Ищем конфиг из аргументов процесса
         local _args
-        _args=$(ps -eo args 2>/dev/null | grep -m1 '[t]elemt' | grep -oE '/[^ ]+\.toml')
+        _args=$(ps -eo args 2>/dev/null | grep -m1 '[t]elemt' | grep -oE '/[^ ]+\.toml' | head -1)
         if [ -n "$_args" ] && [ -f "$_args" ]; then
             DETECTED_CONFIG_PATH="$_args"
-        elif [ -f "/etc/telemt.toml" ]; then
-            DETECTED_CONFIG_PATH="/etc/telemt.toml"
-        elif [ -f "/etc/telemt/config.toml" ]; then
-            DETECTED_CONFIG_PATH="/etc/telemt/config.toml"
         fi
+
+        # Перебираем стандартные пути если не нашли
+        if [ -z "$DETECTED_CONFIG_PATH" ]; then
+            local _cf
+            for _cf in \
+                /etc/telemt/telemt.toml \
+                /etc/telemt/config.toml \
+                /etc/telemt.toml \
+                /opt/telemt/config.toml \
+                /opt/telemt/telemt.toml; do
+                if [ -f "$_cf" ]; then
+                    DETECTED_CONFIG_PATH="$_cf"
+                    break
+                fi
+            done
+        fi
+
         if [ -f "$DETECTED_CONFIG_PATH" ]; then
             local _p
-            _p=$(awk '/^\[server\]/,/^\[/' "$DETECTED_CONFIG_PATH" 2>/dev/null | awk '/^port[[:space:]]*=/{gsub(/[^0-9]/,"",$NF); print $NF; exit}')
+            _p=$(_toml_get_value "port" "$DETECTED_CONFIG_PATH")
             [ -n "$_p" ] && DETECTED_PORT="$_p"
         fi
         return 0
     fi
 
-    # 4. Поиск конфигов
+    # 4. Только конфиг (процесс не запущен, но файлы есть)
     local _cf
-    for _cf in /etc/telemt.toml /etc/telemt/config.toml /opt/telemt/config.toml /opt/mtproxymax/mtproxy/config.toml; do
+    for _cf in \
+        /etc/telemt/telemt.toml \
+        /etc/telemt/config.toml \
+        /etc/telemt.toml \
+        /opt/telemt/config.toml \
+        /opt/telemt/telemt.toml \
+        /opt/mtproxymax/mtproxy/config.toml; do
         if [ -f "$_cf" ]; then
             DETECTED_CONFIG_PATH="$_cf"
             DETECTED_MODE="config_only"
             DETECTED_NETWORK_MODE="host"
             local _p
-            _p=$(awk '/^\[server\]/,/^\[/' "$_cf" 2>/dev/null | awk '/^port[[:space:]]*=/{gsub(/[^0-9]/,"",$NF); print $NF; exit}')
+            _p=$(_toml_get_value "port" "$_cf")
             [ -n "$_p" ] && DETECTED_PORT="$_p"
             return 0
         fi
@@ -245,12 +344,6 @@ detect_public_ip() {
     _ip=$(curl -4 -fsS --max-time 5 https://icanhazip.com 2>/dev/null) ||
     _ip=""
     echo "$_ip"
-}
-
-read_config_value() {
-    local _key="$1" _file="$2"
-    [ -f "$_file" ] || return 0
-    awk -v k="$_key" '$1==k && $2=="=" {gsub(/[^0-9]/,"",$3); print $3; exit}' "$_file" 2>/dev/null
 }
 
 # ── Зависимости ──────────────────────────────────────────────
@@ -284,6 +377,7 @@ install_dependencies() {
 apply_tuning() {
     log_info "Применение тюнинга Telemt..."
 
+    # === MTProxyMax ===
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
         log_info "Режим: MTProxyMax — используем команды mtproxymax tune"
         local _changed=false
@@ -325,7 +419,7 @@ apply_tuning() {
         return 0
     fi
 
-    # Для docker / local — редактируем config.toml напрямую
+    # === Docker / Local / Config_only ===
     if [ -z "$DETECTED_CONFIG_PATH" ] || [ ! -f "$DETECTED_CONFIG_PATH" ]; then
         log_warn "Файл конфигурации не найден — невозможно применить тюнинг автоматически"
         echo ""
@@ -345,52 +439,87 @@ apply_tuning() {
 
     local _cfg="$DETECTED_CONFIG_PATH"
     local _changed=false
+    local _failed=false
 
+    # Создаём бэкап перед изменениями
+    cp "$_cfg" "${_cfg}.mtpr-backup-$(date +%s)" 2>/dev/null || true
+
+    # tg_connect → секция [general]
     local _cur
-    _cur=$(read_config_value "tg_connect" "$_cfg")
+    _cur=$(_toml_get_value "tg_connect" "$_cfg")
     if [ "$_cur" != "$TUNING_TG_CONNECT" ]; then
-        if grep -qE '^tg_connect[[:space:]]*=' "$_cfg"; then
-            sed -i "s/^tg_connect[[:space:]]*=.*/tg_connect = $TUNING_TG_CONNECT/" "$_cfg"
+        if _toml_safe_set "tg_connect" "$TUNING_TG_CONNECT" "general" "$_cfg"; then
+            _changed=true
+            log_success "tg_connect = $TUNING_TG_CONNECT"
         else
-            sed -i "/^\[general\]/a tg_connect = $TUNING_TG_CONNECT" "$_cfg"
+            log_warn "Секция [general] не найдена — tg_connect не применён"
+            _failed=true
         fi
-        _changed=true
-        log_success "tg_connect = $TUNING_TG_CONNECT"
+    else
+        log_info "tg_connect уже $TUNING_TG_CONNECT"
     fi
 
-    _cur=$(read_config_value "client_handshake" "$_cfg")
+    # client_handshake → секция [timeouts]
+    _cur=$(_toml_get_value "client_handshake" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_HANDSHAKE" ]; then
-        if grep -qE '^client_handshake[[:space:]]*=' "$_cfg"; then
-            sed -i "s/^client_handshake[[:space:]]*=.*/client_handshake = $TUNING_CLIENT_HANDSHAKE/" "$_cfg"
+        if _toml_safe_set "client_handshake" "$TUNING_CLIENT_HANDSHAKE" "timeouts" "$_cfg"; then
+            _changed=true
+            log_success "client_handshake = $TUNING_CLIENT_HANDSHAKE"
         else
-            sed -i "/^\[timeouts\]/a client_handshake = $TUNING_CLIENT_HANDSHAKE" "$_cfg"
+            log_warn "Секция [timeouts] не найдена — client_handshake не применён"
+            _failed=true
         fi
-        _changed=true
-        log_success "client_handshake = $TUNING_CLIENT_HANDSHAKE"
+    else
+        log_info "client_handshake уже $TUNING_CLIENT_HANDSHAKE"
     fi
 
-    _cur=$(read_config_value "client_keepalive" "$_cfg")
+    # client_keepalive → секция [timeouts]
+    _cur=$(_toml_get_value "client_keepalive" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
-        if grep -qE '^client_keepalive[[:space:]]*=' "$_cfg"; then
-            sed -i "s/^client_keepalive[[:space:]]*=.*/client_keepalive = $TUNING_CLIENT_KEEPALIVE/" "$_cfg"
+        if _toml_safe_set "client_keepalive" "$TUNING_CLIENT_KEEPALIVE" "timeouts" "$_cfg"; then
+            _changed=true
+            log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
         else
-            sed -i "/^\[timeouts\]/a client_keepalive = $TUNING_CLIENT_KEEPALIVE" "$_cfg"
+            log_warn "Секция [timeouts] не найдена — client_keepalive не применён"
+            _failed=true
         fi
-        _changed=true
-        log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
+    else
+        log_info "client_keepalive уже $TUNING_CLIENT_KEEPALIVE"
     fi
 
+    # Если что-то не удалось — показать инструкцию
+    if [ "$_failed" = "true" ]; then
+        echo ""
+        echo -e "  ${YELLOW}Некоторые параметры не удалось применить автоматически.${NC}"
+        echo -e "  ${BOLD}Добавьте вручную в ${_cfg}:${NC}"
+        echo ""
+        echo "  [general]"
+        echo "  tg_connect = $TUNING_TG_CONNECT"
+        echo ""
+        echo "  [timeouts]"
+        echo "  client_handshake = $TUNING_CLIENT_HANDSHAKE"
+        echo "  client_keepalive = $TUNING_CLIENT_KEEPALIVE"
+        echo ""
+    fi
+
+    # Перезапуск если были изменения
     if [ "$_changed" = "true" ]; then
         if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
             log_info "Перезапуск контейнера $DETECTED_CONTAINER..."
             docker restart "$DETECTED_CONTAINER" &>/dev/null || log_warn "Не удалось перезапустить контейнер"
         elif [ "$DETECTED_MODE" = "local" ]; then
-            log_info "Отправка SIGHUP процессу telemt..."
-            pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал"
+            if systemctl is-active telemt.service &>/dev/null 2>&1; then
+                log_info "Перезапуск службы telemt..."
+                systemctl restart telemt.service &>/dev/null || log_warn "Не удалось перезапустить службу"
+            else
+                log_info "Отправка SIGHUP процессу telemt..."
+                pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал"
+            fi
         fi
     fi
 
     TUNING_APPLIED="true"
+    [ "$_failed" = "true" ] && TUNING_APPLIED="partial"
     save_settings
 }
 
@@ -514,19 +643,10 @@ remove_service() {
 apply_preset() {
     local _preset="$1"
     case "$_preset" in
-        hard)
-            NFT_RATE="1/second"; NFT_BURST="1"
-            ;;
-        medium)
-            NFT_RATE="1/second"; NFT_BURST="3"
-            ;;
-        soft)
-            NFT_RATE="2/second"; NFT_BURST="5"
-            ;;
-        *)
-            log_error "Неизвестный пресет: $_preset"
-            return 1
-            ;;
+        hard)   NFT_RATE="1/second"; NFT_BURST="1" ;;
+        medium) NFT_RATE="1/second"; NFT_BURST="3" ;;
+        soft)   NFT_RATE="2/second"; NFT_BURST="5" ;;
+        *)      log_error "Неизвестный пресет: $_preset"; return 1 ;;
     esac
     save_settings
     log_success "Пресет применён: $_preset (rate=$NFT_RATE burst=$NFT_BURST)"
@@ -562,6 +682,7 @@ full_uninstall() {
     echo -e "  ${DIM}- Симлинк /usr/local/bin/mtpr${NC}"
     echo ""
     echo -e "  ${YELLOW}Значения тюнинга Telemt НЕ будут откачены.${NC}"
+    echo -e "  ${YELLOW}Бэкапы конфигов (*.mtpr-backup-*) останутся на месте.${NC}"
     echo ""
     echo -en "  ${BOLD}Введите 'yes' для подтверждения:${NC} "
     local _confirm
@@ -579,11 +700,17 @@ full_uninstall() {
 
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
         echo ""
-        echo -e "  ${DIM}Для отката тюнинга Telemt в MTProxyMax:${NC}"
+        echo -e "  ${DIM}Для отката тюнинга в MTProxyMax:${NC}"
         echo -e "  ${CYAN}mtproxymax tune clear tg_connect${NC}"
         echo -e "  ${CYAN}mtproxymax tune clear client_handshake${NC}"
         echo -e "  ${CYAN}mtproxymax tune clear client_keepalive${NC}"
         echo -e "  ${CYAN}mtproxymax restart${NC}"
+    elif [ -n "$DETECTED_CONFIG_PATH" ]; then
+        echo ""
+        echo -e "  ${DIM}Для отката тюнинга вручную восстановите бэкап:${NC}"
+        echo -e "  ${CYAN}ls ${DETECTED_CONFIG_PATH}.mtpr-backup-*${NC}"
+        echo -e "  ${CYAN}cp <backup-file> ${DETECTED_CONFIG_PATH}${NC}"
+        echo -e "  ${DIM}Затем перезапустите telemt${NC}"
     fi
     echo ""
     exit 0
@@ -615,8 +742,9 @@ show_header() {
 
     local _tuning_status="${DIM}не применён${NC}"
     case "$TUNING_APPLIED" in
-        true)   _tuning_status="${GREEN}применён${NC}" ;;
-        manual) _tuning_status="${YELLOW}вручную${NC}" ;;
+        true)    _tuning_status="${GREEN}применён${NC}" ;;
+        manual)  _tuning_status="${YELLOW}вручную${NC}" ;;
+        partial) _tuning_status="${YELLOW}частично${NC}" ;;
     esac
 
     echo -e "  ${BOLD}Обнаружение:${NC}   ${DETECTED_MODE:-не найден}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
@@ -681,9 +809,7 @@ show_main_menu() {
                 ;;
             3) show_settings_menu ;;
             4) show_preset_menu ;;
-            5)
-                show_drop_counter || true
-                ;;
+            5) show_drop_counter || true ;;
             6) show_service_menu ;;
             7) show_extra_rules_menu ;;
             8)
@@ -696,7 +822,7 @@ show_main_menu() {
                     NFT_HOOK="input"
                 fi
                 save_settings
-                log_success "Обнаружено: режим=$DETECTED_MODE порт=$DETECTED_PORT"
+                log_success "Обнаружено: режим=$DETECTED_MODE порт=${DETECTED_PORT:-?}"
                 echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
             u|U) full_uninstall ;;
@@ -1049,10 +1175,9 @@ first_run_wizard() {
         *) apply_preset hard ;;
     esac
 
-    # Сохранить
     save_settings
 
-    # Шаг 6: Применить тюнинг
+    # Шаг 6: Тюнинг
     echo ""
     echo -en "  ${BOLD}Применить тюнинг Telemt? [Y/n]:${NC} "
     local _yn_tuning
@@ -1061,7 +1186,7 @@ first_run_wizard() {
         apply_tuning || true
     fi
 
-    # Шаг 7: Применить NFT
+    # Шаг 7: NFT
     echo ""
     echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
     local _yn_nft
@@ -1070,7 +1195,7 @@ first_run_wizard() {
         apply_nft_rules || true
     fi
 
-    # Шаг 8: Установить службу
+    # Шаг 8: Служба
     echo ""
     echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
     local _yn_svc
@@ -1094,23 +1219,17 @@ main() {
 
     mkdir -p "$INSTALL_DIR"
 
-    # Копируем себя в директорию установки
     local _self="${BASH_SOURCE[0]}"
     if [ -f "$_self" ] && [ "$(realpath "$_self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
         cp "$_self" "${INSTALL_DIR}/mtpr.sh"
         chmod +x "${INSTALL_DIR}/mtpr.sh"
     fi
 
-    # Создаём симлинк
     ln -sf "${INSTALL_DIR}/mtpr.sh" /usr/local/bin/mtpr 2>/dev/null || true
 
-    # Загружаем настройки
     load_settings
-
-    # Обнаруживаем telemt
     detect_telemt || true
 
-    # Автозаполнение из обнаружения
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
     [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
@@ -1119,12 +1238,10 @@ main() {
         NFT_HOOK="input"
     fi
 
-    # Первый запуск?
     if [ ! -f "$SETTINGS_FILE" ]; then
         first_run_wizard
     fi
 
-    # Показать меню
     show_main_menu
 }
 
