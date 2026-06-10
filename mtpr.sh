@@ -187,6 +187,24 @@ detect_telemt() {
     DETECTED_PORT=""
     DETECTED_NETWORK_MODE=""
 
+    # Пути которые НЕ являются конфигом telemt
+    # telemt-panel — отдельный продукт со своим config.toml
+    _is_excluded_path() {
+        local _path="$1"
+        case "$_path" in
+            *telemt-panel*|*telemt_panel*) return 0 ;;
+        esac
+        return 1
+    }
+
+    # Проверяет что файл похож на конфиг telemt (есть [access.users] или [server] с port)
+    _looks_like_telemt_config() {
+        local _file="$1"
+        [ -f "$_file" ] || return 1
+        # Должен содержать хотя бы одну из ключевых секций telemt
+        grep -qE '^\[access\.users\]|^\[censorship\]|^\[general\.modes\]|^tls_domain[[:space:]]*=' "$_file" 2>/dev/null
+    }
+
     # 1. MTProxyMax
     if [ -f /opt/mtproxymax/settings.conf ] && command -v mtproxymax &>/dev/null; then
         DETECTED_MODE="mtproxymax"
@@ -214,16 +232,20 @@ detect_telemt() {
     if command -v docker &>/dev/null; then
         local _cname
         for _cname in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+            # Пропускаем контейнеры panel
+            case "$_cname" in *panel*|*telemt-panel*|*telemt_panel*) continue ;; esac
+
             local _inspect
             _inspect=$(docker inspect "$_cname" 2>/dev/null) || continue
 
-            # Проверяем: образ содержит telemt, или аргументы содержат telemt, или монтирован telemt.toml
             local _is_telemt=false
-            if echo "$_inspect" | grep -qiE '"Image".*telemt'; then
+            if echo "$_inspect" | grep -qiE '"Image".*telemt' | grep -viE 'panel'; then
                 _is_telemt=true
-            elif echo "$_inspect" | grep -qiE 'telemt\.toml|telemt/telemt'; then
+            fi
+            if [ "$_is_telemt" = "false" ] && echo "$_inspect" | grep -qiE 'telemt\.toml|telemt/telemt' | grep -viE 'panel'; then
                 _is_telemt=true
-            elif echo "$_inspect" | grep -qiE '"Cmd".*telemt'; then
+            fi
+            if [ "$_is_telemt" = "false" ] && echo "$_inspect" | grep -qiE '"Cmd".*telemt' | grep -viE 'panel'; then
                 _is_telemt=true
             fi
 
@@ -233,38 +255,34 @@ detect_telemt() {
             DETECTED_CONTAINER="$_cname"
 
             # Ищем конфиг по маунтам
-            local _mount
-            # Вариант 1: /etc/telemt.toml
-            _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
-            [ -n "$_mount" ] && [ -f "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
+            local _mount _candidate
 
-            # Вариант 2: /etc/telemt/ (Docker Compose стиль)
-            if [ -z "$DETECTED_CONFIG_PATH" ]; then
-                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
-                if [ -n "$_mount" ]; then
-                    [ -f "${_mount}/config.toml" ] && DETECTED_CONFIG_PATH="${_mount}/config.toml"
-                    [ -f "${_mount}/telemt.toml" ] && DETECTED_CONFIG_PATH="${_mount}/telemt.toml"
+            # Варианты mount destinations
+            local _dests="/etc/telemt.toml /etc/telemt /etc/telemt/telemt.toml /app/config.toml"
+            for _dest in $_dests; do
+                _mount=$(docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${_dest}\"}}{{.Source}}{{end}}{{end}}" "$_cname" 2>/dev/null)
+                [ -z "$_mount" ] && continue
+
+                if [ -d "$_mount" ]; then
+                    # Директория — ищем внутри
+                    for _candidate in "${_mount}/config.toml" "${_mount}/telemt.toml"; do
+                        if [ -f "$_candidate" ] && ! _is_excluded_path "$_candidate" && _looks_like_telemt_config "$_candidate"; then
+                            DETECTED_CONFIG_PATH="$_candidate"
+                            break 2
+                        fi
+                    done
+                elif [ -f "$_mount" ] && ! _is_excluded_path "$_mount" && _looks_like_telemt_config "$_mount"; then
+                    DETECTED_CONFIG_PATH="$_mount"
+                    break
                 fi
-            fi
-
-            # Вариант 3: /etc/telemt/telemt.toml
-            if [ -z "$DETECTED_CONFIG_PATH" ]; then
-                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/telemt/telemt.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
-                [ -n "$_mount" ] && [ -f "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
-            fi
-
-            # Вариант 4: /app/config.toml (docker run без compose)
-            if [ -z "$DETECTED_CONFIG_PATH" ]; then
-                _mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/config.toml"}}{{.Source}}{{end}}{{end}}' "$_cname" 2>/dev/null)
-                [ -n "$_mount" ] && [ -f "$_mount" ] && DETECTED_CONFIG_PATH="$_mount"
-            fi
+            done
 
             # Сеть
             local _nm
             _nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$_cname" 2>/dev/null)
-            DETECTED_NETWORK_MODE="${_nm:-bridge}"
-            # docker compose default network выглядит как "projectname_default"
-            if [ "$_nm" != "host" ] && [ "$_nm" != "none" ]; then
+            if [ "$_nm" = "host" ]; then
+                DETECTED_NETWORK_MODE="host"
+            else
                 DETECTED_NETWORK_MODE="bridge"
             fi
 
@@ -277,6 +295,66 @@ detect_telemt() {
             return 0
         done
     fi
+
+    # 3. Локальный процесс telemt (systemd / ручной запуск)
+    # Исключаем telemt-panel из поиска процессов
+    if pgrep -x telemt &>/dev/null || systemctl is-active telemt.service &>/dev/null 2>&1; then
+        DETECTED_MODE="local"
+        DETECTED_NETWORK_MODE="host"
+
+        # Ищем конфиг из аргументов процесса (исключаем panel)
+        local _args
+        _args=$(ps -eo args 2>/dev/null | grep '[t]elemt' | grep -v 'telemt-panel' | grep -v 'telemt_panel' | head -1 | grep -oE '/[^ ]+\.toml' | head -1)
+        if [ -n "$_args" ] && [ -f "$_args" ] && ! _is_excluded_path "$_args" && _looks_like_telemt_config "$_args"; then
+            DETECTED_CONFIG_PATH="$_args"
+        fi
+
+        # Стандартные пути
+        if [ -z "$DETECTED_CONFIG_PATH" ]; then
+            local _cf
+            for _cf in \
+                /etc/telemt/telemt.toml \
+                /etc/telemt/config.toml \
+                /etc/telemt.toml \
+                /opt/telemt/config.toml \
+                /opt/telemt/telemt.toml; do
+                if [ -f "$_cf" ] && ! _is_excluded_path "$_cf" && _looks_like_telemt_config "$_cf"; then
+                    DETECTED_CONFIG_PATH="$_cf"
+                    break
+                fi
+            done
+        fi
+
+        if [ -f "$DETECTED_CONFIG_PATH" ]; then
+            local _p
+            _p=$(_toml_get_value "port" "$DETECTED_CONFIG_PATH")
+            [ -n "$_p" ] && DETECTED_PORT="$_p"
+        fi
+        return 0
+    fi
+
+    # 4. Только конфиг (процесс не запущен)
+    local _cf
+    for _cf in \
+        /etc/telemt/telemt.toml \
+        /etc/telemt/config.toml \
+        /etc/telemt.toml \
+        /opt/telemt/config.toml \
+        /opt/telemt/telemt.toml \
+        /opt/mtproxymax/mtproxy/config.toml; do
+        if [ -f "$_cf" ] && ! _is_excluded_path "$_cf" && _looks_like_telemt_config "$_cf"; then
+            DETECTED_CONFIG_PATH="$_cf"
+            DETECTED_MODE="config_only"
+            DETECTED_NETWORK_MODE="host"
+            local _p
+            _p=$(_toml_get_value "port" "$_cf")
+            [ -n "$_p" ] && DETECTED_PORT="$_p"
+            return 0
+        fi
+    done
+
+    return 1
+}
 
     # 3. Локальный процесс telemt (systemd / ручной запуск)
     if pgrep -x telemt &>/dev/null || systemctl is-active telemt.service &>/dev/null 2>&1; then
@@ -419,7 +497,7 @@ apply_tuning() {
         return 0
     fi
 
-    # === Docker / Local / Config_only ===
+    # === Docker / Local / Config_only — редактируем config.toml напрямую ===
     if [ -z "$DETECTED_CONFIG_PATH" ] || [ ! -f "$DETECTED_CONFIG_PATH" ]; then
         log_warn "Файл конфигурации не найден — невозможно применить тюнинг автоматически"
         echo ""
@@ -437,9 +515,68 @@ apply_tuning() {
         return 0
     fi
 
+    # Подтверждение конфига перед редактированием
+    echo ""
+    echo -e "  ${BOLD}Обнаруженный конфиг:${NC} ${DETECTED_CONFIG_PATH}"
+
+    # Дополнительная проверка что это точно telemt конфиг
+    if ! _looks_like_telemt_config "$DETECTED_CONFIG_PATH"; then
+        log_error "Файл ${DETECTED_CONFIG_PATH} не похож на конфиг Telemt"
+        log_info "Пропускаю автоматический тюнинг"
+        echo ""
+        echo -e "  ${BOLD}Добавьте в конфиг Telemt вручную:${NC}"
+        echo ""
+        echo "  [general]"
+        echo "  tg_connect = $TUNING_TG_CONNECT"
+        echo ""
+        echo "  [timeouts]"
+        echo "  client_handshake = $TUNING_CLIENT_HANDSHAKE"
+        echo "  client_keepalive = $TUNING_CLIENT_KEEPALIVE"
+        echo ""
+        TUNING_APPLIED="manual"
+        save_settings
+        return 0
+    fi
+
+    echo -en "  ${BOLD}Редактировать этот файл? [Y/n/p(указать путь)]:${NC} "
+    local _confirm_cfg
+    read -r _confirm_cfg
+
+    case "$_confirm_cfg" in
+        n|N)
+            log_info "Пропущено. Добавьте параметры вручную."
+            echo ""
+            echo "  [general]"
+            echo "  tg_connect = $TUNING_TG_CONNECT"
+            echo ""
+            echo "  [timeouts]"
+            echo "  client_handshake = $TUNING_CLIENT_HANDSHAKE"
+            echo "  client_keepalive = $TUNING_CLIENT_KEEPALIVE"
+            echo ""
+            TUNING_APPLIED="manual"
+            save_settings
+            return 0
+            ;;
+        p|P)
+            echo -en "  Путь к конфигу Telemt: "
+            local _custom_path
+            read -r _custom_path
+            if [ -f "$_custom_path" ] && _looks_like_telemt_config "$_custom_path"; then
+                DETECTED_CONFIG_PATH="$_custom_path"
+                log_success "Конфиг принят: $_custom_path"
+            elif [ -f "$_custom_path" ]; then
+                log_warn "Файл не похож на конфиг Telemt, но используем его"
+                DETECTED_CONFIG_PATH="$_custom_path"
+            else
+                log_error "Файл не найден: $_custom_path"
+                TUNING_APPLIED="manual"
+                save_settings
+                return 0
+            fi
+            ;;
+    esac
+
     local _cfg="$DETECTED_CONFIG_PATH"
-    local _changed=false
-    local _failed=false
 
     # Создаём бэкап перед изменениями
     cp "$_cfg" "${_cfg}.mtpr-backup-$(date +%s)" 2>/dev/null || true
@@ -1120,14 +1257,44 @@ first_run_wizard() {
         [ -n "$DETECTED_CONFIG_PATH" ] && log_info "Конфиг: ${DETECTED_CONFIG_PATH}"
         [ -n "$DETECTED_PORT" ] && log_info "Порт: ${DETECTED_PORT}"
         [ -n "$DETECTED_NETWORK_MODE" ] && log_info "Сеть: ${DETECTED_NETWORK_MODE}"
+
+        # Дать возможность указать другой конфиг
+        if [ -n "$DETECTED_CONFIG_PATH" ]; then
+            echo ""
+            echo -en "  ${DIM}Указать другой путь к конфигу? [n/путь]:${NC} "
+            local _alt_cfg
+            read -r _alt_cfg
+            if [ -n "$_alt_cfg" ] && [ "$_alt_cfg" != "n" ] && [ "$_alt_cfg" != "N" ]; then
+                if [ -f "$_alt_cfg" ]; then
+                    DETECTED_CONFIG_PATH="$_alt_cfg"
+                    log_success "Конфиг: $_alt_cfg"
+                    local _p
+                    _p=$(_toml_get_value "port" "$_alt_cfg")
+                    [ -n "$_p" ] && DETECTED_PORT="$_p"
+                else
+                    log_error "Файл не найден: $_alt_cfg"
+                fi
+            fi
+        fi
     else
         log_warn "Telemt не обнаружен автоматически"
-    fi
-
-    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
-        NFT_HOOK="forward"
-    else
-        NFT_HOOK="input"
+        echo ""
+        echo -en "  ${BOLD}Указать путь к конфигу Telemt вручную? [n/путь]:${NC} "
+        local _manual_cfg
+        read -r _manual_cfg
+        if [ -n "$_manual_cfg" ] && [ "$_manual_cfg" != "n" ] && [ "$_manual_cfg" != "N" ]; then
+            if [ -f "$_manual_cfg" ]; then
+                DETECTED_CONFIG_PATH="$_manual_cfg"
+                DETECTED_MODE="manual"
+                DETECTED_NETWORK_MODE="host"
+                log_success "Конфиг: $_manual_cfg"
+                local _p
+                _p=$(_toml_get_value "port" "$_manual_cfg")
+                [ -n "$_p" ] && DETECTED_PORT="$_p"
+            else
+                log_error "Файл не найден: $_manual_cfg"
+            fi
+        fi
     fi
 
     # Шаг 2: Зависимости
