@@ -1,16 +1,17 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.2
+#  MTproxy-reanimation v1.0.3
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
 SYSTEMD_UNIT="mtpr-syn-limit.service"
+IOS_SYSCTL_FILE="/etc/sysctl.d/99-tg-keepalive.conf"
 
 # ── Цвета ─────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -42,6 +43,7 @@ TUNING_CLIENT_HANDSHAKE="15"
 TUNING_CLIENT_KEEPALIVE="60"
 TUNING_APPLIED="false"
 NFT_SERVICE_ENABLED="false"
+IOS_FIX_APPLIED="false"
 
 declare -A EXTRA_RULES_PORT
 declare -A EXTRA_RULES_IP
@@ -81,6 +83,7 @@ TUNING_CLIENT_HANDSHAKE='${TUNING_CLIENT_HANDSHAKE}'
 TUNING_CLIENT_KEEPALIVE='${TUNING_CLIENT_KEEPALIVE}'
 TUNING_APPLIED='${TUNING_APPLIED}'
 NFT_SERVICE_ENABLED='${NFT_SERVICE_ENABLED}'
+IOS_FIX_APPLIED='${IOS_FIX_APPLIED}'
 EXTRA_RULES_COUNT='${EXTRA_RULES_COUNT}'
 EOF
     local _i
@@ -106,7 +109,7 @@ load_settings() {
                 SERVER_IP|SERVER_PORT|NFT_RATE|NFT_BURST|NFT_METER_TIMEOUT|\
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
-                EXTRA_RULES_COUNT)
+                IOS_FIX_APPLIED|EXTRA_RULES_COUNT)
                     printf -v "$_key" '%s' "$_val"
                     ;;
                 EXTRA_RULES_*_PORT)
@@ -132,7 +135,6 @@ load_settings() {
 }
 
 # ── Безопасное чтение значения из TOML ────────────────────────
-# Читает числовое значение ключа, учитывая секцию
 _toml_get_value() {
     local _key="$1" _file="$2"
     [ -f "$_file" ] || return 0
@@ -142,43 +144,31 @@ _toml_get_value() {
     ' "$_file" 2>/dev/null
 }
 
-# Проверяет, есть ли секция в файле
 _toml_has_section() {
     local _section="$1" _file="$2"
     grep -qE "^\\[${_section}\\]" "$_file" 2>/dev/null
 }
 
-# Проверяет, есть ли ключ в файле (любая секция)
 _toml_has_key() {
     local _key="$1" _file="$2"
     grep -qE "^${_key}[[:space:]]*=" "$_file" 2>/dev/null
 }
 
-# Безопасно устанавливает значение: заменяет если есть, добавляет в секцию если нет
-# НЕ создаёт секцию если её нет — возвращает 1
 _toml_safe_set() {
     local _key="$1" _value="$2" _section="$3" _file="$4"
-
     [ -f "$_file" ] || return 1
-
-    # Если ключ уже существует — заменяем
     if _toml_has_key "$_key" "$_file"; then
         sed -i "s/^${_key}[[:space:]]*=.*/${_key} = ${_value}/" "$_file"
         return 0
     fi
-
-    # Если секция существует — добавляем после неё
     if _toml_has_section "$_section" "$_file"; then
         sed -i "/^\\[${_section}\\]/a ${_key} = ${_value}" "$_file"
         return 0
     fi
-
-    # Секции нет — не трогаем файл
     return 1
 }
 
 # ── Обнаружение Telemt ────────────────────────────────────────
-# Пути которые НЕ являются конфигом telemt
 _is_excluded_path() {
     local _path="$1"
     case "$_path" in
@@ -187,7 +177,6 @@ _is_excluded_path() {
     return 1
 }
 
-# Проверяет что файл похож на конфиг telemt
 _looks_like_telemt_config() {
     local _file="$1"
     [ -f "$_file" ] || return 1
@@ -229,15 +218,12 @@ detect_telemt() {
     if command -v docker &>/dev/null; then
         local _cname
         for _cname in $(docker ps --format '{{.Names}}' 2>/dev/null); do
-            # Пропускаем контейнеры panel
             case "$_cname" in *panel*|*telemt-panel*|*telemt_panel*) continue ;; esac
 
             local _inspect
             _inspect=$(docker inspect "$_cname" 2>/dev/null) || continue
 
             local _is_telemt=false
-
-            # Проверяем образ, команду, маунты — исключая panel
             local _inspect_no_panel
             _inspect_no_panel=$(echo "$_inspect" | grep -viE 'panel')
 
@@ -254,17 +240,13 @@ detect_telemt() {
             DETECTED_MODE="docker"
             DETECTED_CONTAINER="$_cname"
 
-            # Ищем конфиг по маунтам
             local _mount _candidate
-
-            # Варианты mount destinations
             local _dests="/etc/telemt.toml /etc/telemt /etc/telemt/telemt.toml /app/config.toml"
             for _dest in $_dests; do
                 _mount=$(docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${_dest}\"}}{{.Source}}{{end}}{{end}}" "$_cname" 2>/dev/null)
                 [ -z "$_mount" ] && continue
 
                 if [ -d "$_mount" ]; then
-                    # Директория — ищем внутри
                     for _candidate in "${_mount}/config.toml" "${_mount}/telemt.toml"; do
                         if [ -f "$_candidate" ] && ! _is_excluded_path "$_candidate" && _looks_like_telemt_config "$_candidate"; then
                             DETECTED_CONFIG_PATH="$_candidate"
@@ -277,7 +259,6 @@ detect_telemt() {
                 fi
             done
 
-            # Сеть
             local _nm
             _nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$_cname" 2>/dev/null)
             if [ "$_nm" = "host" ]; then
@@ -286,7 +267,6 @@ detect_telemt() {
                 DETECTED_NETWORK_MODE="bridge"
             fi
 
-            # Порт из конфига
             if [ -f "$DETECTED_CONFIG_PATH" ]; then
                 local _p
                 _p=$(_toml_get_value "port" "$DETECTED_CONFIG_PATH")
@@ -296,20 +276,17 @@ detect_telemt() {
         done
     fi
 
-    # 3. Локальный процесс telemt (systemd / ручной запуск)
-    # Исключаем telemt-panel из поиска процессов
+    # 3. Локальный процесс telemt
     if pgrep -x telemt &>/dev/null || systemctl is-active telemt.service &>/dev/null 2>&1; then
         DETECTED_MODE="local"
         DETECTED_NETWORK_MODE="host"
 
-        # Ищем конфиг из аргументов процесса (исключаем panel)
         local _args
         _args=$(ps -eo args 2>/dev/null | grep '[t]elemt' | grep -v 'telemt-panel' | grep -v 'telemt_panel' | head -1 | grep -oE '/[^ ]+\.toml' | head -1)
         if [ -n "$_args" ] && [ -f "$_args" ] && ! _is_excluded_path "$_args" && _looks_like_telemt_config "$_args"; then
             DETECTED_CONFIG_PATH="$_args"
         fi
 
-        # Стандартные пути
         if [ -z "$DETECTED_CONFIG_PATH" ]; then
             local _cf
             for _cf in \
@@ -333,7 +310,7 @@ detect_telemt() {
         return 0
     fi
 
-    # 4. Только конфиг (процесс не запущен)
+    # 4. Только конфиг
     local _cf
     for _cf in \
         /etc/telemt/telemt.toml \
@@ -366,7 +343,6 @@ detect_public_ip() {
 }
 
 # ── Зависимости ──────────────────────────────────────────────
-
 install_dependencies() {
     log_info "Проверка зависимостей..."
     local _missing=()
@@ -392,11 +368,9 @@ install_dependencies() {
 }
 
 # ── Тюнинг Telemt ─────────────────────────────────────────────
-
 apply_tuning() {
     log_info "Применение тюнинга Telemt..."
 
-    # === MTProxyMax ===
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
         log_info "Режим: MTProxyMax — используем команды mtproxymax tune"
         local _changed=false
@@ -438,7 +412,6 @@ apply_tuning() {
         return 0
     fi
 
-    # === Docker / Local / Config_only — редактируем config.toml напрямую ===
     if [ -z "$DETECTED_CONFIG_PATH" ] || [ ! -f "$DETECTED_CONFIG_PATH" ]; then
         log_warn "Файл конфигурации не найден — невозможно применить тюнинг автоматически"
         echo ""
@@ -456,11 +429,9 @@ apply_tuning() {
         return 0
     fi
 
-    # Подтверждение конфига перед редактированием
     echo ""
     echo -e "  ${BOLD}Обнаруженный конфиг:${NC} ${DETECTED_CONFIG_PATH}"
 
-    # Дополнительная проверка что это точно telemt конфиг
     if ! _looks_like_telemt_config "$DETECTED_CONFIG_PATH"; then
         log_error "Файл ${DETECTED_CONFIG_PATH} не похож на конфиг Telemt"
         log_info "Пропускаю автоматический тюнинг"
@@ -518,12 +489,10 @@ apply_tuning() {
     esac
 
     local _cfg="$DETECTED_CONFIG_PATH"
-
-    # Создаём бэкап перед изменениями
     cp "$_cfg" "${_cfg}.mtpr-backup-$(date +%s)" 2>/dev/null || true
 
-    # tg_connect → секция [general]
-    local _cur
+    local _cur _changed=false _failed=false
+
     _cur=$(_toml_get_value "tg_connect" "$_cfg")
     if [ "$_cur" != "$TUNING_TG_CONNECT" ]; then
         if _toml_safe_set "tg_connect" "$TUNING_TG_CONNECT" "general" "$_cfg"; then
@@ -537,7 +506,6 @@ apply_tuning() {
         log_info "tg_connect уже $TUNING_TG_CONNECT"
     fi
 
-    # client_handshake → секция [timeouts]
     _cur=$(_toml_get_value "client_handshake" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_HANDSHAKE" ]; then
         if _toml_safe_set "client_handshake" "$TUNING_CLIENT_HANDSHAKE" "timeouts" "$_cfg"; then
@@ -551,7 +519,6 @@ apply_tuning() {
         log_info "client_handshake уже $TUNING_CLIENT_HANDSHAKE"
     fi
 
-    # client_keepalive → секция [timeouts]
     _cur=$(_toml_get_value "client_keepalive" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
         if _toml_safe_set "client_keepalive" "$TUNING_CLIENT_KEEPALIVE" "timeouts" "$_cfg"; then
@@ -565,7 +532,6 @@ apply_tuning() {
         log_info "client_keepalive уже $TUNING_CLIENT_KEEPALIVE"
     fi
 
-    # Если что-то не удалось — показать инструкцию
     if [ "$_failed" = "true" ]; then
         echo ""
         echo -e "  ${YELLOW}Некоторые параметры не удалось применить автоматически.${NC}"
@@ -580,7 +546,6 @@ apply_tuning() {
         echo ""
     fi
 
-    # Перезапуск если были изменения
     if [ "$_changed" = "true" ]; then
         if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
             log_info "Перезапуск контейнера $DETECTED_CONTAINER..."
@@ -601,8 +566,176 @@ apply_tuning() {
     save_settings
 }
 
-# ── NFT правила ───────────────────────────────────────────────
+# ── Фикс для iOS (TCP keepalive) ─────────────────────────────
 
+ios_fix_status() {
+    if [ -f "$IOS_SYSCTL_FILE" ]; then
+        local _time _intvl _probes
+        _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+        _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
+        _probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+        echo -e "${GREEN}активен${NC} (time=${_time} intvl=${_intvl} probes=${_probes})"
+    else
+        echo -e "${DIM}не применён${NC}"
+    fi
+}
+
+ios_fix_apply() {
+    echo ""
+    echo -e "  ${BOLD}Фикс для iOS — TCP keepalive${NC}"
+    echo ""
+    echo -e "  ${DIM}Проблема: мобильный клиент сворачивается, ОС усыпляет${NC}"
+    echo -e "  ${DIM}приложение, сокет не закрывается чисто. Сервер держит${NC}"
+    echo -e "  ${DIM}мёртвое соединение часами. При возврате клиент залипает.${NC}"
+    echo ""
+    echo -e "  ${DIM}Решение: ускоряем TCP keepalive через sysctl.${NC}"
+    echo -e "  ${DIM}Мёртвый коннект будет рваться за ~105 сек:${NC}"
+    echo -e "  ${DIM}  60с тишины → проба каждые 15с × 3 попытки → RST${NC}"
+    echo ""
+
+    local _cur_time _cur_intvl _cur_probes
+    _cur_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+    _cur_intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
+    _cur_probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+
+    echo -e "  ${BOLD}Текущие значения ядра:${NC}"
+    echo -e "    tcp_keepalive_time   = ${_cur_time:-?}  ${DIM}(дефолт: 7200)${NC}"
+    echo -e "    tcp_keepalive_intvl  = ${_cur_intvl:-?}  ${DIM}(дефолт: 75)${NC}"
+    echo -e "    tcp_keepalive_probes = ${_cur_probes:-?}  ${DIM}(дефолт: 9)${NC}"
+    echo ""
+
+    if [ -f "$IOS_SYSCTL_FILE" ]; then
+        echo -e "  ${YELLOW}Файл ${IOS_SYSCTL_FILE} уже существует.${NC}"
+        echo -en "  ${BOLD}Перезаписать? [Y/n]:${NC} "
+    else
+        echo -en "  ${BOLD}Применить фикс? [Y/n]:${NC} "
+    fi
+    local _confirm
+    read -r _confirm
+    [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
+
+    cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
+# MTproxy-reanimation: фикс для iOS — TCP keepalive
+# После 60с тишины — первая keepalive-проба
+net.ipv4.tcp_keepalive_time = 60
+# Повтор пробы каждые 15с
+net.ipv4.tcp_keepalive_intvl = 15
+# 3 неотвеченных пробы → RST
+net.ipv4.tcp_keepalive_probes = 3
+SYSEOF
+
+    if sysctl --system &>/dev/null; then
+        log_success "sysctl применён"
+    else
+        log_warn "sysctl --system вернул ошибку, применяем вручную"
+        sysctl -w net.ipv4.tcp_keepalive_time=60 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_keepalive_intvl=15 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_keepalive_probes=3 2>/dev/null || true
+    fi
+
+    local _new_time _new_intvl _new_probes
+    _new_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+    _new_intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
+    _new_probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+
+    echo ""
+    echo -e "  ${BOLD}Новые значения ядра:${NC}"
+    echo -e "    tcp_keepalive_time   = ${_new_time}"
+    echo -e "    tcp_keepalive_intvl  = ${_new_intvl}"
+    echo -e "    tcp_keepalive_probes = ${_new_probes}"
+
+    if [ "${_new_time}" = "60" ] && [ "${_new_intvl}" = "15" ] && [ "${_new_probes}" = "3" ]; then
+        log_success "Фикс для iOS применён"
+        echo -e "  ${DIM}Мёртвый коннект будет рваться за ~105 сек${NC}"
+    else
+        log_warn "Значения не совпадают с ожидаемыми — проверьте вручную"
+    fi
+
+    IOS_FIX_APPLIED="true"
+    save_settings
+}
+
+ios_fix_remove() {
+    echo ""
+    if [ ! -f "$IOS_SYSCTL_FILE" ]; then
+        log_info "Фикс для iOS не установлен"
+        IOS_FIX_APPLIED="false"
+        save_settings
+        return 0
+    fi
+
+    echo -e "  ${BOLD}Откат фикса для iOS${NC}"
+    echo ""
+    echo -e "  ${DIM}Будет удалён: ${IOS_SYSCTL_FILE}${NC}"
+    echo -e "  ${DIM}Значения ядра вернутся к дефолтным (7200 / 75 / 9)${NC}"
+    echo ""
+    echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
+    local _confirm
+    read -r _confirm
+    [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
+
+    rm -f "$IOS_SYSCTL_FILE"
+
+    sysctl -w net.ipv4.tcp_keepalive_time=7200 &>/dev/null || true
+    sysctl -w net.ipv4.tcp_keepalive_intvl=75 &>/dev/null || true
+    sysctl -w net.ipv4.tcp_keepalive_probes=9 &>/dev/null || true
+    sysctl --system &>/dev/null || true
+
+    local _time _intvl _probes
+    _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+    _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
+    _probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+
+    echo ""
+    echo -e "  ${BOLD}Текущие значения ядра:${NC}"
+    echo -e "    tcp_keepalive_time   = ${_time}"
+    echo -e "    tcp_keepalive_intvl  = ${_intvl}"
+    echo -e "    tcp_keepalive_probes = ${_probes}"
+
+    log_success "Фикс для iOS откачен"
+    IOS_FIX_APPLIED="false"
+    save_settings
+}
+
+show_ios_fix_menu() {
+    show_header
+    echo -e "  ${BOLD}Фикс для iOS (TCP keepalive)${NC}"
+    echo ""
+
+    local _status
+    _status=$(ios_fix_status)
+    echo -e "  Статус: ${_status}"
+    echo ""
+
+    local _time _intvl _probes
+    _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+    _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
+    _probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+    local _detect_secs=$(( ${_time:-7200} + ${_intvl:-75} * ${_probes:-9} ))
+
+    echo -e "  ${BOLD}Значения ядра:${NC}"
+    echo -e "    tcp_keepalive_time   = ${_time:-?}  ${DIM}(дефолт: 7200, фикс: 60)${NC}"
+    echo -e "    tcp_keepalive_intvl  = ${_intvl:-?}  ${DIM}(дефолт: 75,   фикс: 15)${NC}"
+    echo -e "    tcp_keepalive_probes = ${_probes:-?}  ${DIM}(дефолт: 9,    фикс: 3)${NC}"
+    echo -e "    ${DIM}Время обнаружения мёртвого коннекта: ~${_detect_secs} сек${NC}"
+    echo ""
+    echo -e "  ${DIM}[1]${NC} Применить фикс"
+    echo -e "  ${DIM}[2]${NC} Откатить фикс"
+    echo -e "  ${DIM}[0]${NC} Назад"
+    echo ""
+    echo -en "  Выбор: "
+    local _choice
+    read -r _choice
+
+    case "$_choice" in
+        1) ios_fix_apply ;;
+        2) ios_fix_remove ;;
+        0|"") return ;;
+    esac
+    echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
+}
+
+# ── NFT правила ───────────────────────────────────────────────
 generate_nft_script() {
     local _ip="${SERVER_IP:-}"
     local _port="${SERVER_PORT:-443}"
@@ -678,7 +811,6 @@ remove_nft_rules() {
 }
 
 # ── Systemd сервис ────────────────────────────────────────────
-
 install_service() {
     generate_nft_script
     local _table="${NFT_TABLE:-telemt_limit}"
@@ -717,7 +849,6 @@ remove_service() {
 }
 
 # ── Пресеты ───────────────────────────────────────────────────
-
 apply_preset() {
     local _preset="$1"
     case "$_preset" in
@@ -731,7 +862,6 @@ apply_preset() {
 }
 
 # ── Счётчик дропов ────────────────────────────────────────────
-
 show_drop_counter() {
     local _table="${NFT_TABLE:-telemt_limit}"
     local _hook="${NFT_HOOK:-input}"
@@ -748,7 +878,6 @@ show_drop_counter() {
 }
 
 # ── Полное удаление ───────────────────────────────────────────
-
 full_uninstall() {
     echo ""
     echo -e "  ${RED}${BOLD}УДАЛЕНИЕ MTproxy-reanimation${NC}"
@@ -758,6 +887,7 @@ full_uninstall() {
     echo -e "  ${DIM}- Systemd служба${NC}"
     echo -e "  ${DIM}- Все настройки и скрипты${NC}"
     echo -e "  ${DIM}- Симлинк /usr/local/bin/mtpr${NC}"
+    echo -e "  ${DIM}- iOS фикс (sysctl keepalive)${NC}"
     echo ""
     echo -e "  ${YELLOW}Значения тюнинга Telemt НЕ будут откачены.${NC}"
     echo -e "  ${YELLOW}Бэкапы конфигов (*.mtpr-backup-*) останутся на месте.${NC}"
@@ -766,6 +896,16 @@ full_uninstall() {
     local _confirm
     read -r _confirm
     [ "$_confirm" != "yes" ] && { log_info "Отменено"; return; }
+
+    # Откат iOS фикса если был применён
+    if [ -f "$IOS_SYSCTL_FILE" ]; then
+        rm -f "$IOS_SYSCTL_FILE"
+        sysctl -w net.ipv4.tcp_keepalive_time=7200 &>/dev/null || true
+        sysctl -w net.ipv4.tcp_keepalive_intvl=75 &>/dev/null || true
+        sysctl -w net.ipv4.tcp_keepalive_probes=9 &>/dev/null || true
+        sysctl --system &>/dev/null || true
+        log_success "iOS фикс откачен"
+    fi
 
     remove_nft_rules 2>/dev/null || true
     remove_service 2>/dev/null || true
@@ -795,7 +935,6 @@ full_uninstall() {
 }
 
 # ── Интерфейс ─────────────────────────────────────────────────
-
 show_header() {
     clear 2>/dev/null || printf '\033[2J\033[H'
     echo ""
@@ -825,6 +964,9 @@ show_header() {
         partial) _tuning_status="${YELLOW}частично${NC}" ;;
     esac
 
+    local _ios_status
+    _ios_status=$(ios_fix_status)
+
     echo -e "  ${BOLD}Обнаружение:${NC}   ${DETECTED_MODE:-не найден}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
     echo -e "  ${BOLD}Сеть:${NC}          ${DETECTED_NETWORK_MODE:-неизвестно} → hook ${NFT_HOOK}"
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
@@ -838,6 +980,7 @@ show_header() {
     echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
     echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
+    echo -e "  ${BOLD}iOS фикс:${NC}      ${_ios_status}"
 
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""
@@ -864,6 +1007,7 @@ show_main_menu() {
         echo -e "  ${CYAN}[6]${NC}  Управление службой"
         echo -e "  ${CYAN}[7]${NC}  Доп. правила (добавить порт)"
         echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
+        echo -e "  ${CYAN}[9]${NC}  Фикс для iOS (TCP keepalive)"
         echo ""
         echo -e "  ${RED}[u]${NC}  Удалить"
         echo -e "  ${CYAN}[0]${NC}  Выход"
@@ -903,6 +1047,7 @@ show_main_menu() {
                 log_success "Обнаружено: режим=$DETECTED_MODE порт=${DETECTED_PORT:-?}"
                 echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
                 ;;
+            9) show_ios_fix_menu ;;
             u|U) full_uninstall ;;
             0|q|Q) exit 0 ;;
         esac
@@ -1181,7 +1326,6 @@ show_extra_rules_menu() {
 }
 
 # ── Мастер первого запуска ────────────────────────────────────
-
 first_run_wizard() {
     clear 2>/dev/null || printf '\033[2J\033[H'
     echo ""
@@ -1199,7 +1343,6 @@ first_run_wizard() {
         [ -n "$DETECTED_PORT" ] && log_info "Порт: ${DETECTED_PORT}"
         [ -n "$DETECTED_NETWORK_MODE" ] && log_info "Сеть: ${DETECTED_NETWORK_MODE}"
 
-        # Дать возможность указать другой конфиг
         if [ -n "$DETECTED_CONFIG_PATH" ]; then
             echo ""
             echo -en "  ${DIM}Указать другой путь к конфигу? [n/путь]:${NC} "
@@ -1294,7 +1437,26 @@ first_run_wizard() {
         apply_tuning || true
     fi
 
-    # Шаг 7: NFT
+    # Шаг 7: iOS фикс
+    echo ""
+    echo -en "  ${BOLD}Применить фикс для iOS (TCP keepalive)? [Y/n]:${NC} "
+    local _yn_ios
+    read -r _yn_ios
+    if [[ ! "$_yn_ios" =~ ^[nN] ]]; then
+        # Применяем без интерактивного подтверждения внутри функции
+        cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
+# MTproxy-reanimation: фикс для iOS — TCP keepalive
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+SYSEOF
+        sysctl --system &>/dev/null || true
+        IOS_FIX_APPLIED="true"
+        save_settings
+        log_success "Фикс для iOS применён"
+    fi
+
+    # Шаг 8: NFT
     echo ""
     echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
     local _yn_nft
@@ -1303,7 +1465,7 @@ first_run_wizard() {
         apply_nft_rules || true
     fi
 
-    # Шаг 8: Служба
+    # Шаг 9: Служба
     echo ""
     echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
     local _yn_svc
@@ -1321,7 +1483,6 @@ first_run_wizard() {
 }
 
 # ── Главная точка входа ───────────────────────────────────────
-
 main() {
     check_root
 
