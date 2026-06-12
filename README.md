@@ -12,7 +12,7 @@
 curl -fsSL https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main/install.sh | sudo bash
 ```
 
-После установки запускается мастер настройки.  
+После установки запускается мастер настройки. Или обновленное меню если ставите поверх установленного.
 Если нужно открыть меню позже:
 
 ```bash
