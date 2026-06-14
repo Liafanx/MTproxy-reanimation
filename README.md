@@ -45,10 +45,10 @@ mtpr
   - `input` — если Telemt работает на хосте или через `--network host`
   - `forward` — если Telemt работает в Docker bridge
 - применяет **per-client inbound SYN limiter** через `nftables`
-- может безопасно применить базовые параметры Telemt:
-  - `tg_connect = 10`
-  - `client_handshake = 15`
-  - `client_keepalive = 60`
+- может безопасно применить базовые параметры Telemt(потом модно изменить в настройках):
+  - `tg_connect = 30`
+  - `client_handshake = 90`
+  - `client_keepalive = 120`
 - перед изменением `config.toml` **создаёт бэкап** (`*.mtpr-backup-*`)
 - умеет поставить `systemd`-службу и включить автозапуск
 - позволяет управлять всеми настройками через меню
