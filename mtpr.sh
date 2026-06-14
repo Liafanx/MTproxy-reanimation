@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.4
+#  MTproxy-reanimation v1.0.5
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.4"
+VERSION="1.0.5"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -38,9 +38,9 @@ NFT_BURST="1"
 NFT_METER_TIMEOUT="60s"
 NFT_TABLE="telemt_limit"
 NFT_HOOK="input"
-TUNING_TG_CONNECT="10"
-TUNING_CLIENT_HANDSHAKE="15"
-TUNING_CLIENT_KEEPALIVE="60"
+TUNING_TG_CONNECT="30"
+TUNING_CLIENT_HANDSHAKE="90"
+TUNING_CLIENT_KEEPALIVE="120"
 TUNING_APPLIED="false"
 NFT_SERVICE_ENABLED="false"
 IOS_FIX_APPLIED="false"
