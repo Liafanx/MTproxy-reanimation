@@ -1269,19 +1269,27 @@ show_header() {
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
     echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
     echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"; echo ""
-    echo -e "  ${BOLD}IP привязка:${NC}   ${SERVER_IP:-${DIM}отключена (все IP сервера)${NC}}"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
+            local _cip
+            _cip=$(docker_container_ip)
+            echo -e "  ${BOLD}IP режим:${NC}      ${GREEN}авто по IP контейнера${NC}"
+            echo -e "  ${BOLD}IP Контейнера:${NC}  ${_cip:-${DIM}не найден${NC}}"
+        else
+            echo -e "  ${BOLD}IP режим:${NC}      ${DIM}без IP привязки (только по порту)${NC}"
+        fi
+    else
+        echo -e "  ${BOLD}IP привязка:${NC}   ${SERVER_IP:-${DIM}отключена (все IP сервера)${NC}}"
+    fi
+
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
     echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
     echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
-    echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"; echo ""
+    echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
+    echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
     echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
     echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
-    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
-        local _cip
-        _cip=$(docker_container_ip)
-        echo -e "  ${BOLD}Container IP:${NC}  ${_cip:-${DIM}не найден${NC}}"
-    fi    
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
         local _i; for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
