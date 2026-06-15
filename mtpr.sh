@@ -337,6 +337,24 @@ detect_public_ip() {
     echo "$_ip"
 }
 
+validate_ip_literal() {
+    local _ip="$1"
+
+    # Только IPv4
+    if [[ "$_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        local _a _b _c _d
+        read -r _a _b _c _d <<< "$_ip"
+        for _octet in "$_a" "$_b" "$_c" "$_d"; do
+            [[ "$_octet" =~ ^[0-9]+$ ]] || return 1
+            [ "$_octet" -ge 0 ] && [ "$_octet" -le 255 ] || return 1
+        done
+        return 0
+    fi
+
+    return 1
+}
+
 # ── Зависимости ──────────────────────────────────────────────
 install_dependencies() {
     log_info "Проверка зависимостей..."
@@ -756,20 +774,41 @@ show_ios2_fix_menu() {
         1) ios2_fix_apply ;;
         2) ios2_fix_remove ;;
         3)
-            echo -en "  Новый внешний порт [${IOS2_EXTERNAL_PORT}]: "; local _p; read -r _p
+            echo -en "  Новый внешний порт [${IOS2_EXTERNAL_PORT}]: "
+            local _p; read -r _p
             if [[ "$_p" =~ ^[0-9]+$ ]] && [ "$_p" -ge 1 ] && [ "$_p" -le 65535 ]; then
-                IOS2_EXTERNAL_PORT="$_p"; save_settings; log_success "Внешний порт: $_p"
-            elif [ -n "$_p" ]; then log_error "Некорректный порт"; fi ;;
+                IOS2_EXTERNAL_PORT="$_p"
+                save_settings
+                log_success "Внешний порт: $_p"
+                prompt_apply_nft_rules
+            elif [ -n "$_p" ]; then
+                log_error "Некорректный порт"
+            fi
+            ;;
         4)
-            echo -en "  Новый целевой порт [${_target}]: "; local _p; read -r _p
+            echo -en "  Новый целевой порт [${_target}]: "
+            local _p; read -r _p
             if [[ "$_p" =~ ^[0-9]+$ ]] && [ "$_p" -ge 1 ] && [ "$_p" -le 65535 ]; then
-                IOS2_TARGET_PORT="$_p"; save_settings; log_success "Целевой порт: $_p"
-            elif [ -n "$_p" ]; then log_error "Некорректный порт"; fi ;;
+                IOS2_TARGET_PORT="$_p"
+                save_settings
+                log_success "Целевой порт: $_p"
+                prompt_apply_nft_rules
+            elif [ -n "$_p" ]; then
+                log_error "Некорректный порт"
+            fi
+            ;;
         5)
-            echo -en "  Новый MSS [${IOS2_MSS}] (88..4096): "; local _m; read -r _m
+            echo -en "  Новый MSS [${IOS2_MSS}] (88..4096): "
+            local _m; read -r _m
             if [[ "$_m" =~ ^[0-9]+$ ]] && [ "$_m" -ge 88 ] && [ "$_m" -le 4096 ]; then
-                IOS2_MSS="$_m"; save_settings; log_success "MSS: $_m"
-            elif [ -n "$_m" ]; then log_error "Некорректный MSS (88..4096)"; fi ;;
+                IOS2_MSS="$_m"
+                save_settings
+                log_success "MSS: $_m"
+                prompt_apply_nft_rules
+            elif [ -n "$_m" ]; then
+                log_error "Некорректный MSS (88..4096)"
+            fi
+            ;;
         0|"") return ;;
     esac
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -860,6 +899,26 @@ remove_nft_rules() {
     nft delete table inet "$_table" 2>/dev/null || true
     nft delete table inet "$_ios2_table" 2>/dev/null || true
     log_success "NFT правила удалены"
+}
+
+prompt_apply_nft_rules() {
+    if [ -z "$SERVER_PORT" ] && [ "${IOS2_FIX_APPLIED:-false}" != "true" ]; then
+        log_warn "Порт не задан — NFT-правила сейчас применить нельзя"
+        return 0
+    fi
+
+    echo ""
+    echo -en "  ${BOLD}Применить новые NFT-правила сейчас? [Y/n]:${NC} "
+    local _yn
+    read -r _yn
+
+    # По умолчанию = Да
+    if [[ ! "$_yn" =~ ^[nN]$ ]]; then
+        apply_nft_rules || true
+        if [ "${NFT_SERVICE_ENABLED:-false}" = "true" ]; then
+            install_service
+        fi
+    fi
 }
 
 # ── Systemd сервис ────────────────────────────────────────────
@@ -981,7 +1040,7 @@ show_header() {
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
     echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
     echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"; echo ""
-    echo -e "  ${BOLD}IP:${NC}            ${SERVER_IP:-${DIM}любой${NC}}"
+    echo -e "  ${BOLD}IP привязка:${NC}   ${SERVER_IP:-${DIM}отключена (все IP сервера)${NC}}"
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
     echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
     echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
@@ -1033,7 +1092,7 @@ show_main_menu() {
 show_settings_menu() {
     while true; do
         show_header; echo -e "  ${BOLD}Настройки${NC}"; echo ""
-        echo -e "  ${DIM}[1]${NC} IP сервера      [${SERVER_IP:-любой}]"
+        echo -e "  ${DIM}[1]${NC} Привязка к IPv4 [${SERVER_IP:-отключена}]"
         echo -e "  ${DIM}[2]${NC} Порт            [${SERVER_PORT:-не задан}]"
         echo -e "  ${DIM}[3]${NC} Rate             [${NFT_RATE}]"
         echo -e "  ${DIM}[4]${NC} Burst            [${NFT_BURST}]"
@@ -1046,17 +1105,107 @@ show_settings_menu() {
         echo -e "  ${DIM}[0]${NC} Назад"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
-            1) echo -en "  Новый IP [${SERVER_IP:-пусто}]: "; local _val; read -r _val
-               [ -n "$_val" ] && SERVER_IP="$_val"; save_settings ;;
-            2) echo -en "  Новый порт [${SERVER_PORT:-}]: "; local _val; read -r _val
-               if [[ "$_val" =~ ^[0-9]+$ ]] && [ "$_val" -ge 1 ] && [ "$_val" -le 65535 ]; then SERVER_PORT="$_val"; save_settings
-               elif [ -n "$_val" ]; then log_error "Некорректный порт"; fi ;;
-            3) echo -en "  Новый rate (напр. 1/second, 2/second): "; local _val; read -r _val
-               [ -n "$_val" ] && NFT_RATE="$_val" && save_settings ;;
-            4) echo -en "  Новый burst: "; local _val; read -r _val
-               [[ "$_val" =~ ^[0-9]+$ ]] && NFT_BURST="$_val" && save_settings ;;
-            5) echo -en "  Новый meter timeout (напр. 30s, 60s, 120s): "; local _val; read -r _val
-               [ -n "$_val" ] && NFT_METER_TIMEOUT="$_val" && save_settings ;;
+            1)
+                echo ""
+                echo -e "  ${DIM}IP-привязка ограничивает правило только одним IPv4 сервера.${NC}"
+                echo -e "  ${DIM}Если IP пустой — правило будет применяться ко всем IP сервера${NC}"
+                echo -e "  ${DIM}на выбранном порту.${NC}"
+                echo ""
+                echo -e "  ${DIM}Enter  — оставить текущее значение${NC}"
+                echo -e "  ${DIM}none   — убрать привязку к IP${NC}"
+                echo -e "  ${DIM}auto   — автоопределить публичный IPv4${NC}"
+                echo -e "  ${DIM}или введите свой IPv4 вручную${NC}"
+                echo ""
+
+                while true; do
+                    echo -en "  ${BOLD}IPv4 сервера [${SERVER_IP:-none}]:${NC} "
+                    local _val
+                    read -r _val
+
+                    if [ -z "$_val" ]; then
+                        break
+                    fi
+
+                    case "$_val" in
+                        none|NONE|clear|CLEAR|-)
+                            SERVER_IP=""
+                            save_settings
+                            log_success "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
+                            prompt_apply_nft_rules
+                            break
+                            ;;
+                        auto|AUTO)
+                            local _detected_ip
+                            log_info "Определение публичного IP..."
+                            _detected_ip=$(detect_public_ip)
+                            if [ -n "$_detected_ip" ] && validate_ip_literal "$_detected_ip"; then
+                                SERVER_IP="$_detected_ip"
+                                save_settings
+                                log_success "IP определён: ${SERVER_IP}"
+                                prompt_apply_nft_rules
+                                break
+                            else
+                                log_error "Не удалось определить корректный публичный IPv4"
+                            fi
+                            ;;
+                        *)
+                            if validate_ip_literal "$_val"; then
+                                SERVER_IP="$_val"
+                                save_settings
+                                log_success "IP установлен: ${SERVER_IP}"
+                                prompt_apply_nft_rules
+                                break
+                            else
+                                log_error "Некорректный IPv4. Введите IPv4, Enter, none, clear, - или auto"
+                            fi
+                            ;;
+                    esac
+                done
+                ;;
+            2)
+                echo -en "  Новый порт [${SERVER_PORT:-}]: "
+                local _val; read -r _val
+                if [[ "$_val" =~ ^[0-9]+$ ]] && [ "$_val" -ge 1 ] && [ "$_val" -le 65535 ]; then
+                    SERVER_PORT="$_val"
+                    save_settings
+                    log_success "Порт установлен: ${SERVER_PORT}"
+                    prompt_apply_nft_rules
+                elif [ -n "$_val" ]; then
+                    log_error "Некорректный порт"
+                fi
+                ;;
+            3)
+                echo -en "  Новый rate (напр. 1/second, 2/second): "
+                local _val; read -r _val
+                if [ -n "$_val" ]; then
+                    NFT_RATE="$_val"
+                    save_settings
+                    log_success "Rate установлен: ${NFT_RATE}"
+                    prompt_apply_nft_rules
+                fi
+                ;;
+            4)
+                echo -en "  Новый burst: "
+                local _val; read -r _val
+                if [[ "$_val" =~ ^[0-9]+$ ]]; then
+                    NFT_BURST="$_val"
+                    save_settings
+                    log_success "Burst установлен: ${NFT_BURST}"
+                    prompt_apply_nft_rules
+                elif [ -n "$_val" ]; then
+                    log_error "Некорректный burst"
+                fi
+                ;;
+            5)
+                echo -en "  Новый meter timeout (напр. 30s, 60s, 120s): "
+                local _val; read -r _val
+                if [ -n "$_val" ]; then
+                    NFT_METER_TIMEOUT="$_val"
+                    save_settings
+                    log_success "Meter timeout установлен: ${NFT_METER_TIMEOUT}"
+                    prompt_apply_nft_rules
+                fi
+                ;;
             6) echo -en "  tg_connect [${TUNING_TG_CONNECT}]: "; local _val; read -r _val
                [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_TG_CONNECT="$_val" && save_settings ;;
             7) echo -en "  client_handshake [${TUNING_CLIENT_HANDSHAKE}]: "; local _val; read -r _val
@@ -1064,11 +1213,16 @@ show_settings_menu() {
             8) echo -en "  client_keepalive [${TUNING_CLIENT_KEEPALIVE}]: "; local _val; read -r _val
                [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_CLIENT_KEEPALIVE="$_val" && save_settings ;;
             9) log_info "Определение публичного IP..."; local _detected_ip; _detected_ip=$(detect_public_ip)
-               if [ -n "$_detected_ip" ]; then SERVER_IP="$_detected_ip"; save_settings; log_success "IP определён: $_detected_ip"
+               if [ -n "$_detected_ip" ]; then SERVER_IP="$_detected_ip"; save_settings; log_success "IP определён: $_detected_ip"; prompt_apply_nft_rules
                else log_error "Не удалось определить публичный IP"; fi
                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
-            c|C) SERVER_IP=""; save_settings; log_success "IP очищен — правила будут применяться ко всем адресам"
-                 echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            c|C)
+                SERVER_IP=""
+                save_settings
+                log_success "IP очищен — правила будут применяться ко всем адресам"
+                prompt_apply_nft_rules
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
+                ;;
             0|"") return ;; esac; done
 }
 
@@ -1197,15 +1351,65 @@ first_run_wizard() {
     local _port_input; read -r _port_input
     if [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -ge 1 ] && [ "$_port_input" -le 65535 ]; then SERVER_PORT="$_port_input"; fi
     echo ""
-    if [ -n "$DETECTED_IP" ]; then SERVER_IP="$DETECTED_IP"; log_info "IP из конфига: $SERVER_IP"
-    else log_info "Определение публичного IP..."; SERVER_IP=$(detect_public_ip)
-        [ -n "$SERVER_IP" ] && log_success "Определён: $SERVER_IP" || log_warn "Не удалось определить IP"; fi
+    echo -e "  ${DIM}Можно привязать правило к конкретному IPv4-адресу сервера.${NC}"
+    echo -e "  ${DIM}Если IP указан — правило будет работать только для трафика${NC}"
+    echo -e "  ${DIM}на этот IP и выбранный порт.${NC}"
+    echo -e "  ${DIM}Если IP не указывать — правило будет работать для всех${NC}"
+    echo -e "  ${DIM}локальных IP сервера на выбранном порту.${NC}"
     echo ""
-    echo -e "  ${DIM}Если указать IP — правила будут применяться только к трафику${NC}"
-    echo -e "  ${DIM}на этот адрес. Если оставить пустым — ко всему входящему${NC}"
-    echo -e "  ${DIM}трафику на указанный порт, независимо от IP назначения.${NC}"
-    echo -en "  ${BOLD}IP сервера [${SERVER_IP:-оставьте пустым для всех}]:${NC} "
-    local _ip_input; read -r _ip_input; [ -n "$_ip_input" ] && SERVER_IP="$_ip_input"
+    echo -en "  ${BOLD}Указать IPv4 сервера? [Y/n]:${NC} "
+    local _use_ip
+    read -r _use_ip
+
+    if [[ ! "$_use_ip" =~ ^[nN]$ ]]; then
+        if [ -n "$DETECTED_IP" ]; then
+            SERVER_IP="$DETECTED_IP"
+            log_info "IP из конфига: $SERVER_IP"
+        else
+            log_info "Определение публичного IP..."
+            SERVER_IP=$(detect_public_ip)
+            [ -n "$SERVER_IP" ] && log_success "Определён: $SERVER_IP" || log_warn "Не удалось определить IP"
+        fi
+
+        echo ""
+        echo -e "  ${DIM}Enter  — оставить найденный IP${NC}"
+        echo -e "  ${DIM}none   — не использовать привязку к IP${NC}"
+        echo -e "  ${DIM}или введите свой IPv4 вручную${NC}"
+        echo ""
+
+        while true; do
+            echo -en "  ${BOLD}IPv4 сервера [${SERVER_IP:-none}]:${NC} "
+            local _ip_input
+            read -r _ip_input
+
+            if [ -z "$_ip_input" ]; then
+                break
+            fi
+
+            case "$_ip_input" in
+                none|NONE|clear|CLEAR|-)
+                    SERVER_IP=""
+                    break
+                    ;;
+            esac
+
+            if validate_ip_literal "$_ip_input"; then
+                SERVER_IP="$_ip_input"
+                break
+            else
+                log_error "Некорректный IPv4. Введите IPv4, Enter, none, clear или -"
+            fi
+        done
+
+        if [ -n "$SERVER_IP" ]; then
+            log_success "Будет использоваться IP: $SERVER_IP"
+        else
+            log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
+        fi
+    else
+        SERVER_IP=""
+        log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
+    fi
     echo ""; echo -e "  ${BOLD}Пресет ограничения:${NC}"
     echo -e "    ${RED}[1]${NC} Жёсткий  — 1/sec burst 1  ${DIM}(рекомендуется)${NC}"
     echo -e "    ${YELLOW}[2]${NC} Средний  — 1/sec burst 3"
