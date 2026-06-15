@@ -24,14 +24,6 @@ mtpr
 ## Обновления
 
 <details>
-<summary><b>1.0.7 от 15.06.2026</b></summary>
-
-- Для Docker bridge добавлен выбор режима:
-  - **Простой режим** — правило только по порту
-  - **Точный Docker-режим** — внутренний IP контейнера + watcher
-- Обновлён README
-
-</details>
 
 <details>
 <summary><b>1.0.6 от 15.06.2026</b></summary>
