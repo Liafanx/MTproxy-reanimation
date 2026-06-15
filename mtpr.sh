@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.6
+#  MTproxy-reanimation v1.0.7
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.6"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
+VERSION="1.0.7"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -53,6 +53,10 @@ IOS2_EXTERNAL_PORT="4443"
 IOS2_TARGET_PORT=""
 IOS2_MSS="92"
 IOS2_TABLE="mtpr_ios2_fix"
+DOCKER_BRIDGE_MODE="simple"   # simple | precise
+BRIDGE_WATCH_INTERVAL="5"
+WATCHER_SCRIPT="/usr/local/sbin/mtpr-bridge-watch.sh"
+WATCHER_UNIT="mtpr-bridge-watch.service"
 
 declare -A EXTRA_RULES_PORT
 declare -A EXTRA_RULES_IP
@@ -101,6 +105,8 @@ IOS2_EXTERNAL_PORT='${IOS2_EXTERNAL_PORT}'
 IOS2_TARGET_PORT='${IOS2_TARGET_PORT}'
 IOS2_MSS='${IOS2_MSS}'
 IOS2_TABLE='${IOS2_TABLE}'
+DOCKER_BRIDGE_MODE='${DOCKER_BRIDGE_MODE}'
+BRIDGE_WATCH_INTERVAL='${BRIDGE_WATCH_INTERVAL}'
 EXTRA_RULES_COUNT='${EXTRA_RULES_COUNT}'
 EOF
     local _i
@@ -128,7 +134,7 @@ load_settings() {
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
                 IOS_FIX_APPLIED|IOS_KA_TIME|IOS_KA_INTVL|IOS_KA_PROBES|\
                 IOS2_FIX_APPLIED|IOS2_EXTERNAL_PORT|\
-                IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|EXTRA_RULES_COUNT)
+                IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT)
                     printf -v "$_key" '%s' "$_val"
                     ;;
                 EXTRA_RULES_*_PORT)
@@ -335,6 +341,56 @@ detect_public_ip() {
     _ip=$(curl -4 -fsS --max-time 5 https://icanhazip.com 2>/dev/null) ||
     _ip=""
     echo "$_ip"
+}
+
+docker_container_ip() {
+    local _container="${1:-$DETECTED_CONTAINER}"
+    [ -z "$_container" ] && return 1
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$_container" 2>/dev/null | awk 'NF {print; exit}'
+}
+
+service_unit_name() {
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
+        echo "$WATCHER_UNIT"
+    else
+        echo "$SYSTEMD_UNIT"
+    fi
+}
+
+prompt_bridge_mode() {
+    if [ "$DETECTED_NETWORK_MODE" != "bridge" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Обнаружен Docker bridge режим${NC}"
+    echo ""
+    echo -e "  ${DIM}[1]${NC} Простой режим — без IP, правило только по порту"
+    echo -e "      ${DIM}Плюсы:${NC} надёжно, без watcher, меньше зависимостей"
+    echo -e "      ${DIM}Минусы:${NC} менее точное совпадение"
+    echo ""
+    echo -e "  ${DIM}[2]${NC} Точный Docker-режим — внутренний IP контейнера + watcher"
+    echo -e "      ${DIM}Плюсы:${NC} точное совпадение по контейнеру"
+    echo -e "      ${DIM}Минусы:${NC} нужен watcher, так как IP контейнера может меняться"
+    echo ""
+    echo -en "  ${BOLD}Выбор [по умолчанию 1]:${NC} "
+    local _bm
+    read -r _bm
+
+    case "$_bm" in
+        2) DOCKER_BRIDGE_MODE="precise" ;;
+        *) DOCKER_BRIDGE_MODE="simple" ;;
+    esac
+
+    save_settings
+
+    if [ "$DOCKER_BRIDGE_MODE" = "simple" ]; then
+        log_info "Выбран простой bridge-режим — IP привязка не используется"
+    else
+        local _cip
+        _cip=$(docker_container_ip)
+        [ -n "$_cip" ] && log_info "Выбран точный bridge-режим — контейнерный IP: ${_cip}"
+    fi
 }
 
 validate_ip_literal() {
@@ -858,6 +914,14 @@ generate_nft_script() {
     local _ios2_target="${IOS2_TARGET_PORT:-${SERVER_PORT:-443}}"
     local _ios2_mss="${IOS2_MSS:-92}"
 
+    local _bridge_precise="false"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && \
+       [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && \
+       [ -n "$DETECTED_CONTAINER" ]; then
+        _bridge_precise="true"
+    fi
+
+    # Пишем заголовок скрипта
     cat > "$NFT_SCRIPT" << NFTEOF
 #!/bin/sh
 set -eu
@@ -868,13 +932,46 @@ nft delete table inet "\$TABLE" 2>/dev/null || true
 nft delete table inet "\$IOS2_TABLE" 2>/dev/null || true
 nft add table inet "\$TABLE"
 nft "add chain inet \$TABLE \$CHAIN { type filter hook ${_hook} priority 0; policy accept; }"
-nft "add rule inet \$TABLE \$CHAIN \\
-$([ -n "$_ip" ] && echo "ip daddr ${_ip} " || echo "")tcp dport ${_port} \\
-tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } \\
-counter drop comment \\"mtpr_main_${_rate}_burst_${_burst}\\""
 NFTEOF
 
+    # Основное правило — bridge precise
+    if [ "$_bridge_precise" = "true" ]; then
+        cat >> "$NFT_SCRIPT" << BRIDGEOF
+CONTAINER="${DETECTED_CONTAINER}"
+TARGET_IP=""
+for i in \$(seq 1 60); do
+    RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
+    if [ "\$RUNNING" = "true" ]; then
+        TARGET_IP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+        [ -n "\$TARGET_IP" ] && break
+    fi
+    sleep 1
+done
+if [ -z "\$TARGET_IP" ]; then
+    echo "Не удалось определить IP контейнера: \$CONTAINER" >&2
+    exit 1
+fi
+nft "add rule inet \$TABLE \$CHAIN ip daddr \$TARGET_IP tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+BRIDGEOF
+
+    # Основное правило — bridge simple (без ip daddr)
+    elif [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ]; then
+        cat >> "$NFT_SCRIPT" << SIMPLEBRIDGEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+SIMPLEBRIDGEOF
+
+    # Основное правило — host/local с IP или без
+    elif [ -n "$_ip" ]; then
+        cat >> "$NFT_SCRIPT" << HOSTIPEOF
+nft "add rule inet \$TABLE \$CHAIN ip daddr ${_ip} tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+HOSTIPEOF
+    else
+        cat >> "$NFT_SCRIPT" << HOSTNIPEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+HOSTNIPEOF
+    fi
+
+    # Доп. правила
     local _i
     for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
         local _eport="${EXTRA_RULES_PORT[$_i]:-}"
@@ -882,30 +979,37 @@ NFTEOF
         local _erate="${EXTRA_RULES_RATE[$_i]:-1/second}"
         local _eburst="${EXTRA_RULES_BURST[$_i]:-1}"
         [ -z "$_eport" ] && continue
-        cat >> "$NFT_SCRIPT" << EXTRAEOF
-nft "add rule inet \$TABLE \$CHAIN \\
-$([ -n "$_eip" ] && echo "ip daddr ${_eip} " || echo "")tcp dport ${_eport} \\
-tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } \\
-counter drop comment \\"mtpr_extra_${_i}_${_erate}_burst_${_eburst}\\""
-EXTRAEOF
+
+        if [ -n "$_eip" ]; then
+            cat >> "$NFT_SCRIPT" << EXTRAIPEOF
+nft "add rule inet \$TABLE \$CHAIN ip daddr ${_eip} tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter drop comment \\"mtpr_extra_${_i}\\""
+EXTRAIPEOF
+        else
+            cat >> "$NFT_SCRIPT" << EXTRANIPEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter drop comment \\"mtpr_extra_${_i}\\""
+EXTRANIPEOF
+        fi
     done
 
+    # iOS fix v2
     if [ "$_ios2_enabled" = "true" ]; then
         cat >> "$NFT_SCRIPT" << IOS2EOF
-# iOS fix v2: MSS + redirect
 nft add table inet "\$IOS2_TABLE"
-nft "add chain inet \$IOS2_TABLE mangle_prerouting { type filter hook prerouting priority mangle; policy accept; }"
-nft "add chain inet \$IOS2_TABLE nat_prerouting { type nat hook prerouting priority dstnat; policy accept; }"
-nft "add rule inet \$IOS2_TABLE mangle_prerouting \\
-$([ -n "$_ip" ] && echo "ip daddr ${_ip} " || echo "")tcp dport ${_ios2_ext} \\
-tcp flags & (syn | rst) == syn \\
-tcp option maxseg size set ${_ios2_mss} \\
-counter comment \\"mtpr_ios2_mss_${_ios2_mss}\\""
-nft "add rule inet \$IOS2_TABLE nat_prerouting \\
-$([ -n "$_ip" ] && echo "ip daddr ${_ip} " || echo "")tcp dport ${_ios2_ext} \\
-counter redirect to :${_ios2_target} comment \\"mtpr_ios2_redirect_${_ios2_ext}_to_${_ios2_target}\\""
+nft "add chain inet \$IOS2_TABLE mangle_pre { type filter hook prerouting priority mangle; policy accept; }"
+nft "add chain inet \$IOS2_TABLE nat_pre { type nat hook prerouting priority dstnat; policy accept; }"
 IOS2EOF
+
+        if [ -n "$_ip" ]; then
+            cat >> "$NFT_SCRIPT" << IOS2IPEOF
+nft "add rule inet \$IOS2_TABLE mangle_pre ip daddr ${_ip} tcp dport ${_ios2_ext} tcp flags & (syn | rst) == syn tcp option maxseg size set ${_ios2_mss} counter comment \\"mtpr_ios2_mss\\""
+nft "add rule inet \$IOS2_TABLE nat_pre ip daddr ${_ip} tcp dport ${_ios2_ext} counter redirect to :${_ios2_target} comment \\"mtpr_ios2_redirect\\""
+IOS2IPEOF
+        else
+            cat >> "$NFT_SCRIPT" << IOS2NIPEOF
+nft "add rule inet \$IOS2_TABLE mangle_pre tcp dport ${_ios2_ext} tcp flags & (syn | rst) == syn tcp option maxseg size set ${_ios2_mss} counter comment \\"mtpr_ios2_mss\\""
+nft "add rule inet \$IOS2_TABLE nat_pre tcp dport ${_ios2_ext} counter redirect to :${_ios2_target} comment \\"mtpr_ios2_redirect\\""
+IOS2NIPEOF
+        fi
     fi
 
     cat >> "$NFT_SCRIPT" << 'TAILEOF'
@@ -913,7 +1017,47 @@ echo "MTproxy-reanimation: nft правила применены"
 nft list table inet "$TABLE" 2>/dev/null || true
 nft list table inet "$IOS2_TABLE" 2>/dev/null || true
 TAILEOF
+
     chmod +x "$NFT_SCRIPT"
+}
+
+generate_bridge_watch_script() {
+    cat > "$WATCHER_SCRIPT" << EOF
+#!/bin/sh
+set -eu
+
+CONTAINER="${DETECTED_CONTAINER}"
+NFT_SCRIPT="${NFT_SCRIPT}"
+INTERVAL="${BRIDGE_WATCH_INTERVAL}"
+
+LAST_IP=""
+
+echo "MTproxy-reanimation: watching container \$CONTAINER for bridge precise mode"
+
+while true; do
+    RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
+
+    if [ "\$RUNNING" = "true" ]; then
+        IP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+
+        if [ -n "\$IP" ] && [ "\$IP" != "\$LAST_IP" ]; then
+            echo "Container IP changed: \${LAST_IP:-none} -> \$IP"
+            /bin/sh "\$NFT_SCRIPT" || true
+            LAST_IP="\$IP"
+        fi
+    else
+        if [ -n "\$LAST_IP" ]; then
+            echo "Container \$CONTAINER is not running"
+            LAST_IP=""
+        fi
+    fi
+
+    sleep "\$INTERVAL"
+done
+EOF
+
+    chmod +x "$WATCHER_SCRIPT"
+    log_success "Watcher-скрипт создан: ${WATCHER_SCRIPT}"
 }
 
 apply_nft_rules() {
@@ -953,33 +1097,79 @@ prompt_apply_nft_rules() {
 # ── Systemd сервис ────────────────────────────────────────────
 install_service() {
     generate_nft_script
-    local _table="${NFT_TABLE:-telemt_limit}"
-    local _ios2_table="${IOS2_TABLE:-mtpr_ios2_fix}"
-    cat > "/etc/systemd/system/${SYSTEMD_UNIT}" << SVCEOF
+
+    # Сначала убираем старые службы, чтобы не было конфликта
+    systemctl disable --now "$SYSTEMD_UNIT" 2>/dev/null || true
+    systemctl disable --now "$WATCHER_UNIT" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${SYSTEMD_UNIT}"
+    rm -f "/etc/systemd/system/${WATCHER_UNIT}"
+
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
+        generate_bridge_watch_script
+
+        cat > "/etc/systemd/system/${WATCHER_UNIT}" << EOF
+[Unit]
+Description=MTproxy-reanimation Docker bridge watcher
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${WATCHER_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable "$WATCHER_UNIT" 2>/dev/null
+        systemctl restart "$WATCHER_UNIT" 2>/dev/null
+        log_success "Установлена watcher-служба для точного Docker-режима"
+    else
+        local _table="${NFT_TABLE:-telemt_limit}"
+        local _ios2_table="${IOS2_TABLE:-mtpr_ios2_fix}"
+
+        cat > "/etc/systemd/system/${SYSTEMD_UNIT}" << EOF
 [Unit]
 Description=MTproxy-reanimation inbound SYN limiter
 After=network-online.target docker.service
 Wants=network-online.target
+
 [Service]
 Type=oneshot
 ExecStart=/bin/sh ${NFT_SCRIPT}
 ExecStop=/bin/sh -c '/usr/sbin/nft delete table inet ${_table} 2>/dev/null || true; /usr/sbin/nft delete table inet ${_ios2_table} 2>/dev/null || true'
 RemainAfterExit=yes
+
 [Install]
 WantedBy=multi-user.target
-SVCEOF
-    systemctl daemon-reload
-    systemctl enable "$SYSTEMD_UNIT" 2>/dev/null
-    systemctl restart "$SYSTEMD_UNIT" 2>/dev/null
-    NFT_SERVICE_ENABLED="true"; save_settings
-    log_success "Служба установлена и запущена"
+EOF
+
+        systemctl daemon-reload
+        systemctl enable "$SYSTEMD_UNIT" 2>/dev/null
+        systemctl restart "$SYSTEMD_UNIT" 2>/dev/null
+        log_success "Установлена обычная nft-служба"
+    fi
+
+    NFT_SERVICE_ENABLED="true"
+    save_settings
 }
 
 remove_service() {
     systemctl disable --now "$SYSTEMD_UNIT" 2>/dev/null || true
+    systemctl disable --now "$WATCHER_UNIT" 2>/dev/null || true
+
     rm -f "/etc/systemd/system/${SYSTEMD_UNIT}"
+    rm -f "/etc/systemd/system/${WATCHER_UNIT}"
+    rm -f "$WATCHER_SCRIPT"
+
     systemctl daemon-reload 2>/dev/null || true
-    NFT_SERVICE_ENABLED="false"; save_settings; log_success "Служба удалена"
+    NFT_SERVICE_ENABLED="false"
+    save_settings
+    log_success "Службы удалены"
 }
 
 # ── Пресеты ───────────────────────────────────────────────────
@@ -1055,9 +1245,15 @@ show_header() {
     local _nft_status="${RED}неактивно${NC}"
     if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then _nft_status="${GREEN}активно${NC}"; fi
     local _svc_status="${DIM}не установлена${NC}"
-    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
-        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null 2>&1; then _svc_status="${GREEN}вкл + работает${NC}"
-        else _svc_status="${YELLOW}вкл + остановлена${NC}"; fi; fi
+    local _active_unit
+    _active_unit=$(service_unit_name)
+    if systemctl is-enabled "$_active_unit" &>/dev/null 2>&1; then
+        if systemctl is-active "$_active_unit" &>/dev/null 2>&1; then
+            _svc_status="${GREEN}вкл + работает${NC}"
+        else
+            _svc_status="${YELLOW}вкл + остановлена${NC}"
+        fi
+    fi
     local _tuning_status="${DIM}не применён${NC}"
     case "$TUNING_APPLIED" in
         true) _tuning_status="${GREEN}применён${NC}" ;; manual) _tuning_status="${YELLOW}вручную${NC}" ;;
@@ -1065,15 +1261,32 @@ show_header() {
     local _ios_status; _ios_status=$(ios_fix_status)
     local _ios2_status; _ios2_status=$(ios2_fix_status)
     echo -e "  ${BOLD}Обнаружение:${NC}   ${DETECTED_MODE:-не найден}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
-    echo -e "  ${BOLD}Сеть:${NC}          ${DETECTED_NETWORK_MODE:-неизвестно} → hook ${NFT_HOOK}"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        echo -e "  ${BOLD}Сеть:${NC}          bridge → hook ${NFT_HOOK} (${DOCKER_BRIDGE_MODE})"
+    else
+        echo -e "  ${BOLD}Сеть:${NC}          ${DETECTED_NETWORK_MODE:-неизвестно} → hook ${NFT_HOOK}"
+    fi
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
     echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
     echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"; echo ""
-    echo -e "  ${BOLD}IP привязка:${NC}   ${SERVER_IP:-${DIM}отключена (все IP сервера)${NC}}"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
+            local _cip
+            _cip=$(docker_container_ip)
+            echo -e "  ${BOLD}IP режим:${NC}      ${GREEN}авто по IP контейнера${NC}"
+            echo -e "  ${BOLD}IP Контейнера:${NC}  ${_cip:-${DIM}не найден${NC}}"
+        else
+            echo -e "  ${BOLD}IP режим:${NC}      ${DIM}без IP привязки (только по порту)${NC}"
+        fi
+    else
+        echo -e "  ${BOLD}IP привязка:${NC}   ${SERVER_IP:-${DIM}отключена (все IP сервера)${NC}}"
+    fi
+
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
     echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
     echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
-    echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"; echo ""
+    echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
+    echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
     echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
     echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
@@ -1130,6 +1343,9 @@ show_settings_menu() {
         echo -e "  ${DIM}[7]${NC} client_handshake [${TUNING_CLIENT_HANDSHAKE}]"
         echo -e "  ${DIM}[8]${NC} client_keepalive [${TUNING_CLIENT_KEEPALIVE}]"
         echo -e "  ${DIM}[9]${NC} Определить IP из интернета"
+        if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+            echo -e "  ${DIM}[b]${NC} Режим Docker bridge [${DOCKER_BRIDGE_MODE}]"
+        fi
         echo -e "  ${DIM}[c]${NC} Очистить IP (применять ко всем адресам)"
         echo -e "  ${DIM}[0]${NC} Назад"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
@@ -1245,6 +1461,14 @@ show_settings_menu() {
                if [ -n "$_detected_ip" ]; then SERVER_IP="$_detected_ip"; save_settings; log_success "IP определён: $_detected_ip"; prompt_apply_nft_rules
                else log_error "Не удалось определить публичный IP"; fi
                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            b|B)
+                if [ "$DETECTED_NETWORK_MODE" != "bridge" ]; then
+                    log_info "Режим Docker bridge недоступен"
+                else
+                    prompt_bridge_mode
+                    prompt_apply_nft_rules
+                fi
+                ;;
             c|C)
                 SERVER_IP=""
                 save_settings
@@ -1275,11 +1499,23 @@ show_preset_menu() {
 }
 
 show_service_menu() {
-    show_header; echo -e "  ${BOLD}Управление службой${NC}"; echo ""
+    show_header
+    echo -e "  ${BOLD}Управление службой${NC}"
+    echo ""
+
+    local _unit
+    _unit=$(service_unit_name)
+
     local _status="${DIM}не установлена${NC}"
-    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
-        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null 2>&1; then _status="${GREEN}вкл + работает${NC}"
-        else _status="${YELLOW}вкл + остановлена${NC}"; fi; fi
+    if systemctl is-enabled "$_unit" &>/dev/null 2>&1; then
+        if systemctl is-active "$_unit" &>/dev/null 2>&1; then
+            _status="${GREEN}вкл + работает${NC}"
+        else
+            _status="${YELLOW}вкл + остановлена${NC}"
+        fi
+    fi
+
+    echo -e "  Активная служба: ${_unit}"
     echo -e "  Статус: ${_status}"; echo ""
     echo -e "  ${DIM}[1]${NC} Установить и включить службу"
     echo -e "  ${DIM}[2]${NC} Удалить службу"
@@ -1290,9 +1526,9 @@ show_service_menu() {
     case "$_choice" in
         1) if [ -z "$SERVER_PORT" ]; then log_error "Порт не задан — настройте в разделе Настройки"; else install_service; fi ;;
         2) remove_service ;;
-        3) systemctl restart "$SYSTEMD_UNIT" 2>/dev/null && log_success "Служба перезапущена" || log_error "Не удалось перезапустить" ;;
-        4) systemctl stop "$SYSTEMD_UNIT" 2>/dev/null && log_success "Служба остановлена" || log_error "Не удалось остановить" ;;
-        5) echo ""; journalctl -u "$SYSTEMD_UNIT" -n 20 --no-pager 2>/dev/null || log_warn "Логов нет" ;;
+        3) systemctl restart "$_unit" 2>/dev/null && log_success "Служба перезапущена" || log_error "Не удалось перезапустить" ;;
+        4) systemctl stop "$_unit" 2>/dev/null && log_success "Служба остановлена" || log_error "Не удалось остановить" ;;
+        5) echo ""; journalctl -u "$_unit" -n 20 --no-pager 2>/dev/null || log_warn "Логов нет" ;;
         0|"") return ;; esac
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
@@ -1373,72 +1609,97 @@ first_run_wizard() {
                 log_success "Конфиг: $_manual_cfg"; local _p; _p=$(_toml_get_value "port" "$_manual_cfg"); [ -n "$_p" ] && DETECTED_PORT="$_p"
             else log_error "Файл не найден: $_manual_cfg"; fi; fi; fi
 
-    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
-    echo ""; install_dependencies || exit 1
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        NFT_HOOK="forward"
+        SERVER_IP=""
+    else
+        NFT_HOOK="input"
+    fi
+    echo ""
+    install_dependencies || exit 1
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        prompt_bridge_mode
+    fi
+    #-----ПОРТ-----
     echo ""; SERVER_PORT="${DETECTED_PORT:-443}"
     echo -en "  ${BOLD}Порт прокси [${SERVER_PORT}]:${NC} "
     local _port_input; read -r _port_input
     if [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -ge 1 ] && [ "$_port_input" -le 65535 ]; then SERVER_PORT="$_port_input"; fi
+    #-----IP-----
     echo ""
-    echo -e "  ${DIM}Можно привязать правило к конкретному IPv4-адресу сервера.${NC}"
-    echo -e "  ${DIM}Если IP указан — правило будет работать только для трафика${NC}"
-    echo -e "  ${DIM}на этот IP и выбранный порт.${NC}"
-    echo -e "  ${DIM}Если IP не указывать — правило будет работать для всех${NC}"
-    echo -e "  ${DIM}локальных IP сервера на выбранном порту.${NC}"
-    echo ""
-    echo -en "  ${BOLD}Указать IPv4 сервера? [Y/n]:${NC} "
-    local _use_ip
-    read -r _use_ip
-
-    if [[ ! "$_use_ip" =~ ^[nN]$ ]]; then
-        if [ -n "$DETECTED_IP" ]; then
-            SERVER_IP="$DETECTED_IP"
-            log_info "IP из конфига: $SERVER_IP"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        if [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ]; then
+            log_info "Docker bridge / простой режим: внешний IP не используется"
+            log_info "Правило будет применяться ко всему трафику на выбранный порт"
         else
-            log_info "Определение публичного IP..."
-            SERVER_IP=$(detect_public_ip)
-            [ -n "$SERVER_IP" ] && log_success "Определён: $SERVER_IP" || log_warn "Не удалось определить IP"
+            local _cip
+            _cip=$(docker_container_ip)
+            log_info "Docker bridge / точный режим: будет использоваться IP контейнера"
+            [ -n "$_cip" ] && log_info "Текущий IP контейнера: ${_cip}"
         fi
-
+        SERVER_IP=""
+    else
+        echo -e "  ${DIM}Можно привязать правило к конкретному IPv4-адресу сервера.${NC}"
+        echo -e "  ${DIM}Если IP указан — правило будет работать только для трафика${NC}"
+        echo -e "  ${DIM}на этот IP и выбранный порт.${NC}"
+        echo -e "  ${DIM}Если IP не указывать — правило будет работать для всех${NC}"
+        echo -e "  ${DIM}локальных IP сервера на выбранном порту.${NC}"
         echo ""
-        echo -e "  ${DIM}Enter  — оставить найденный IP${NC}"
-        echo -e "  ${DIM}none   — не использовать привязку к IP${NC}"
-        echo -e "  ${DIM}или введите свой IPv4 вручную${NC}"
-        echo ""
+        echo -en "  ${BOLD}Указать IPv4 сервера? [Y/n]:${NC} "
+        local _use_ip
+        read -r _use_ip
 
-        while true; do
-            echo -en "  ${BOLD}IPv4 сервера [${SERVER_IP:-none}]:${NC} "
-            local _ip_input
-            read -r _ip_input
-
-            if [ -z "$_ip_input" ]; then
-                break
-            fi
-
-            case "$_ip_input" in
-                none|NONE|clear|CLEAR|-)
-                    SERVER_IP=""
-                    break
-                    ;;
-            esac
-
-            if validate_ip_literal "$_ip_input"; then
-                SERVER_IP="$_ip_input"
-                break
+        if [[ ! "$_use_ip" =~ ^[nN]$ ]]; then
+            if [ -n "$DETECTED_IP" ]; then
+                SERVER_IP="$DETECTED_IP"
+                log_info "IP из конфига: $SERVER_IP"
             else
-                log_error "Некорректный IPv4. Введите IPv4, Enter, none, clear или -"
+                log_info "Определение публичного IP..."
+                SERVER_IP=$(detect_public_ip)
+                [ -n "$SERVER_IP" ] && log_success "Определён: $SERVER_IP" || log_warn "Не удалось определить IP"
             fi
-        done
 
-        if [ -n "$SERVER_IP" ]; then
-            log_success "Будет использоваться IP: $SERVER_IP"
+            echo ""
+            echo -e "  ${DIM}Enter  — оставить найденный IP${NC}"
+            echo -e "  ${DIM}none   — не использовать привязку к IP${NC}"
+            echo -e "  ${DIM}или введите свой IPv4 вручную${NC}"
+            echo ""
+
+            while true; do
+                echo -en "  ${BOLD}IPv4 сервера [${SERVER_IP:-none}]:${NC} "
+                local _ip_input
+                read -r _ip_input
+
+                if [ -z "$_ip_input" ]; then
+                    break
+                fi
+
+                case "$_ip_input" in
+                    none|NONE|clear|CLEAR|-)
+                        SERVER_IP=""
+                        break
+                        ;;
+                esac
+
+                if validate_ip_literal "$_ip_input"; then
+                    SERVER_IP="$_ip_input"
+                    break
+                else
+                    log_error "Некорректный IPv4. Введите IPv4, Enter, none, clear или -"
+                fi
+            done
+
+            if [ -n "$SERVER_IP" ]; then
+                log_success "Будет использоваться IP: $SERVER_IP"
+            else
+                log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
+            fi
         else
+            SERVER_IP=""
             log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
         fi
-    else
-        SERVER_IP=""
-        log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
     fi
+    #-----Пресет-----
     echo ""; echo -e "  ${BOLD}Пресет ограничения:${NC}"
     echo -e "    ${RED}[1]${NC} Жёсткий  — 1/sec burst 1  ${DIM}(рекомендуется)${NC}"
     echo -e "    ${YELLOW}[2]${NC} Средний  — 1/sec burst 3"
@@ -1523,12 +1784,15 @@ main() {
     if [ -f "$_self" ] && [ "$(realpath "$_self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
         cp "$_self" "${INSTALL_DIR}/mtpr.sh"; chmod +x "${INSTALL_DIR}/mtpr.sh"; fi
     ln -sf "${INSTALL_DIR}/mtpr.sh" /usr/local/bin/mtpr 2>/dev/null || true
-    load_settings; detect_telemt || true
-    check_for_update
+    load_settings
+    detect_telemt || true
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
     [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
-    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
-    if [ ! -f "$SETTINGS_FILE" ]; then first_run_wizard; fi
+    check_for_update
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
+        first_run_wizard
+    fi
     show_main_menu
 }
 
