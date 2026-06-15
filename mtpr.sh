@@ -6,7 +6,7 @@
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.6"
+VERSION="1.0.7"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
