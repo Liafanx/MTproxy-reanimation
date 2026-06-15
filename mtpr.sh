@@ -450,28 +450,57 @@ apply_tuning() {
 
     local _cfg="$DETECTED_CONFIG_PATH"
     cp "$_cfg" "${_cfg}.mtpr-backup-$(date +%s)" 2>/dev/null || true
-    local _cur _changed=false _failed=false
+    local _cur _changed=false _failed=false _timeouts_created=false
 
     _cur=$(_toml_get_value "tg_connect" "$_cfg")
     if [ "$_cur" != "$TUNING_TG_CONNECT" ]; then
         if _toml_safe_set "tg_connect" "$TUNING_TG_CONNECT" "general" "$_cfg"; then
             _changed=true; log_success "tg_connect = $TUNING_TG_CONNECT"
-        else log_warn "Секция [general] не найдена — tg_connect не применён"; _failed=true; fi
+        else
+            log_warn "Секция [general] не найдена в конфиге"
+            echo -en "  ${BOLD}Создать секцию [general] и применить tg_connect? [Y/n]:${NC} "
+            local _cr; read -r _cr
+            if [[ ! "$_cr" =~ ^[nN]$ ]]; then
+                echo "" >> "$_cfg"
+                echo "[general]" >> "$_cfg"
+                echo "tg_connect = $TUNING_TG_CONNECT" >> "$_cfg"
+                _changed=true; log_success "Секция [general] создана, tg_connect = $TUNING_TG_CONNECT"
+            else _failed=true; fi
+        fi
     else log_info "tg_connect уже $TUNING_TG_CONNECT"; fi
 
     _cur=$(_toml_get_value "client_handshake" "$_cfg")
     if [ "$_cur" != "$TUNING_CLIENT_HANDSHAKE" ]; then
         if _toml_safe_set "client_handshake" "$TUNING_CLIENT_HANDSHAKE" "timeouts" "$_cfg"; then
             _changed=true; log_success "client_handshake = $TUNING_CLIENT_HANDSHAKE"
-        else log_warn "Секция [timeouts] не найдена — client_handshake не применён"; _failed=true; fi
+        else
+            log_warn "Секция [timeouts] не найдена в конфиге"
+            echo -en "  ${BOLD}Создать секцию [timeouts] и применить client_handshake + client_keepalive? [Y/n]:${NC} "
+            local _cr; read -r _cr
+            if [[ ! "$_cr" =~ ^[nN]$ ]]; then
+                echo "" >> "$_cfg"
+                echo "[timeouts]" >> "$_cfg"
+                echo "client_handshake = $TUNING_CLIENT_HANDSHAKE" >> "$_cfg"
+                echo "client_keepalive = $TUNING_CLIENT_KEEPALIVE" >> "$_cfg"
+                _changed=true
+                _timeouts_created=true
+                log_success "Секция [timeouts] создана, client_handshake = $TUNING_CLIENT_HANDSHAKE, client_keepalive = $TUNING_CLIENT_KEEPALIVE"
+            else _failed=true; fi
+        fi
     else log_info "client_handshake уже $TUNING_CLIENT_HANDSHAKE"; fi
 
-    _cur=$(_toml_get_value "client_keepalive" "$_cfg")
-    if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
-        if _toml_safe_set "client_keepalive" "$TUNING_CLIENT_KEEPALIVE" "timeouts" "$_cfg"; then
-            _changed=true; log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
-        else log_warn "Секция [timeouts] не найдена — client_keepalive не применён"; _failed=true; fi
-    else log_info "client_keepalive уже $TUNING_CLIENT_KEEPALIVE"; fi
+    # Пропускаем если уже создали секцию [timeouts] выше вместе с client_keepalive
+    if [ "${_timeouts_created:-false}" != "true" ]; then
+        _cur=$(_toml_get_value "client_keepalive" "$_cfg")
+        if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
+            if _toml_safe_set "client_keepalive" "$TUNING_CLIENT_KEEPALIVE" "timeouts" "$_cfg"; then
+                _changed=true; log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
+            else
+                log_warn "Секция [timeouts] не найдена — client_keepalive не применён"
+                _failed=true
+            fi
+        else log_info "client_keepalive уже $TUNING_CLIENT_KEEPALIVE"; fi
+    fi
 
     if [ "$_failed" = "true" ]; then
         echo ""; echo -e "  ${YELLOW}Некоторые параметры не удалось применить автоматически.${NC}"
@@ -1417,7 +1446,17 @@ first_run_wizard() {
     echo -en "  Выбор [1]: "; local _preset_input; read -r _preset_input
     case "$_preset_input" in 2) apply_preset medium ;; 3) apply_preset soft ;; *) apply_preset hard ;; esac
     save_settings
-    echo ""; echo -en "  ${BOLD}Применить тюнинг Telemt? [Y/n]:${NC} "
+    echo ""
+    echo -e "  ${BOLD}Тюнинг Telemt — будут применены следующие параметры:${NC}"
+    echo ""
+    echo -e "  ${DIM}[general]${NC}"
+    echo -e "    tg_connect       = ${BOLD}${TUNING_TG_CONNECT}${NC}  ${DIM}(таймаут подключения к Telegram DC)${NC}"
+    echo ""
+    echo -e "  ${DIM}[timeouts]${NC}"
+    echo -e "    client_handshake = ${BOLD}${TUNING_CLIENT_HANDSHAKE}${NC}  ${DIM}(ожидание начального handshake)${NC}"
+    echo -e "    client_keepalive = ${BOLD}${TUNING_CLIENT_KEEPALIVE}${NC}  ${DIM}(ожидание активности клиента)${NC}"
+    echo ""
+    echo -en "  ${BOLD}Применить тюнинг Telemt? [Y/n]:${NC} "
     local _yn_tuning; read -r _yn_tuning
     if [[ ! "$_yn_tuning" =~ ^[nN] ]]; then apply_tuning || true; fi
     echo ""; echo -en "  ${BOLD}Применить фикс для iOS вариант 1 (TCP keepalive)? [y/N]:${NC} "
