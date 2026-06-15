@@ -1,12 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.5
+#  MTproxy-reanimation v1.0.6
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.5"
+VERSION="1.0.6"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -44,6 +45,9 @@ TUNING_CLIENT_KEEPALIVE="120"
 TUNING_APPLIED="false"
 NFT_SERVICE_ENABLED="false"
 IOS_FIX_APPLIED="false"
+IOS_KA_TIME="60"
+IOS_KA_INTVL="15"
+IOS_KA_PROBES="3"
 IOS2_FIX_APPLIED="false"
 IOS2_EXTERNAL_PORT="4443"
 IOS2_TARGET_PORT=""
@@ -89,6 +93,9 @@ TUNING_CLIENT_KEEPALIVE='${TUNING_CLIENT_KEEPALIVE}'
 TUNING_APPLIED='${TUNING_APPLIED}'
 NFT_SERVICE_ENABLED='${NFT_SERVICE_ENABLED}'
 IOS_FIX_APPLIED='${IOS_FIX_APPLIED}'
+IOS_KA_TIME='${IOS_KA_TIME}'
+IOS_KA_INTVL='${IOS_KA_INTVL}'
+IOS_KA_PROBES='${IOS_KA_PROBES}'
 IOS2_FIX_APPLIED='${IOS2_FIX_APPLIED}'
 IOS2_EXTERNAL_PORT='${IOS2_EXTERNAL_PORT}'
 IOS2_TARGET_PORT='${IOS2_TARGET_PORT}'
@@ -119,7 +126,8 @@ load_settings() {
                 SERVER_IP|SERVER_PORT|NFT_RATE|NFT_BURST|NFT_METER_TIMEOUT|\
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
-                IOS_FIX_APPLIED|IOS2_FIX_APPLIED|IOS2_EXTERNAL_PORT|\
+                IOS_FIX_APPLIED|IOS_KA_TIME|IOS_KA_INTVL|IOS_KA_PROBES|\
+                IOS2_FIX_APPLIED|IOS2_EXTERNAL_PORT|\
                 IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|EXTRA_RULES_COUNT)
                     printf -v "$_key" '%s' "$_val"
                     ;;
@@ -478,45 +486,69 @@ ios_fix_status() {
         _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
         _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
         _probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
-        echo -e "${GREEN}активен${NC} (time=${_time} intvl=${_intvl} probes=${_probes})"
+        echo -e "${GREEN}v1 активен${NC} (time=${_time} intvl=${_intvl} probes=${_probes})"
     else echo -e "${DIM}не применён${NC}"; fi
 }
 
 ios_fix_apply() {
-    echo ""; echo -e "  ${BOLD}Фикс для iOS — TCP keepalive${NC}"; echo ""
+    echo ""; echo -e "  ${BOLD}Фикс для iOS (вариант 1) — TCP keepalive${NC}"; echo ""
     echo -e "  ${DIM}Проблема: мобильный клиент сворачивается, ОС усыпляет${NC}"
     echo -e "  ${DIM}приложение, сокет не закрывается чисто. Сервер держит${NC}"
     echo -e "  ${DIM}мёртвое соединение часами. При возврате клиент залипает.${NC}"; echo ""
-    echo -e "  ${DIM}Решение: ускоряем TCP keepalive через sysctl.${NC}"
-    echo -e "  ${DIM}Мёртвый коннект будет рваться за ~105 сек:${NC}"
-    echo -e "  ${DIM}  60с тишины → проба каждые 15с × 3 попытки → RST${NC}"; echo ""
+    echo -e "  ${DIM}Решение: ускоряем TCP keepalive через sysctl.${NC}"; echo ""
+
     local _cur_time _cur_intvl _cur_probes
     _cur_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
     _cur_intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
     _cur_probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+
     echo -e "  ${BOLD}Текущие значения ядра:${NC}"
     echo -e "    tcp_keepalive_time   = ${_cur_time:-?}  ${DIM}(дефолт: 7200)${NC}"
     echo -e "    tcp_keepalive_intvl  = ${_cur_intvl:-?}  ${DIM}(дефолт: 75)${NC}"
     echo -e "    tcp_keepalive_probes = ${_cur_probes:-?}  ${DIM}(дефолт: 9)${NC}"; echo ""
+
+    echo -e "  ${BOLD}Параметры фикса (Enter = оставить текущее):${NC}"
+    echo -en "    tcp_keepalive_time   [${IOS_KA_TIME}]: "
+    local _t; read -r _t
+    [[ "$_t" =~ ^[0-9]+$ ]] && IOS_KA_TIME="$_t"
+
+    echo -en "    tcp_keepalive_intvl  [${IOS_KA_INTVL}]: "
+    local _i; read -r _i
+    [[ "$_i" =~ ^[0-9]+$ ]] && IOS_KA_INTVL="$_i"
+
+    echo -en "    tcp_keepalive_probes [${IOS_KA_PROBES}]: "
+    local _p; read -r _p
+    [[ "$_p" =~ ^[0-9]+$ ]] && IOS_KA_PROBES="$_p"
+
+    local _detect_secs=$(( IOS_KA_TIME + IOS_KA_INTVL * IOS_KA_PROBES ))
+    echo ""
+    echo -e "  ${DIM}Мёртвый коннект будет рваться за ~${_detect_secs} сек${NC}"
+    echo -e "  ${DIM}  ${IOS_KA_TIME}с тишины → проба каждые ${IOS_KA_INTVL}с × ${IOS_KA_PROBES} попыток → RST${NC}"; echo ""
+
     if [ -f "$IOS_SYSCTL_FILE" ]; then
         echo -e "  ${YELLOW}Файл ${IOS_SYSCTL_FILE} уже существует.${NC}"
         echo -en "  ${BOLD}Перезаписать? [Y/n]:${NC} "
-    else echo -en "  ${BOLD}Применить фикс? [Y/n]:${NC} "; fi
+    else
+        echo -en "  ${BOLD}Применить фикс? [Y/n]:${NC} "
+    fi
     local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
-    cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
-# MTproxy-reanimation: фикс для iOS — TCP keepalive
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
+
+    cat > "$IOS_SYSCTL_FILE" << SYSEOF
+# MTproxy-reanimation: фикс для iOS v1 — TCP keepalive
+net.ipv4.tcp_keepalive_time = ${IOS_KA_TIME}
+net.ipv4.tcp_keepalive_intvl = ${IOS_KA_INTVL}
+net.ipv4.tcp_keepalive_probes = ${IOS_KA_PROBES}
 SYSEOF
+
     if sysctl --system &>/dev/null; then log_success "sysctl применён"
     else
         log_warn "sysctl --system вернул ошибку, применяем вручную"
-        sysctl -w net.ipv4.tcp_keepalive_time=60 2>/dev/null || true
-        sysctl -w net.ipv4.tcp_keepalive_intvl=15 2>/dev/null || true
-        sysctl -w net.ipv4.tcp_keepalive_probes=3 2>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_time=${IOS_KA_TIME}" 2>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_intvl=${IOS_KA_INTVL}" 2>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_probes=${IOS_KA_PROBES}" 2>/dev/null || true
     fi
+
     local _new_time _new_intvl _new_probes
     _new_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
     _new_intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
@@ -525,8 +557,9 @@ SYSEOF
     echo -e "    tcp_keepalive_time   = ${_new_time}"
     echo -e "    tcp_keepalive_intvl  = ${_new_intvl}"
     echo -e "    tcp_keepalive_probes = ${_new_probes}"
-    if [ "${_new_time}" = "60" ] && [ "${_new_intvl}" = "15" ] && [ "${_new_probes}" = "3" ]; then
-        log_success "Фикс для iOS применён"; echo -e "  ${DIM}Мёртвый коннект будет рваться за ~105 сек${NC}"
+
+    if [ "${_new_time}" = "${IOS_KA_TIME}" ] && [ "${_new_intvl}" = "${IOS_KA_INTVL}" ] && [ "${_new_probes}" = "${IOS_KA_PROBES}" ]; then
+        log_success "Фикс для iOS (v1) применён"
     else log_warn "Значения не совпадают с ожидаемыми — проверьте вручную"; fi
     IOS_FIX_APPLIED="true"; save_settings
 }
@@ -534,9 +567,9 @@ SYSEOF
 ios_fix_remove() {
     echo ""
     if [ ! -f "$IOS_SYSCTL_FILE" ]; then
-        log_info "Фикс для iOS не установлен"; IOS_FIX_APPLIED="false"; save_settings; return 0
+        log_info "Фикс для iOS (v1) не установлен"; IOS_FIX_APPLIED="false"; save_settings; return 0
     fi
-    echo -e "  ${BOLD}Откат фикса для iOS${NC}"; echo ""
+    echo -e "  ${BOLD}Откат фикса для iOS (вариант 1)${NC}"; echo ""
     echo -e "  ${DIM}Будет удалён: ${IOS_SYSCTL_FILE}${NC}"
     echo -e "  ${DIM}Значения ядра вернутся к дефолтным (7200 / 75 / 9)${NC}"; echo ""
     echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
@@ -555,11 +588,11 @@ ios_fix_remove() {
     echo -e "    tcp_keepalive_time   = ${_time}"
     echo -e "    tcp_keepalive_intvl  = ${_intvl}"
     echo -e "    tcp_keepalive_probes = ${_probes}"
-    log_success "Фикс для iOS откачен"; IOS_FIX_APPLIED="false"; save_settings
+    log_success "Фикс для iOS (v1) откачен"; IOS_FIX_APPLIED="false"; save_settings
 }
 
 show_ios_fix_menu() {
-    show_header; echo -e "  ${BOLD}Фикс для iOS (TCP keepalive)${NC}"; echo ""
+    show_header; echo -e "  ${BOLD}Фикс для iOS (вариант 1) — TCP keepalive${NC}"; echo ""
     local _status; _status=$(ios_fix_status); echo -e "  Статус: ${_status}"; echo ""
     local _time _intvl _probes
     _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
@@ -567,15 +600,31 @@ show_ios_fix_menu() {
     _probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
     local _detect_secs=$(( ${_time:-7200} + ${_intvl:-75} * ${_probes:-9} ))
     echo -e "  ${BOLD}Значения ядра:${NC}"
-    echo -e "    tcp_keepalive_time   = ${_time:-?}  ${DIM}(дефолт: 7200, фикс: 60)${NC}"
-    echo -e "    tcp_keepalive_intvl  = ${_intvl:-?}  ${DIM}(дефолт: 75,   фикс: 15)${NC}"
-    echo -e "    tcp_keepalive_probes = ${_probes:-?}  ${DIM}(дефолт: 9,    фикс: 3)${NC}"
+    echo -e "    tcp_keepalive_time   = ${_time:-?}  ${DIM}(дефолт: 7200, фикс: ${IOS_KA_TIME})${NC}"
+    echo -e "    tcp_keepalive_intvl  = ${_intvl:-?}  ${DIM}(дефолт: 75,   фикс: ${IOS_KA_INTVL})${NC}"
+    echo -e "    tcp_keepalive_probes = ${_probes:-?}  ${DIM}(дефолт: 9,    фикс: ${IOS_KA_PROBES})${NC}"
     echo -e "    ${DIM}Время обнаружения мёртвого коннекта: ~${_detect_secs} сек${NC}"; echo ""
-    echo -e "  ${DIM}[1]${NC} Применить фикс"
+    echo -e "  ${DIM}[1]${NC} Применить / обновить фикс"
     echo -e "  ${DIM}[2]${NC} Откатить фикс"
+    echo -e "  ${DIM}[3]${NC} Изменить keepalive_time   [${IOS_KA_TIME}]"
+    echo -e "  ${DIM}[4]${NC} Изменить keepalive_intvl  [${IOS_KA_INTVL}]"
+    echo -e "  ${DIM}[5]${NC} Изменить keepalive_probes [${IOS_KA_PROBES}]"
     echo -e "  ${DIM}[0]${NC} Назад"; echo ""
     echo -en "  Выбор: "; local _choice; read -r _choice
-    case "$_choice" in 1) ios_fix_apply ;; 2) ios_fix_remove ;; 0|"") return ;; esac
+    case "$_choice" in
+        1) ios_fix_apply ;;
+        2) ios_fix_remove ;;
+        3)
+            echo -en "  tcp_keepalive_time [${IOS_KA_TIME}]: "; local _v; read -r _v
+            [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_TIME="$_v"; save_settings; log_success "keepalive_time = $_v"; } ;;
+        4)
+            echo -en "  tcp_keepalive_intvl [${IOS_KA_INTVL}]: "; local _v; read -r _v
+            [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_INTVL="$_v"; save_settings; log_success "keepalive_intvl = $_v"; } ;;
+        5)
+            echo -en "  tcp_keepalive_probes [${IOS_KA_PROBES}]: "; local _v; read -r _v
+            [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_PROBES="$_v"; save_settings; log_success "keepalive_probes = $_v"; } ;;
+        0|"") return ;;
+    esac
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
 
@@ -912,7 +961,7 @@ full_uninstall() {
 # ── Интерфейс ─────────────────────────────────────────────────
 show_header() {
     clear 2>/dev/null || printf '\033[2J\033[H'
-    echo ""; echo -e "  ${CYAN}${BOLD}MTproxy-reanimation${NC} ${DIM}v${VERSION}${NC}"
+    echo ""; echo -e "  ${CYAN}${BOLD}MTproxy-reanimation${NC} ${DIM}v${VERSION}${NC} ${DIM}by LiafanX${NC}"
     echo -e "  ${DIM}Telemt inbound SYN limiter + тюнинг${NC}"
     echo -e "  ${DIM}────────────────────────────────────────${NC}"; echo ""
     local _nft_status="${RED}неактивно${NC}"
@@ -938,7 +987,7 @@ show_header() {
     echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
     echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"; echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
-    echo -e "  ${BOLD}iOS фикс:${NC}      ${_ios_status}"
+    echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
     echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
@@ -959,7 +1008,7 @@ show_main_menu() {
         echo -e "  ${CYAN}[6]${NC}  Управление службой"
         echo -e "  ${CYAN}[7]${NC}  Доп. правила (добавить порт)"
         echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
-        echo -e "  ${CYAN}[9]${NC}  Фикс для iOS (TCP keepalive)"
+        echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
         echo ""
         echo -e "  ${RED}[u]${NC}  Удалить"
@@ -1126,7 +1175,7 @@ first_run_wizard() {
         [ -n "$DETECTED_PORT" ] && log_info "Порт: ${DETECTED_PORT}"
         [ -n "$DETECTED_NETWORK_MODE" ] && log_info "Сеть: ${DETECTED_NETWORK_MODE}"
         if [ -n "$DETECTED_CONFIG_PATH" ]; then
-            echo ""; echo -en "  ${DIM}Указать другой путь к конфигу? [n/путь]:${NC} "
+            echo ""; echo -en "  ${DIM}Указать другой путь к конфигу? [N/путь]:${NC} "
             local _alt_cfg; read -r _alt_cfg
             if [ -n "$_alt_cfg" ] && [ "$_alt_cfg" != "n" ] && [ "$_alt_cfg" != "N" ]; then
                 if [ -f "$_alt_cfg" ]; then DETECTED_CONFIG_PATH="$_alt_cfg"; log_success "Конфиг: $_alt_cfg"
@@ -1134,7 +1183,7 @@ first_run_wizard() {
                 else log_error "Файл не найден: $_alt_cfg"; fi; fi; fi
     else
         log_warn "Telemt не обнаружен автоматически"; echo ""
-        echo -en "  ${BOLD}Указать путь к конфигу Telemt вручную? [n/путь]:${NC} "
+        echo -en "  ${BOLD}Указать путь к конфигу Telemt вручную? [n(Enter, если ставите на входящей точке даб хоп)/путь]:${NC} "
         local _manual_cfg; read -r _manual_cfg
         if [ -n "$_manual_cfg" ] && [ "$_manual_cfg" != "n" ] && [ "$_manual_cfg" != "N" ]; then
             if [ -f "$_manual_cfg" ]; then DETECTED_CONFIG_PATH="$_manual_cfg"; DETECTED_MODE="manual"; DETECTED_NETWORK_MODE="host"
@@ -1151,6 +1200,10 @@ first_run_wizard() {
     if [ -n "$DETECTED_IP" ]; then SERVER_IP="$DETECTED_IP"; log_info "IP из конфига: $SERVER_IP"
     else log_info "Определение публичного IP..."; SERVER_IP=$(detect_public_ip)
         [ -n "$SERVER_IP" ] && log_success "Определён: $SERVER_IP" || log_warn "Не удалось определить IP"; fi
+    echo ""
+    echo -e "  ${DIM}Если указать IP — правила будут применяться только к трафику${NC}"
+    echo -e "  ${DIM}на этот адрес. Если оставить пустым — ко всему входящему${NC}"
+    echo -e "  ${DIM}трафику на указанный порт, независимо от IP назначения.${NC}"
     echo -en "  ${BOLD}IP сервера [${SERVER_IP:-оставьте пустым для всех}]:${NC} "
     local _ip_input; read -r _ip_input; [ -n "$_ip_input" ] && SERVER_IP="$_ip_input"
     echo ""; echo -e "  ${BOLD}Пресет ограничения:${NC}"
@@ -1163,9 +1216,9 @@ first_run_wizard() {
     echo ""; echo -en "  ${BOLD}Применить тюнинг Telemt? [Y/n]:${NC} "
     local _yn_tuning; read -r _yn_tuning
     if [[ ! "$_yn_tuning" =~ ^[nN] ]]; then apply_tuning || true; fi
-    echo ""; echo -en "  ${BOLD}Применить фикс для iOS (TCP keepalive)? [Y/n]:${NC} "
+    echo ""; echo -en "  ${BOLD}Применить фикс для iOS вариант 1 (TCP keepalive)? [y/N]:${NC} "
     local _yn_ios; read -r _yn_ios
-    if [[ ! "$_yn_ios" =~ ^[nN] ]]; then
+    if [[ "$_yn_ios" =~ ^[yY]$ ]]; then
         cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
 # MTproxy-reanimation: фикс для iOS — TCP keepalive
 net.ipv4.tcp_keepalive_time = 60
@@ -1185,6 +1238,41 @@ SYSEOF
     read -rsn1 -p "  Нажмите любую клавишу для входа в меню..."
 }
 
+# ── Проверка обновлений ───────────────────────────────────────
+check_for_update() {
+    local _remote_ver
+    _remote_ver=$(curl -fsS --max-time 5 "${GITHUB_RAW}/version" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$_remote_ver" ] && return 0
+
+    if [ "$_remote_ver" = "$VERSION" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}Доступно обновление: v${VERSION} → v${_remote_ver}${NC}"
+    echo -en "  ${BOLD}Обновить сейчас? [Y/n]:${NC} "
+    local _yn; read -r _yn
+    [[ "$_yn" =~ ^[nN] ]] && return 0
+
+    log_info "Скачивание обновления..."
+    local _tmp="/tmp/mtpr-update-$$.sh"
+    if curl -fsS --max-time 30 "${GITHUB_RAW}/mtpr.sh" -o "$_tmp" 2>/dev/null; then
+        if ! bash -n "$_tmp" 2>/dev/null; then
+            log_error "Скачанный файл содержит ошибки синтаксиса — обновление отменено"
+            rm -f "$_tmp"; return 1
+        fi
+        cp "${INSTALL_DIR}/mtpr.sh" "${INSTALL_DIR}/mtpr.sh.backup-$(date +%s)" 2>/dev/null || true
+        mv "$_tmp" "${INSTALL_DIR}/mtpr.sh"
+        chmod +x "${INSTALL_DIR}/mtpr.sh"
+        log_success "Обновлено до v${_remote_ver}"
+        log_info "Перезапуск..."
+        exec "${INSTALL_DIR}/mtpr.sh"
+    else
+        log_error "Не удалось скачать обновление"
+        rm -f "$_tmp"
+    fi
+}
+
 # ── Главная точка входа ───────────────────────────────────────
 main() {
     check_root; mkdir -p "$INSTALL_DIR"
@@ -1193,6 +1281,7 @@ main() {
         cp "$_self" "${INSTALL_DIR}/mtpr.sh"; chmod +x "${INSTALL_DIR}/mtpr.sh"; fi
     ln -sf "${INSTALL_DIR}/mtpr.sh" /usr/local/bin/mtpr 2>/dev/null || true
     load_settings; detect_telemt || true
+    check_for_update
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
     [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
