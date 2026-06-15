@@ -1021,6 +1021,45 @@ TAILEOF
     chmod +x "$NFT_SCRIPT"
 }
 
+generate_bridge_watch_script() {
+    cat > "$WATCHER_SCRIPT" << EOF
+#!/bin/sh
+set -eu
+
+CONTAINER="${DETECTED_CONTAINER}"
+NFT_SCRIPT="${NFT_SCRIPT}"
+INTERVAL="${BRIDGE_WATCH_INTERVAL}"
+
+LAST_IP=""
+
+echo "MTproxy-reanimation: watching container \$CONTAINER for bridge precise mode"
+
+while true; do
+    RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
+
+    if [ "\$RUNNING" = "true" ]; then
+        IP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+
+        if [ -n "\$IP" ] && [ "\$IP" != "\$LAST_IP" ]; then
+            echo "Container IP changed: \${LAST_IP:-none} -> \$IP"
+            /bin/sh "\$NFT_SCRIPT" || true
+            LAST_IP="\$IP"
+        fi
+    else
+        if [ -n "\$LAST_IP" ]; then
+            echo "Container \$CONTAINER is not running"
+            LAST_IP=""
+        fi
+    fi
+
+    sleep "\$INTERVAL"
+done
+EOF
+
+    chmod +x "$WATCHER_SCRIPT"
+    log_success "Watcher-скрипт создан: ${WATCHER_SCRIPT}"
+}
+
 apply_nft_rules() {
     generate_nft_script
     if /bin/sh "$NFT_SCRIPT"; then log_success "NFT правила применены"
