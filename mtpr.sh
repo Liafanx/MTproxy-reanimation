@@ -1573,7 +1573,6 @@ first_run_wizard() {
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         prompt_bridge_mode
     fi
-    install_dependencies || exit 1
     #-----ПОРТ-----
     echo ""; SERVER_PORT="${DETECTED_PORT:-443}"
     echo -en "  ${BOLD}Порт прокси [${SERVER_PORT}]:${NC} "
