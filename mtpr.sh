@@ -915,10 +915,13 @@ generate_nft_script() {
     local _ios2_mss="${IOS2_MSS:-92}"
 
     local _bridge_precise="false"
-    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && \
+       [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && \
+       [ -n "$DETECTED_CONTAINER" ]; then
         _bridge_precise="true"
     fi
 
+    # Пишем заголовок скрипта
     cat > "$NFT_SCRIPT" << NFTEOF
 #!/bin/sh
 set -eu
@@ -929,8 +932,11 @@ nft delete table inet "\$TABLE" 2>/dev/null || true
 nft delete table inet "\$IOS2_TABLE" 2>/dev/null || true
 nft add table inet "\$TABLE"
 nft "add chain inet \$TABLE \$CHAIN { type filter hook ${_hook} priority 0; policy accept; }"
-if [ "$_bridge_precise" = "true" ]; then
-    cat >> "$NFT_SCRIPT" << BRIDGEOF
+NFTEOF
+
+    # Основное правило — bridge precise
+    if [ "$_bridge_precise" = "true" ]; then
+        cat >> "$NFT_SCRIPT" << BRIDGEOF
 CONTAINER="${DETECTED_CONTAINER}"
 TARGET_IP=""
 for i in \$(seq 1 60); do
@@ -941,28 +947,31 @@ for i in \$(seq 1 60); do
     fi
     sleep 1
 done
-
 if [ -z "\$TARGET_IP" ]; then
     echo "Не удалось определить IP контейнера: \$CONTAINER" >&2
     exit 1
 fi
-
-nft "add rule inet \$TABLE \$CHAIN ip daddr \$TARGET_IP tcp dport ${_port} \\
-tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } \\
-counter drop comment \\"mtpr_main_${_rate}_burst_${_burst}\\""
+nft "add rule inet \$TABLE \$CHAIN ip daddr \$TARGET_IP tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
 BRIDGEOF
-else
-    cat >> "$NFT_SCRIPT" << MAINRULEEOF
-nft "add rule inet \$TABLE \$CHAIN \\
-$([ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ] && echo "" || ([ -n "$_ip" ] && echo "ip daddr ${_ip} "))tcp dport ${_port} \\
-tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } \\
-counter drop comment \\"mtpr_main_${_rate}_burst_${_burst}\\""
-MAINRULEEOF
-fi
-NFTEOF
 
+    # Основное правило — bridge simple (без ip daddr)
+    elif [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ]; then
+        cat >> "$NFT_SCRIPT" << SIMPLEBRIDGEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+SIMPLEBRIDGEOF
+
+    # Основное правило — host/local с IP или без
+    elif [ -n "$_ip" ]; then
+        cat >> "$NFT_SCRIPT" << HOSTIPEOF
+nft "add rule inet \$TABLE \$CHAIN ip daddr ${_ip} tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+HOSTIPEOF
+    else
+        cat >> "$NFT_SCRIPT" << HOSTNIPEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+HOSTNIPEOF
+    fi
+
+    # Доп. правила
     local _i
     for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
         local _eport="${EXTRA_RULES_PORT[$_i]:-}"
@@ -970,30 +979,37 @@ NFTEOF
         local _erate="${EXTRA_RULES_RATE[$_i]:-1/second}"
         local _eburst="${EXTRA_RULES_BURST[$_i]:-1}"
         [ -z "$_eport" ] && continue
-        cat >> "$NFT_SCRIPT" << EXTRAEOF
-nft "add rule inet \$TABLE \$CHAIN \\
-$([ -n "$_eip" ] && echo "ip daddr ${_eip} " || echo "")tcp dport ${_eport} \\
-tcp flags & (syn | ack) == syn \\
-meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } \\
-counter drop comment \\"mtpr_extra_${_i}_${_erate}_burst_${_eburst}\\""
-EXTRAEOF
+
+        if [ -n "$_eip" ]; then
+            cat >> "$NFT_SCRIPT" << EXTRAIPEOF
+nft "add rule inet \$TABLE \$CHAIN ip daddr ${_eip} tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter drop comment \\"mtpr_extra_${_i}\\""
+EXTRAIPEOF
+        else
+            cat >> "$NFT_SCRIPT" << EXTRANIPEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter drop comment \\"mtpr_extra_${_i}\\""
+EXTRANIPEOF
+        fi
     done
 
+    # iOS fix v2
     if [ "$_ios2_enabled" = "true" ]; then
         cat >> "$NFT_SCRIPT" << IOS2EOF
-# iOS fix v2: MSS + redirect
 nft add table inet "\$IOS2_TABLE"
-nft "add chain inet \$IOS2_TABLE mangle_prerouting { type filter hook prerouting priority mangle; policy accept; }"
-nft "add chain inet \$IOS2_TABLE nat_prerouting { type nat hook prerouting priority dstnat; policy accept; }"
-nft "add rule inet \$IOS2_TABLE mangle_prerouting \\
-$([ -n "$_ip" ] && echo "ip daddr ${_ip} " || echo "")tcp dport ${_ios2_ext} \\
-tcp flags & (syn | rst) == syn \\
-tcp option maxseg size set ${_ios2_mss} \\
-counter comment \\"mtpr_ios2_mss_${_ios2_mss}\\""
-nft "add rule inet \$IOS2_TABLE nat_prerouting \\
-$([ -n "$_ip" ] && echo "ip daddr ${_ip} " || echo "")tcp dport ${_ios2_ext} \\
-counter redirect to :${_ios2_target} comment \\"mtpr_ios2_redirect_${_ios2_ext}_to_${_ios2_target}\\""
+nft "add chain inet \$IOS2_TABLE mangle_pre { type filter hook prerouting priority mangle; policy accept; }"
+nft "add chain inet \$IOS2_TABLE nat_pre { type nat hook prerouting priority dstnat; policy accept; }"
 IOS2EOF
+
+        if [ -n "$_ip" ]; then
+            cat >> "$NFT_SCRIPT" << IOS2IPEOF
+nft "add rule inet \$IOS2_TABLE mangle_pre ip daddr ${_ip} tcp dport ${_ios2_ext} tcp flags & (syn | rst) == syn tcp option maxseg size set ${_ios2_mss} counter comment \\"mtpr_ios2_mss\\""
+nft "add rule inet \$IOS2_TABLE nat_pre ip daddr ${_ip} tcp dport ${_ios2_ext} counter redirect to :${_ios2_target} comment \\"mtpr_ios2_redirect\\""
+IOS2IPEOF
+        else
+            cat >> "$NFT_SCRIPT" << IOS2NIPEOF
+nft "add rule inet \$IOS2_TABLE mangle_pre tcp dport ${_ios2_ext} tcp flags & (syn | rst) == syn tcp option maxseg size set ${_ios2_mss} counter comment \\"mtpr_ios2_mss\\""
+nft "add rule inet \$IOS2_TABLE nat_pre tcp dport ${_ios2_ext} counter redirect to :${_ios2_target} comment \\"mtpr_ios2_redirect\\""
+IOS2NIPEOF
+        fi
     fi
 
     cat >> "$NFT_SCRIPT" << 'TAILEOF'
@@ -1001,45 +1017,8 @@ echo "MTproxy-reanimation: nft правила применены"
 nft list table inet "$TABLE" 2>/dev/null || true
 nft list table inet "$IOS2_TABLE" 2>/dev/null || true
 TAILEOF
+
     chmod +x "$NFT_SCRIPT"
-}
-
-generate_bridge_watch_script() {
-    cat > "$WATCHER_SCRIPT" << EOF
-#!/bin/sh
-set -eu
-
-CONTAINER="${DETECTED_CONTAINER}"
-NFT_SCRIPT="${NFT_SCRIPT}"
-INTERVAL="${BRIDGE_WATCH_INTERVAL}"
-
-LAST_IP=""
-
-echo "Watching Docker container for bridge precise mode: \$CONTAINER"
-
-while true; do
-    RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
-
-    if [ "\$RUNNING" = "true" ]; then
-        IP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
-
-        if [ -n "\$IP" ] && [ "\$IP" != "\$LAST_IP" ]; then
-            echo "Container IP changed: \${LAST_IP:-none} -> \$IP"
-            /bin/sh "\$NFT_SCRIPT" || true
-            LAST_IP="\$IP"
-        fi
-    else
-        if [ -n "\$LAST_IP" ]; then
-            echo "Container \$CONTAINER is not running"
-            LAST_IP=""
-        fi
-    fi
-
-    sleep "\$INTERVAL"
-done
-EOF
-
-    chmod +x "$WATCHER_SCRIPT"
 }
 
 apply_nft_rules() {
@@ -1227,9 +1206,15 @@ show_header() {
     local _nft_status="${RED}неактивно${NC}"
     if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then _nft_status="${GREEN}активно${NC}"; fi
     local _svc_status="${DIM}не установлена${NC}"
-    if systemctl is-enabled "$SYSTEMD_UNIT" &>/dev/null 2>&1; then
-        if systemctl is-active "$SYSTEMD_UNIT" &>/dev/null 2>&1; then _svc_status="${GREEN}вкл + работает${NC}"
-        else _svc_status="${YELLOW}вкл + остановлена${NC}"; fi; fi
+    local _active_unit
+    _active_unit=$(service_unit_name)
+    if systemctl is-enabled "$_active_unit" &>/dev/null 2>&1; then
+        if systemctl is-active "$_active_unit" &>/dev/null 2>&1; then
+            _svc_status="${GREEN}вкл + работает${NC}"
+        else
+            _svc_status="${YELLOW}вкл + остановлена${NC}"
+        fi
+    fi
     local _tuning_status="${DIM}не применён${NC}"
     case "$TUNING_APPLIED" in
         true) _tuning_status="${GREEN}применён${NC}" ;; manual) _tuning_status="${YELLOW}вручную${NC}" ;;
@@ -1579,12 +1564,16 @@ first_run_wizard() {
 
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         NFT_HOOK="forward"
-        prompt_bridge_mode
         SERVER_IP=""
     else
         NFT_HOOK="input"
     fi
-    echo ""; install_dependencies || exit 1
+    echo ""
+    install_dependencies || exit 1
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+        prompt_bridge_mode
+    fi
+    install_dependencies || exit 1
     #-----ПОРТ-----
     echo ""; SERVER_PORT="${DETECTED_PORT:-443}"
     echo -en "  ${BOLD}Порт прокси [${SERVER_PORT}]:${NC} "
@@ -1749,12 +1738,15 @@ main() {
     if [ -f "$_self" ] && [ "$(realpath "$_self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
         cp "$_self" "${INSTALL_DIR}/mtpr.sh"; chmod +x "${INSTALL_DIR}/mtpr.sh"; fi
     ln -sf "${INSTALL_DIR}/mtpr.sh" /usr/local/bin/mtpr 2>/dev/null || true
-    load_settings; detect_telemt || true
-    check_for_update
+    load_settings
+    detect_telemt || true
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
     [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
-    if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
-    if [ ! -f "$SETTINGS_FILE" ]; then first_run_wizard; fi
+    check_for_update
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
+        first_run_wizard
+    fi
     show_main_menu
 }
 
