@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.7
+#  MTproxy-reanimation v1.0.8
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.7"
+VERSION="1.0.8"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
