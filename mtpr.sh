@@ -1222,16 +1222,70 @@ full_uninstall() {
     rm -f "$NFT_SCRIPT"; rm -f /usr/local/bin/mtpr; rm -rf "$INSTALL_DIR"
     echo ""; log_success "MTproxy-reanimation полностью удалён"
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
-        echo ""; echo -e "  ${DIM}Для отката тюнинга в MTProxyMax:${NC}"
-        echo -e "  ${CYAN}mtproxymax tune clear tg_connect${NC}"
-        echo -e "  ${CYAN}mtproxymax tune clear client_handshake${NC}"
-        echo -e "  ${CYAN}mtproxymax tune clear client_keepalive${NC}"
-        echo -e "  ${CYAN}mtproxymax restart${NC}"
+        echo ""
+        echo -en "  ${BOLD}Откатить тюнинг MTProxyMax к значениям до реаниматора? [y/N]:${NC} "
+        local _revert_mpx
+        read -r _revert_mpx
+        if [[ "$_revert_mpx" =~ ^[yY]$ ]]; then
+            mtproxymax tune clear tg_connect &>/dev/null || true
+            mtproxymax tune clear client_handshake &>/dev/null || true
+            mtproxymax tune clear client_keepalive &>/dev/null || true
+            mtproxymax restart &>/dev/null || true
+            log_success "Тюнинг MTProxyMax откачен"
+        else
+            echo ""
+            echo -e "  ${DIM}Для ручного отката тюнинга:${NC}"
+            echo -e "  ${CYAN}mtproxymax tune clear tg_connect${NC}"
+            echo -e "  ${CYAN}mtproxymax tune clear client_handshake${NC}"
+            echo -e "  ${CYAN}mtproxymax tune clear client_keepalive${NC}"
+            echo -e "  ${CYAN}mtproxymax restart${NC}"
+        fi
+
     elif [ -n "$DETECTED_CONFIG_PATH" ]; then
-        echo ""; echo -e "  ${DIM}Для отката тюнинга вручную восстановите бэкап:${NC}"
-        echo -e "  ${CYAN}ls ${DETECTED_CONFIG_PATH}.mtpr-backup-*${NC}"
-        echo -e "  ${CYAN}cp <backup-file> ${DETECTED_CONFIG_PATH}${NC}"
-        echo -e "  ${DIM}Затем перезапустите telemt${NC}"
+        # Ищем бэкап
+        local _backup_file=""
+        _backup_file=$(ls -1t "${DETECTED_CONFIG_PATH}".mtpr-backup-* 2>/dev/null | head -1)
+
+        if [ -n "$_backup_file" ] && [ -f "$_backup_file" ]; then
+            echo ""
+            echo -e "  ${BOLD}Найден бэкап конфигурации:${NC}"
+            echo -e "  ${CYAN}${_backup_file}${NC}"
+            echo ""
+            echo -e "  ${YELLOW}Внимание! Все изменения, внесённые после установки${NC}"
+            echo -e "  ${YELLOW}реаниматора, будут потеряны.${NC}"
+            echo ""
+            echo -en "  ${BOLD}Восстановить конфигурацию из бэкапа? [y/N]:${NC} "
+            local _restore
+            read -r _restore
+
+            if [[ "$_restore" =~ ^[yY]$ ]]; then
+                cp "$_backup_file" "$DETECTED_CONFIG_PATH"
+                log_success "Конфигурация восстановлена из бэкапа"
+
+                # Перезапуск telemt
+                if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
+                    docker restart "$DETECTED_CONTAINER" &>/dev/null && log_success "Контейнер ${DETECTED_CONTAINER} перезапущен" || log_warn "Не удалось перезапустить контейнер"
+                elif [ "$DETECTED_MODE" = "local" ]; then
+                    if systemctl is-active telemt.service &>/dev/null 2>&1; then
+                        systemctl restart telemt.service &>/dev/null && log_success "Служба telemt перезапущена" || log_warn "Не удалось перезапустить telemt"
+                    else
+                        pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал telemt"
+                    fi
+                fi
+            else
+                echo ""
+                echo -e "  ${DIM}Бэкап остался по пути:${NC}"
+                echo -e "  ${CYAN}${_backup_file}${NC}"
+                echo ""
+                echo -e "  ${DIM}Для ручного восстановления:${NC}"
+                echo -e "  ${CYAN}cp ${_backup_file} ${DETECTED_CONFIG_PATH}${NC}"
+                echo -e "  ${DIM}Затем перезапустите telemt${NC}"
+            fi
+        else
+            echo ""
+            echo -e "  ${DIM}Бэкапы конфигурации не найдены.${NC}"
+            echo -e "  ${DIM}Если тюнинг был применён, откатите параметры вручную.${NC}"
+        fi
     fi
     echo ""; exit 0
 }
