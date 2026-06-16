@@ -48,6 +48,9 @@ IOS_FIX_APPLIED="false"
 IOS_KA_TIME="60"
 IOS_KA_INTVL="15"
 IOS_KA_PROBES="3"
+IOS_ORIG_TIME=""
+IOS_ORIG_INTVL=""
+IOS_ORIG_PROBES=""
 IOS2_FIX_APPLIED="false"
 IOS2_EXTERNAL_PORT="4443"
 IOS2_TARGET_PORT=""
@@ -100,6 +103,9 @@ IOS_FIX_APPLIED='${IOS_FIX_APPLIED}'
 IOS_KA_TIME='${IOS_KA_TIME}'
 IOS_KA_INTVL='${IOS_KA_INTVL}'
 IOS_KA_PROBES='${IOS_KA_PROBES}'
+IOS_ORIG_TIME='${IOS_ORIG_TIME}'
+IOS_ORIG_INTVL='${IOS_ORIG_INTVL}'
+IOS_ORIG_PROBES='${IOS_ORIG_PROBES}'
 IOS2_FIX_APPLIED='${IOS2_FIX_APPLIED}'
 IOS2_EXTERNAL_PORT='${IOS2_EXTERNAL_PORT}'
 IOS2_TARGET_PORT='${IOS2_TARGET_PORT}'
@@ -133,6 +139,7 @@ load_settings() {
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
                 IOS_FIX_APPLIED|IOS_KA_TIME|IOS_KA_INTVL|IOS_KA_PROBES|\
+                IOS_ORIG_TIME|IOS_ORIG_INTVL|IOS_ORIG_PROBES|\
                 IOS2_FIX_APPLIED|IOS2_EXTERNAL_PORT|\
                 IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT)
                     printf -v "$_key" '%s' "$_val"
@@ -636,6 +643,13 @@ ios_fix_apply() {
     fi
     local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
+    # Сохраняем оригинальные значения если ещё не сохранены
+    if [ -z "$IOS_ORIG_TIME" ]; then
+        IOS_ORIG_TIME=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "7200")
+        IOS_ORIG_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
+        IOS_ORIG_PROBES=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "9")
+        log_info "Сохранены оригинальные значения: time=${IOS_ORIG_TIME} intvl=${IOS_ORIG_INTVL} probes=${IOS_ORIG_PROBES}"
+    fi
 
     cat > "$IOS_SYSCTL_FILE" << SYSEOF
 # MTproxy-reanimation: фикс для iOS v1 — TCP keepalive
@@ -679,10 +693,22 @@ ios_fix_remove() {
     local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
     rm -f "$IOS_SYSCTL_FILE"
-    sysctl -w net.ipv4.tcp_keepalive_time=7200 &>/dev/null || true
-    sysctl -w net.ipv4.tcp_keepalive_intvl=75 &>/dev/null || true
-    sysctl -w net.ipv4.tcp_keepalive_probes=9 &>/dev/null || true
+
+    local _restore_time="${IOS_ORIG_TIME:-7200}"
+    local _restore_intvl="${IOS_ORIG_INTVL:-75}"
+    local _restore_probes="${IOS_ORIG_PROBES:-9}"
+
+    log_info "Восстановление значений: time=${_restore_time} intvl=${_restore_intvl} probes=${_restore_probes}"
+    sysctl -w "net.ipv4.tcp_keepalive_time=${_restore_time}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_keepalive_intvl=${_restore_intvl}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_keepalive_probes=${_restore_probes}" &>/dev/null || true
     sysctl --system &>/dev/null || true
+
+    # Очищаем сохранённые оригиналы
+    IOS_ORIG_TIME=""
+    IOS_ORIG_INTVL=""
+    IOS_ORIG_PROBES=""
+    
     local _time _intvl _probes
     _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
     _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
@@ -712,6 +738,10 @@ show_ios_fix_menu() {
     echo -e "  ${DIM}[3]${NC} Изменить keepalive_time   [${IOS_KA_TIME}]"
     echo -e "  ${DIM}[4]${NC} Изменить keepalive_intvl  [${IOS_KA_INTVL}]"
     echo -e "  ${DIM}[5]${NC} Изменить keepalive_probes [${IOS_KA_PROBES}]"
+    if [ -n "$IOS_ORIG_TIME" ]; then
+        echo -e "  ${DIM}Значения до установки фикса: time=${IOS_ORIG_TIME} intvl=${IOS_ORIG_INTVL} probes=${IOS_ORIG_PROBES}${NC}"
+        echo ""
+    fi
     echo -e "  ${DIM}[0]${NC} Назад"; echo ""
     echo -en "  Выбор: "; local _choice; read -r _choice
     case "$_choice" in
@@ -1196,26 +1226,37 @@ show_drop_counter() {
 
 # ── Полное удаление ───────────────────────────────────────────
 full_uninstall() {
-    echo ""; echo -e "  ${RED}${BOLD}УДАЛЕНИЕ MTproxy-reanimation${NC}"; echo ""
+    echo "" 
+    echo -e "  ${RED}${BOLD}УДАЛЕНИЕ MTproxy-reanimation${NC}"
+    echo ""
     echo -e "  Будет удалено:"
     echo -e "  ${DIM}- NFT правила${NC}"
     echo -e "  ${DIM}- Systemd служба${NC}"
     echo -e "  ${DIM}- iOS фикс (sysctl keepalive)${NC}"
     echo -e "  ${DIM}- iOS фикс вариант 2 (MSS + redirect)${NC}"
     echo -e "  ${DIM}- Все настройки и скрипты${NC}"
-    echo -e "  ${DIM}- Симлинк /usr/local/bin/mtpr${NC}"; echo ""
-    echo -e "  ${YELLOW}Значения тюнинга Telemt НЕ будут откачены.${NC}"
-    echo -e "  ${YELLOW}Бэкапы конфигов (*.mtpr-backup-*) останутся на месте.${NC}"; echo ""
+    echo -e "  ${DIM}- Симлинк /usr/local/bin/mtpr${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Во время удаления будет предложен откат конфигурации / тюнинга,${NC}"
+    echo -e "  ${YELLOW}если для этого доступны сохранённые настройки или бэкап.${NC}"
+    echo -e "  ${YELLOW}Если вы выберете восстановление из бэкапа, все изменения,${NC}"
+    echo -e "  ${YELLOW}внесённые после установки реаниматора, будут потеряны.${NC}"
+    echo ""
     echo -en "  ${BOLD}Введите 'yes' для подтверждения:${NC} "
     local _confirm; read -r _confirm
     [ "$_confirm" != "yes" ] && { log_info "Отменено"; return; }
     if [ -f "$IOS_SYSCTL_FILE" ]; then
         rm -f "$IOS_SYSCTL_FILE"
-        sysctl -w net.ipv4.tcp_keepalive_time=7200 &>/dev/null || true
-        sysctl -w net.ipv4.tcp_keepalive_intvl=75 &>/dev/null || true
-        sysctl -w net.ipv4.tcp_keepalive_probes=9 &>/dev/null || true
+
+        local _restore_time="${IOS_ORIG_TIME:-7200}"
+        local _restore_intvl="${IOS_ORIG_INTVL:-75}"
+        local _restore_probes="${IOS_ORIG_PROBES:-9}"
+
+        sysctl -w "net.ipv4.tcp_keepalive_time=${_restore_time}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_intvl=${_restore_intvl}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_probes=${_restore_probes}" &>/dev/null || true
         sysctl --system &>/dev/null || true
-        log_success "iOS фикс откачен"
+        log_success "iOS фикс откачен (восстановлены значения: time=${_restore_time} intvl=${_restore_intvl} probes=${_restore_probes})"
     fi
     remove_nft_rules 2>/dev/null || true
     remove_service 2>/dev/null || true
@@ -1777,6 +1818,12 @@ first_run_wizard() {
     echo ""; echo -en "  ${BOLD}Применить фикс для iOS вариант 1 (TCP keepalive)? [y/N]:${NC} "
     local _yn_ios; read -r _yn_ios
     if [[ "$_yn_ios" =~ ^[yY]$ ]]; then
+        # Сохраняем оригинальные значения
+        if [ -z "$IOS_ORIG_TIME" ]; then
+            IOS_ORIG_TIME=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "7200")
+            IOS_ORIG_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
+            IOS_ORIG_PROBES=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "9")
+        fi
         cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
 # MTproxy-reanimation: фикс для iOS — TCP keepalive
 net.ipv4.tcp_keepalive_time = 60
