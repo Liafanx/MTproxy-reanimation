@@ -1417,9 +1417,13 @@ show_main_menu() {
             3) show_settings_menu ;; 4) show_preset_menu ;; 5) show_drop_counter || true ;;
             6) show_service_menu ;; 7) show_extra_rules_menu ;;
             8) detect_telemt || true
-               [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
-               [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
-               if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
+                [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
+                if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+                    NFT_HOOK="forward"
+                else
+                    [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
+                    NFT_HOOK="input"
+                fi
                save_settings; log_success "Обнаружено: режим=$DETECTED_MODE порт=${DETECTED_PORT:-?}"
                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             9) show_ios_fix_menu ;; a|A) show_ios2_fix_menu ;;
@@ -1429,7 +1433,11 @@ show_main_menu() {
 show_settings_menu() {
     while true; do
         show_header; echo -e "  ${BOLD}Настройки${NC}"; echo ""
-        echo -e "  ${DIM}[1]${NC} Привязка к IPv4 [${SERVER_IP:-отключена}]"
+        if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+            echo -e "  ${DIM}[1]${NC} Привязка к IPv4 [${DIM}не используется в bridge${NC}]"
+        else
+            echo -e "  ${DIM}[1]${NC} Привязка к IPv4 [${SERVER_IP:-отключена}]"
+        fi
         echo -e "  ${DIM}[2]${NC} Порт            [${SERVER_PORT:-не задан}]"
         echo -e "  ${DIM}[3]${NC} Rate             [${NFT_RATE}]"
         echo -e "  ${DIM}[4]${NC} Burst            [${NFT_BURST}]"
@@ -1446,6 +1454,12 @@ show_settings_menu() {
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
             1)
+                if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+                    log_info "В bridge-режиме привязка к внешнему IPv4 не используется"
+                    log_info "Используйте [b] для выбора bridge-режима: simple или precise"
+                    echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
+                    continue
+                fi
                 echo ""
                 echo -e "  ${DIM}IP-привязка ограничивает правило только одним IPv4 сервера.${NC}"
                 echo -e "  ${DIM}Если IP пустой — правило будет применяться ко всем IP сервера${NC}"
