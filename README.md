@@ -4,7 +4,12 @@
 
 За основу взяты мануалы сообщества: [Ссылка №1](https://h1de0x.github.io/telemt-tune) · [Ссылка №2](https://assyoucandy.github.io/telemt-server-guide/) · [Ссылка №3](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html)
 
+## Реклама
+
+Сделал свой Прокси менеджер ставится в докере , управление через tui меню со встроенным syn limiter, версия 1.0.0 https://github.com/Liafanx/MTProxyL
+
 ## Установка и обновление
+
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main/install.sh | sudo bash
