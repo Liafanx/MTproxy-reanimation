@@ -28,7 +28,7 @@ mtpr
 ## Обновления
 
 <details>
-<summary><b>1.0.9 от XX.XX.2026</b></summary>
+<summary><b>1.0.9 от 25.06.2026</b></summary>
 
 - Добавлен **NFT Smart By-MEKO** — новый рекомендуемый режим SYN limiter
   - iOS и Android/Desktop разделяются автоматически по TTL — один порт для всех клиентов
