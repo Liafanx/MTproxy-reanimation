@@ -2135,7 +2135,7 @@ main() {
     detect_telemt || true
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
     [ -z "$SERVER_IP" ]   && [ -n "$DETECTED_IP" ]   && SERVER_IP="$DETECTED_IP"
-    check_for_update
+    check_for_update || true
     if [ ! -f "$SETTINGS_FILE" ]; then
         if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
             NFT_HOOK="forward"
