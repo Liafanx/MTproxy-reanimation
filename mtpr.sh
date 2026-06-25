@@ -7,7 +7,7 @@
 set -eo pipefail
 
 VERSION="1.0.9"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
