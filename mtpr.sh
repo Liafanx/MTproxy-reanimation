@@ -1018,7 +1018,7 @@ EXTRANIPEOF
         fi
     done
 
-    if [ "$_ios2_enabled" = "true" ] && [ "${NFT_MODE:-classic}" = "classic" ]; then
+    if [ "$_ios2_enabled" = "true" ]; then
         cat >> "$NFT_SCRIPT" << IOS2EOF
 nft add table inet "\$IOS2_TABLE"
 nft "add chain inet \$IOS2_TABLE mangle_pre { type filter hook prerouting priority mangle; policy accept; }"
