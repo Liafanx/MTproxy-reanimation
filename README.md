@@ -279,4 +279,9 @@ systemctl restart telemt
 
 ---
 
+## Поддержать автора
+Если вы хотите поддержать автора и проект на пачку кириешек можно закинуть тут: [Cloudtips](https://pay.cloudtips.ru/p/ad2f7e4d)
+
+---
+
 MTproxy-reanimation by LiafanX · [GitHub](https://github.com/Liafanx/MTproxy-reanimation)
