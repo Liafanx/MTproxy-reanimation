@@ -2091,7 +2091,7 @@ first_run_wizard() {
 # ── Проверка обновлений ───────────────────────────────────────
 check_for_update() {
     local _remote_ver
-    _remote_ver=$(curl -fsS --max-time 5 "${GITHUB_RAW}/version" 2>/dev/null | tr -d '[:space:]')
+    _remote_ver=$(curl -fsS --max-time 5 "${GITHUB_RAW}/version" 2>/dev/null | tr -d '[:space:]') || true
     [ -z "$_remote_ver" ] && return 0
     [ "$_remote_ver" = "$VERSION" ] && return 0
 
