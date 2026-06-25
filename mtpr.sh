@@ -701,8 +701,11 @@ ios_fix_remove() {
         log_info "Фикс для iOS (v1) не установлен"; IOS_FIX_APPLIED="false"; save_settings; return 0
     fi
     echo -e "  ${BOLD}Откат фикса для iOS (вариант 1)${NC}"; echo ""
+    local _rt="${IOS_ORIG_TIME:-7200}"
+    local _ri="${IOS_ORIG_INTVL:-75}"
+    local _rp="${IOS_ORIG_PROBES:-9}"
     echo -e "  ${DIM}Будет удалён: ${IOS_SYSCTL_FILE}${NC}"
-    echo -e "  ${DIM}Значения ядра вернутся к дефолтным (7200 / 75 / 9)${NC}"; echo ""
+    echo -e "  ${DIM}Будут восстановлены: time=${_rt} intvl=${_ri} probes=${_rp}${NC}"; echo ""
     echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
     local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
@@ -899,7 +902,7 @@ show_ios2_fix_menu() {
         echo -e "  ${DIM}  Smart автоматически разделяет iOS/Android на одном порту.${NC}"
         echo ""
     fi
-    show_header; echo -e "  ${BOLD}Фикс для iOS вариант 2 (MSS + redirect)${NC}"; echo ""
+    echo -e "  ${BOLD}Фикс для iOS вариант 2 (MSS + redirect)${NC}"; echo ""
     local _status; _status=$(ios2_fix_status)
     local _target="${IOS2_TARGET_PORT:-${SERVER_PORT:-443}}"
     echo -e "  Статус: ${_status}"; echo ""
@@ -1405,7 +1408,13 @@ show_drop_counter() {
     local _hook="${NFT_HOOK:-input}"
     if ! nft list table inet "$_table" &>/dev/null; then
         log_warn "Активных NFT правил не найдено"; return 1; fi
-    echo ""; echo -e "  ${BOLD}Счётчик дропов (Ctrl+C для выхода):${NC}"; echo ""
+    echo ""
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo -e "  ${BOLD}Счётчик правил Smart By-MEKO (Ctrl+C для выхода):${NC}"; echo ""
+    else
+        echo -e "  ${BOLD}Счётчик дропов Classic (Ctrl+C для выхода):${NC}"; echo ""
+    fi
+    echo ""
     watch -n 2 "nft list chain inet $_table $_hook 2>/dev/null | grep -E 'counter|comment'"
 }
 
@@ -1554,7 +1563,7 @@ show_header() {
     fi
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
     echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
-    echo -e "  ${BOLD}NFT режим:${NC}    ${NFT_MODE:-classic}"
+    echo -e "  ${BOLD}NFT режим:${NC}     ${NFT_MODE:-classic}"
     echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"; echo ""
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
@@ -1570,8 +1579,13 @@ show_header() {
     fi
 
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
-    echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
-    echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo -e "  ${BOLD}iOS Rate:${NC}      ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
+        echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
+    else
+        echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
+        echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
+    fi
     echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
     echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
@@ -2064,6 +2078,10 @@ first_run_wizard() {
             IOS_ORIG_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
             IOS_ORIG_PROBES=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "9")
         fi
+    if [ "${NFT_MODE:-classic}" = "classic" ]; then
+        echo ""
+        log_info "iOS Fix v2 (MSS + redirect) доступен в меню: [a] Фикс для iOS вариант 2"
+    fi
         cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
 # MTproxy-reanimation: фикс для iOS — TCP keepalive
 net.ipv4.tcp_keepalive_time = 60
@@ -2071,7 +2089,8 @@ net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 3
 SYSEOF
         sysctl --system &>/dev/null || true; IOS_FIX_APPLIED="true"; save_settings
-        log_success "Фикс для iOS применён"; fi
+        log_success "Фикс для iOS применён"
+    fi
     echo ""; echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
     local _yn_nft; read -r _yn_nft
     if [[ ! "$_yn_nft" =~ ^[nN] ]]; then apply_nft_rules || true; fi
