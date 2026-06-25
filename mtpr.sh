@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.8
+#  MTproxy-reanimation v1.0.9
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.8"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
+VERSION="1.0.9"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -34,11 +34,18 @@ DETECTED_NETWORK_MODE=""
 
 SERVER_IP=""
 SERVER_PORT=""
+
 NFT_RATE="1/second"
 NFT_BURST="1"
 NFT_METER_TIMEOUT="60s"
 NFT_TABLE="telemt_limit"
 NFT_HOOK="input"
+NFT_MODE="classic"
+NFT_IOS_RATE="15/second"
+NFT_IOS_BURST="30"
+NFT_OTHER_RATE="54/minute"
+NFT_OTHER_BURST="1"
+
 TUNING_TG_CONNECT="30"
 TUNING_CLIENT_HANDSHAKE="90"
 TUNING_CLIENT_KEEPALIVE="120"
@@ -56,7 +63,7 @@ IOS2_EXTERNAL_PORT="4443"
 IOS2_TARGET_PORT=""
 IOS2_MSS="92"
 IOS2_TABLE="mtpr_ios2_fix"
-DOCKER_BRIDGE_MODE="simple"   # simple | precise
+DOCKER_BRIDGE_MODE="simple"
 BRIDGE_WATCH_INTERVAL="5"
 WATCHER_SCRIPT="/usr/local/sbin/mtpr-bridge-watch.sh"
 WATCHER_UNIT="mtpr-bridge-watch.service"
@@ -94,6 +101,11 @@ NFT_BURST='${NFT_BURST}'
 NFT_METER_TIMEOUT='${NFT_METER_TIMEOUT}'
 NFT_TABLE='${NFT_TABLE}'
 NFT_HOOK='${NFT_HOOK}'
+NFT_MODE='${NFT_MODE}'
+NFT_IOS_RATE='${NFT_IOS_RATE}'
+NFT_IOS_BURST='${NFT_IOS_BURST}'
+NFT_OTHER_RATE='${NFT_OTHER_RATE}'
+NFT_OTHER_BURST='${NFT_OTHER_BURST}'
 TUNING_TG_CONNECT='${TUNING_TG_CONNECT}'
 TUNING_CLIENT_HANDSHAKE='${TUNING_CLIENT_HANDSHAKE}'
 TUNING_CLIENT_KEEPALIVE='${TUNING_CLIENT_KEEPALIVE}'
@@ -137,11 +149,13 @@ load_settings() {
             case "$_key" in
                 SERVER_IP|SERVER_PORT|NFT_RATE|NFT_BURST|NFT_METER_TIMEOUT|\
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
+                NFT_MODE|NFT_IOS_RATE|NFT_IOS_BURST|NFT_OTHER_RATE|NFT_OTHER_BURST|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
                 IOS_FIX_APPLIED|IOS_KA_TIME|IOS_KA_INTVL|IOS_KA_PROBES|\
                 IOS_ORIG_TIME|IOS_ORIG_INTVL|IOS_ORIG_PROBES|\
                 IOS2_FIX_APPLIED|IOS2_EXTERNAL_PORT|\
-                IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT)
+                IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|\
+                DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT)
                     printf -v "$_key" '%s' "$_val"
                     ;;
                 EXTRA_RULES_*_PORT)
@@ -164,6 +178,10 @@ load_settings() {
         fi
     done < "$SETTINGS_FILE"
     [[ "$EXTRA_RULES_COUNT" =~ ^[0-9]+$ ]] || EXTRA_RULES_COUNT=0
+    case "$NFT_MODE" in
+        classic|smart) ;;
+        *) NFT_MODE="classic" ;;
+    esac
 }
 
 # ── Безопасное чтение значения из TOML ────────────────────────
@@ -327,7 +345,9 @@ detect_telemt() {
 
     # 4. Только конфиг
     local _cf
-    for _cf in /etc/telemt/telemt.toml /etc/telemt/config.toml /etc/telemt.toml /opt/telemt/config.toml /opt/telemt/telemt.toml /opt/mtproxymax/mtproxy/config.toml; do
+    for _cf in /etc/telemt/telemt.toml /etc/telemt/config.toml /etc/telemt.toml \
+               /opt/telemt/config.toml /opt/telemt/telemt.toml \
+               /opt/mtproxymax/mtproxy/config.toml; do
         if [ -f "$_cf" ] && ! _is_excluded_path "$_cf" && _looks_like_telemt_config "$_cf"; then
             DETECTED_CONFIG_PATH="$_cf"
             DETECTED_MODE="config_only"
@@ -353,7 +373,8 @@ detect_public_ip() {
 docker_container_ip() {
     local _container="${1:-$DETECTED_CONTAINER}"
     [ -z "$_container" ] && return 1
-    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$_container" 2>/dev/null | awk 'NF {print; exit}'
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' \
+        "$_container" 2>/dev/null | awk 'NF {print; exit}'
 }
 
 service_unit_name() {
@@ -368,7 +389,6 @@ prompt_bridge_mode() {
     if [ "$DETECTED_NETWORK_MODE" != "bridge" ]; then
         return 0
     fi
-
     echo ""
     echo -e "  ${BOLD}Обнаружен Docker bridge режим${NC}"
     echo ""
@@ -383,14 +403,11 @@ prompt_bridge_mode() {
     echo -en "  ${BOLD}Выбор [по умолчанию 1]:${NC} "
     local _bm
     read -r _bm
-
     case "$_bm" in
         2) DOCKER_BRIDGE_MODE="precise" ;;
         *) DOCKER_BRIDGE_MODE="simple" ;;
     esac
-
     save_settings
-
     if [ "$DOCKER_BRIDGE_MODE" = "simple" ]; then
         log_info "Выбран простой bridge-режим — IP привязка не используется"
     else
@@ -402,8 +419,6 @@ prompt_bridge_mode() {
 
 validate_ip_literal() {
     local _ip="$1"
-
-    # Только IPv4
     if [[ "$_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
         local IFS='.'
         local _a _b _c _d
@@ -414,11 +429,10 @@ validate_ip_literal() {
         done
         return 0
     fi
-
     return 1
 }
 
-# ── Зависимости ──────────────────────────────────────────────
+# ── Зависимости ───────────────────────────────────────────────
 install_dependencies() {
     log_info "Проверка зависимостей..."
     local _missing=()
@@ -445,25 +459,30 @@ install_dependencies() {
 # ── Тюнинг Telemt ─────────────────────────────────────────────
 apply_tuning() {
     log_info "Применение тюнинга Telemt..."
+
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
         log_info "Режим: MTProxyMax — используем команды mtproxymax tune"
         local _changed=false
         local _cur
+
         _cur=$(mtproxymax tune get tg_connect 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
         if [ "$_cur" != "$TUNING_TG_CONNECT" ]; then
             echo "n" | mtproxymax tune set tg_connect "$TUNING_TG_CONNECT" &>/dev/null || true
             _changed=true; log_success "tg_connect = $TUNING_TG_CONNECT"
         else log_info "tg_connect уже $TUNING_TG_CONNECT"; fi
+
         _cur=$(mtproxymax tune get client_handshake 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
         if [ "$_cur" != "$TUNING_CLIENT_HANDSHAKE" ]; then
             echo "n" | mtproxymax tune set client_handshake "$TUNING_CLIENT_HANDSHAKE" &>/dev/null || true
             _changed=true; log_success "client_handshake = $TUNING_CLIENT_HANDSHAKE"
         else log_info "client_handshake уже $TUNING_CLIENT_HANDSHAKE"; fi
+
         _cur=$(mtproxymax tune get client_keepalive 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
         if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
             echo "n" | mtproxymax tune set client_keepalive "$TUNING_CLIENT_KEEPALIVE" &>/dev/null || true
             _changed=true; log_success "client_keepalive = $TUNING_CLIENT_KEEPALIVE"
         else log_info "client_keepalive уже $TUNING_CLIENT_KEEPALIVE"; fi
+
         if [ "$_changed" = "true" ]; then
             log_info "Перезапуск MTProxyMax..."
             mtproxymax restart &>/dev/null || log_warn "Не удалось перезапустить"
@@ -505,9 +524,11 @@ apply_tuning() {
             if [ -f "$_custom_path" ] && _looks_like_telemt_config "$_custom_path"; then
                 DETECTED_CONFIG_PATH="$_custom_path"; log_success "Конфиг принят: $_custom_path"
             elif [ -f "$_custom_path" ]; then
-                log_warn "Файл не похож на конфиг Telemt, но используем его"; DETECTED_CONFIG_PATH="$_custom_path"
+                log_warn "Файл не похож на конфиг Telemt, но используем его"
+                DETECTED_CONFIG_PATH="$_custom_path"
             else
-                log_error "Файл не найден: $_custom_path"; TUNING_APPLIED="manual"; save_settings; return 0
+                log_error "Файл не найден: $_custom_path"
+                TUNING_APPLIED="manual"; save_settings; return 0
             fi ;;
     esac
 
@@ -524,11 +545,12 @@ apply_tuning() {
             echo -en "  ${BOLD}Создать секцию [general] и применить tg_connect? [Y/n]:${NC} "
             local _cr; read -r _cr
             if [[ ! "$_cr" =~ ^[nN]$ ]]; then
-                echo "" >> "$_cfg"
-                echo "[general]" >> "$_cfg"
-                echo "tg_connect = $TUNING_TG_CONNECT" >> "$_cfg"
-                _changed=true; log_success "Секция [general] создана, tg_connect = $TUNING_TG_CONNECT"
-            else _failed=true; fi
+                printf '\n[general]\ntg_connect = %s\n' "$TUNING_TG_CONNECT" >> "$_cfg"
+                _changed=true
+                log_success "Секция [general] создана, tg_connect = $TUNING_TG_CONNECT"
+            else
+                _failed=true
+            fi
         fi
     else log_info "tg_connect уже $TUNING_TG_CONNECT"; fi
 
@@ -541,18 +563,17 @@ apply_tuning() {
             echo -en "  ${BOLD}Создать секцию [timeouts] и применить client_handshake + client_keepalive? [Y/n]:${NC} "
             local _cr; read -r _cr
             if [[ ! "$_cr" =~ ^[nN]$ ]]; then
-                echo "" >> "$_cfg"
-                echo "[timeouts]" >> "$_cfg"
-                echo "client_handshake = $TUNING_CLIENT_HANDSHAKE" >> "$_cfg"
-                echo "client_keepalive = $TUNING_CLIENT_KEEPALIVE" >> "$_cfg"
+                printf '\n[timeouts]\nclient_handshake = %s\nclient_keepalive = %s\n' \
+                    "$TUNING_CLIENT_HANDSHAKE" "$TUNING_CLIENT_KEEPALIVE" >> "$_cfg"
                 _changed=true
                 _timeouts_created=true
-                log_success "Секция [timeouts] создана, client_handshake = $TUNING_CLIENT_HANDSHAKE, client_keepalive = $TUNING_CLIENT_KEEPALIVE"
-            else _failed=true; fi
+                log_success "Секция [timeouts] создана"
+            else
+                _failed=true
+            fi
         fi
     else log_info "client_handshake уже $TUNING_CLIENT_HANDSHAKE"; fi
 
-    # Пропускаем если уже создали секцию [timeouts] выше вместе с client_keepalive
     if [ "${_timeouts_created:-false}" != "true" ]; then
         _cur=$(_toml_get_value "client_keepalive" "$_cfg")
         if [ "$_cur" != "$TUNING_CLIENT_KEEPALIVE" ]; then
@@ -582,11 +603,14 @@ apply_tuning() {
                 log_info "Перезапуск службы telemt..."
                 systemctl restart telemt.service &>/dev/null || log_warn "Не удалось перезапустить службу"
             else
-                log_info "Отправка SIGHUP процессу telemt..."; pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал"
+                log_info "Отправка SIGHUP процессу telemt..."
+                pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал"
             fi
         fi
     fi
-    TUNING_APPLIED="true"; [ "$_failed" = "true" ] && TUNING_APPLIED="partial"; save_settings
+    TUNING_APPLIED="true"
+    [ "$_failed" = "true" ] && TUNING_APPLIED="partial"
+    save_settings
 }
 
 # ── Фикс для iOS (TCP keepalive) ─────────────────────────────
@@ -597,7 +621,9 @@ ios_fix_status() {
         _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
         _probes=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
         echo -e "${GREEN}v1 активен${NC} (time=${_time} intvl=${_intvl} probes=${_probes})"
-    else echo -e "${DIM}не применён${NC}"; fi
+    else
+        echo -e "${DIM}не применён${NC}"
+    fi
 }
 
 ios_fix_apply() {
@@ -643,7 +669,7 @@ ios_fix_apply() {
     fi
     local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
-    # Сохраняем оригинальные значения если ещё не сохранены
+
     if [ -z "$IOS_ORIG_TIME" ]; then
         IOS_ORIG_TIME=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "7200")
         IOS_ORIG_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
@@ -651,14 +677,11 @@ ios_fix_apply() {
         log_info "Сохранены оригинальные значения: time=${IOS_ORIG_TIME} intvl=${IOS_ORIG_INTVL} probes=${IOS_ORIG_PROBES}"
     fi
 
-    cat > "$IOS_SYSCTL_FILE" << SYSEOF
-# MTproxy-reanimation: фикс для iOS v1 — TCP keepalive
-net.ipv4.tcp_keepalive_time = ${IOS_KA_TIME}
-net.ipv4.tcp_keepalive_intvl = ${IOS_KA_INTVL}
-net.ipv4.tcp_keepalive_probes = ${IOS_KA_PROBES}
-SYSEOF
+    printf '# MTproxy-reanimation: фикс для iOS v1 — TCP keepalive\nnet.ipv4.tcp_keepalive_time = %s\nnet.ipv4.tcp_keepalive_intvl = %s\nnet.ipv4.tcp_keepalive_probes = %s\n' \
+        "$IOS_KA_TIME" "$IOS_KA_INTVL" "$IOS_KA_PROBES" > "$IOS_SYSCTL_FILE"
 
-    if sysctl --system &>/dev/null; then log_success "sysctl применён"
+    if sysctl --system &>/dev/null; then
+        log_success "sysctl применён"
     else
         log_warn "sysctl --system вернул ошибку, применяем вручную"
         sysctl -w "net.ipv4.tcp_keepalive_time=${IOS_KA_TIME}" 2>/dev/null || true
@@ -675,40 +698,45 @@ SYSEOF
     echo -e "    tcp_keepalive_intvl  = ${_new_intvl}"
     echo -e "    tcp_keepalive_probes = ${_new_probes}"
 
-    if [ "${_new_time}" = "${IOS_KA_TIME}" ] && [ "${_new_intvl}" = "${IOS_KA_INTVL}" ] && [ "${_new_probes}" = "${IOS_KA_PROBES}" ]; then
+    if [ "${_new_time}" = "${IOS_KA_TIME}" ] && \
+       [ "${_new_intvl}" = "${IOS_KA_INTVL}" ] && \
+       [ "${_new_probes}" = "${IOS_KA_PROBES}" ]; then
         log_success "Фикс для iOS (v1) применён"
-    else log_warn "Значения не совпадают с ожидаемыми — проверьте вручную"; fi
+    else
+        log_warn "Значения не совпадают с ожидаемыми — проверьте вручную"
+    fi
     IOS_FIX_APPLIED="true"; save_settings
 }
 
 ios_fix_remove() {
     echo ""
     if [ ! -f "$IOS_SYSCTL_FILE" ]; then
-        log_info "Фикс для iOS (v1) не установлен"; IOS_FIX_APPLIED="false"; save_settings; return 0
+        log_info "Фикс для iOS (v1) не установлен"
+        IOS_FIX_APPLIED="false"; save_settings; return 0
     fi
+
+    local _rt="${IOS_ORIG_TIME:-7200}"
+    local _ri="${IOS_ORIG_INTVL:-75}"
+    local _rp="${IOS_ORIG_PROBES:-9}"
+
     echo -e "  ${BOLD}Откат фикса для iOS (вариант 1)${NC}"; echo ""
     echo -e "  ${DIM}Будет удалён: ${IOS_SYSCTL_FILE}${NC}"
-    echo -e "  ${DIM}Значения ядра вернутся к дефолтным (7200 / 75 / 9)${NC}"; echo ""
+    echo -e "  ${DIM}Будут восстановлены: time=${_rt} intvl=${_ri} probes=${_rp}${NC}"; echo ""
     echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
     local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
+
     rm -f "$IOS_SYSCTL_FILE"
-
-    local _restore_time="${IOS_ORIG_TIME:-7200}"
-    local _restore_intvl="${IOS_ORIG_INTVL:-75}"
-    local _restore_probes="${IOS_ORIG_PROBES:-9}"
-
-    log_info "Восстановление значений: time=${_restore_time} intvl=${_restore_intvl} probes=${_restore_probes}"
-    sysctl -w "net.ipv4.tcp_keepalive_time=${_restore_time}" &>/dev/null || true
-    sysctl -w "net.ipv4.tcp_keepalive_intvl=${_restore_intvl}" &>/dev/null || true
-    sysctl -w "net.ipv4.tcp_keepalive_probes=${_restore_probes}" &>/dev/null || true
+    log_info "Восстановление значений: time=${_rt} intvl=${_ri} probes=${_rp}"
+    sysctl -w "net.ipv4.tcp_keepalive_time=${_rt}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_keepalive_intvl=${_ri}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_keepalive_probes=${_rp}" &>/dev/null || true
     sysctl --system &>/dev/null || true
 
-    # Очищаем сохранённые оригиналы
     IOS_ORIG_TIME=""
     IOS_ORIG_INTVL=""
     IOS_ORIG_PROBES=""
-    
+
     local _time _intvl _probes
     _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
     _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
@@ -717,12 +745,15 @@ ios_fix_remove() {
     echo -e "    tcp_keepalive_time   = ${_time}"
     echo -e "    tcp_keepalive_intvl  = ${_intvl}"
     echo -e "    tcp_keepalive_probes = ${_probes}"
-    log_success "Фикс для iOS (v1) откачен"; IOS_FIX_APPLIED="false"; save_settings
+    log_success "Фикс для iOS (v1) откачен"
+    IOS_FIX_APPLIED="false"; save_settings
 }
 
 show_ios_fix_menu() {
-    show_header; echo -e "  ${BOLD}Фикс для iOS (вариант 1) — TCP keepalive${NC}"; echo ""
-    local _status; _status=$(ios_fix_status); echo -e "  Статус: ${_status}"; echo ""
+    show_header
+    echo -e "  ${BOLD}Фикс для iOS (вариант 1) — TCP keepalive${NC}"; echo ""
+    local _status; _status=$(ios_fix_status)
+    echo -e "  Статус: ${_status}"; echo ""
     local _time _intvl _probes
     _time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
     _intvl=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
@@ -733,29 +764,26 @@ show_ios_fix_menu() {
     echo -e "    tcp_keepalive_intvl  = ${_intvl:-?}  ${DIM}(дефолт: 75,   фикс: ${IOS_KA_INTVL})${NC}"
     echo -e "    tcp_keepalive_probes = ${_probes:-?}  ${DIM}(дефолт: 9,    фикс: ${IOS_KA_PROBES})${NC}"
     echo -e "    ${DIM}Время обнаружения мёртвого коннекта: ~${_detect_secs} сек${NC}"; echo ""
+    if [ -n "$IOS_ORIG_TIME" ]; then
+        echo -e "  ${DIM}Значения до установки фикса: time=${IOS_ORIG_TIME} intvl=${IOS_ORIG_INTVL} probes=${IOS_ORIG_PROBES}${NC}"
+        echo ""
+    fi
     echo -e "  ${DIM}[1]${NC} Применить / обновить фикс"
     echo -e "  ${DIM}[2]${NC} Откатить фикс"
     echo -e "  ${DIM}[3]${NC} Изменить keepalive_time   [${IOS_KA_TIME}]"
     echo -e "  ${DIM}[4]${NC} Изменить keepalive_intvl  [${IOS_KA_INTVL}]"
     echo -e "  ${DIM}[5]${NC} Изменить keepalive_probes [${IOS_KA_PROBES}]"
-    if [ -n "$IOS_ORIG_TIME" ]; then
-        echo -e "  ${DIM}Значения до установки фикса: time=${IOS_ORIG_TIME} intvl=${IOS_ORIG_INTVL} probes=${IOS_ORIG_PROBES}${NC}"
-        echo ""
-    fi
     echo -e "  ${DIM}[0]${NC} Назад"; echo ""
     echo -en "  Выбор: "; local _choice; read -r _choice
     case "$_choice" in
         1) ios_fix_apply ;;
         2) ios_fix_remove ;;
-        3)
-            echo -en "  tcp_keepalive_time [${IOS_KA_TIME}]: "; local _v; read -r _v
-            [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_TIME="$_v"; save_settings; log_success "keepalive_time = $_v"; } ;;
-        4)
-            echo -en "  tcp_keepalive_intvl [${IOS_KA_INTVL}]: "; local _v; read -r _v
-            [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_INTVL="$_v"; save_settings; log_success "keepalive_intvl = $_v"; } ;;
-        5)
-            echo -en "  tcp_keepalive_probes [${IOS_KA_PROBES}]: "; local _v; read -r _v
-            [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_PROBES="$_v"; save_settings; log_success "keepalive_probes = $_v"; } ;;
+        3) echo -en "  tcp_keepalive_time [${IOS_KA_TIME}]: "; local _v; read -r _v
+           [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_TIME="$_v"; save_settings; log_success "keepalive_time = $_v"; } ;;
+        4) echo -en "  tcp_keepalive_intvl [${IOS_KA_INTVL}]: "; local _v; read -r _v
+           [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_INTVL="$_v"; save_settings; log_success "keepalive_intvl = $_v"; } ;;
+        5) echo -en "  tcp_keepalive_probes [${IOS_KA_PROBES}]: "; local _v; read -r _v
+           [[ "$_v" =~ ^[0-9]+$ ]] && { IOS_KA_PROBES="$_v"; save_settings; log_success "keepalive_probes = $_v"; } ;;
         0|"") return ;;
     esac
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -766,11 +794,12 @@ ios2_fix_status() {
     if [ "${IOS2_FIX_APPLIED:-false}" = "true" ]; then
         local _target="${IOS2_TARGET_PORT:-${SERVER_PORT:-443}}"
         echo -e "${GREEN}активен${NC} (порт ${IOS2_EXTERNAL_PORT} → ${_target}, mss=${IOS2_MSS})"
-    else echo -e "${DIM}не применён${NC}"; fi
+    else
+        echo -e "${DIM}не применён${NC}"
+    fi
 }
 
 _ios2_check_client_mss() {
-    # Проверяем наличие client_mss в конфиге telemt
     local _cfg="${DETECTED_CONFIG_PATH:-}"
     if [ -n "$_cfg" ] && [ -f "$_cfg" ]; then
         if grep -qE '^client_mss[[:space:]]*=' "$_cfg" 2>/dev/null; then
@@ -789,8 +818,7 @@ _ios2_check_client_mss() {
                 echo -e "  ${CYAN}mtproxymax restart${NC}"
             else
                 echo -e "  Удалите или закомментируйте строку ${BOLD}client_mss = ...${NC}"
-                echo -e "  в файле ${CYAN}${_cfg}${NC}"
-                echo -e "  и перезапустите telemt"
+                echo -e "  в файле ${CYAN}${_cfg}${NC} и перезапустите telemt"
             fi
             echo ""
             echo -en "  ${BOLD}Продолжить всё равно? [y/N]:${NC} "
@@ -802,28 +830,39 @@ _ios2_check_client_mss() {
 }
 
 ios2_fix_apply() {
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo ""
+        echo -e "  ${YELLOW}⚠ Smart By-MEKO активен — iOS Fix v2 не нужен.${NC}"
+        echo -e "  ${DIM}Smart автоматически разделяет iOS и Android на одном порту.${NC}"
+        echo ""
+        echo -en "  ${BOLD}Всё равно включить iOS Fix v2? [y/N]:${NC} "
+        local _force; read -r _force
+        [[ "$_force" =~ ^[yY] ]] || { log_info "Отменено"; return 0; }
+    fi
+
     local _target="${IOS2_TARGET_PORT:-${SERVER_PORT:-443}}"
-    if [ -z "${SERVER_PORT:-}" ]; then log_error "Основной порт Telemt не определён"; return 1; fi
-    if ! [[ "${IOS2_EXTERNAL_PORT}" =~ ^[0-9]+$ ]] || [ "${IOS2_EXTERNAL_PORT}" -lt 1 ] || [ "${IOS2_EXTERNAL_PORT}" -gt 65535 ]; then
+    if [ -z "${SERVER_PORT:-}" ]; then
+        log_error "Основной порт Telemt не определён"; return 1; fi
+    if ! [[ "${IOS2_EXTERNAL_PORT}" =~ ^[0-9]+$ ]] || \
+       [ "${IOS2_EXTERNAL_PORT}" -lt 1 ] || [ "${IOS2_EXTERNAL_PORT}" -gt 65535 ]; then
         log_error "Некорректный внешний порт iOS v2"; return 1; fi
-    if ! [[ "${_target}" =~ ^[0-9]+$ ]] || [ "${_target}" -lt 1 ] || [ "${_target}" -gt 65535 ]; then
+    if ! [[ "${_target}" =~ ^[0-9]+$ ]] || \
+       [ "${_target}" -lt 1 ] || [ "${_target}" -gt 65535 ]; then
         log_error "Некорректный целевой порт iOS v2"; return 1; fi
     if [ "${IOS2_EXTERNAL_PORT}" = "${_target}" ]; then
         log_error "Внешний порт iOS v2 не должен совпадать с основным портом"; return 1; fi
-    if ! [[ "${IOS2_MSS}" =~ ^[0-9]+$ ]] || [ "${IOS2_MSS}" -lt 88 ] || [ "${IOS2_MSS}" -gt 4096 ]; then
+    if ! [[ "${IOS2_MSS}" =~ ^[0-9]+$ ]] || \
+       [ "${IOS2_MSS}" -lt 88 ] || [ "${IOS2_MSS}" -gt 4096 ]; then
         log_error "MSS должен быть в диапазоне 88..4096"; return 1; fi
 
     echo ""; echo -e "  ${BOLD}Фикс для iOS вариант 2 (MSS + redirect)${NC}"; echo ""
     echo -e "  ${DIM}Создаёт отдельный внешний порт для iOS-клиентов.${NC}"
     echo -e "  ${DIM}На этом порту входящий SYN получает MSS=${IOS2_MSS},${NC}"
     echo -e "  ${DIM}затем трафик прозрачно редиректится на основной порт.${NC}"; echo ""
-    echo -e "  ${DIM}Android и Desktop продолжают работать на основном порту.${NC}"
-    echo -e "  ${DIM}iOS-пользователям нужно заменить порт в ссылке.${NC}"; echo ""
     echo -e "    Внешний порт iOS: ${BOLD}${IOS2_EXTERNAL_PORT}${NC}"
     echo -e "    Основной порт:    ${_target}"
     echo -e "    MSS:              ${IOS2_MSS}"; echo ""
 
-    # Проверяем client_mss в конфиге
     _ios2_check_client_mss || return 0
 
     echo -en "  ${BOLD}Применить? [Y/n]:${NC} "
@@ -860,7 +899,8 @@ ios2_fix_remove() {
     echo -e "  ${BOLD}Отключение фикса для iOS вариант 2${NC}"; echo ""
     echo -e "  ${DIM}Будет удалён редирект порта ${IOS2_EXTERNAL_PORT} → ${IOS2_TARGET_PORT:-${SERVER_PORT:-443}}${NC}"
     echo -e "  ${DIM}и правило MSS=${IOS2_MSS}${NC}"; echo ""
-    echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "; local _confirm; read -r _confirm
+    echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
+    local _confirm; read -r _confirm
     [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
     IOS2_FIX_APPLIED="false"; save_settings
     apply_nft_rules || true
@@ -870,7 +910,13 @@ ios2_fix_remove() {
 }
 
 show_ios2_fix_menu() {
-    show_header; echo -e "  ${BOLD}Фикс для iOS вариант 2 (MSS + redirect)${NC}"; echo ""
+    show_header
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo -e "  ${YELLOW}⚠ Smart By-MEKO активен — iOS Fix v2 не нужен.${NC}"
+        echo -e "  ${DIM}  Smart автоматически разделяет iOS/Android на одном порту.${NC}"
+        echo ""
+    fi
+    echo -e "  ${BOLD}Фикс для iOS вариант 2 (MSS + redirect)${NC}"; echo ""
     local _status; _status=$(ios2_fix_status)
     local _target="${IOS2_TARGET_PORT:-${SERVER_PORT:-443}}"
     echo -e "  Статус: ${_status}"; echo ""
@@ -892,38 +938,23 @@ show_ios2_fix_menu() {
             echo -en "  Новый внешний порт [${IOS2_EXTERNAL_PORT}]: "
             local _p; read -r _p
             if [[ "$_p" =~ ^[0-9]+$ ]] && [ "$_p" -ge 1 ] && [ "$_p" -le 65535 ]; then
-                IOS2_EXTERNAL_PORT="$_p"
-                save_settings
-                log_success "Внешний порт: $_p"
-                prompt_apply_nft_rules
-            elif [ -n "$_p" ]; then
-                log_error "Некорректный порт"
-            fi
-            ;;
+                IOS2_EXTERNAL_PORT="$_p"; save_settings
+                log_success "Внешний порт: $_p"; prompt_apply_nft_rules
+            elif [ -n "$_p" ]; then log_error "Некорректный порт"; fi ;;
         4)
             echo -en "  Новый целевой порт [${_target}]: "
             local _p; read -r _p
             if [[ "$_p" =~ ^[0-9]+$ ]] && [ "$_p" -ge 1 ] && [ "$_p" -le 65535 ]; then
-                IOS2_TARGET_PORT="$_p"
-                save_settings
-                log_success "Целевой порт: $_p"
-                prompt_apply_nft_rules
-            elif [ -n "$_p" ]; then
-                log_error "Некорректный порт"
-            fi
-            ;;
+                IOS2_TARGET_PORT="$_p"; save_settings
+                log_success "Целевой порт: $_p"; prompt_apply_nft_rules
+            elif [ -n "$_p" ]; then log_error "Некорректный порт"; fi ;;
         5)
             echo -en "  Новый MSS [${IOS2_MSS}] (88..4096): "
             local _m; read -r _m
             if [[ "$_m" =~ ^[0-9]+$ ]] && [ "$_m" -ge 88 ] && [ "$_m" -le 4096 ]; then
-                IOS2_MSS="$_m"
-                save_settings
-                log_success "MSS: $_m"
-                prompt_apply_nft_rules
-            elif [ -n "$_m" ]; then
-                log_error "Некорректный MSS (88..4096)"
-            fi
-            ;;
+                IOS2_MSS="$_m"; save_settings
+                log_success "MSS: $_m"; prompt_apply_nft_rules
+            elif [ -n "$_m" ]; then log_error "Некорректный MSS (88..4096)"; fi ;;
         0|"") return ;;
     esac
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -933,8 +964,6 @@ show_ios2_fix_menu() {
 generate_nft_script() {
     local _ip="${SERVER_IP:-}"
     local _port="${SERVER_PORT:-443}"
-    local _rate="${NFT_RATE:-1/second}"
-    local _burst="${NFT_BURST:-1}"
     local _timeout="${NFT_METER_TIMEOUT:-60s}"
     local _table="${NFT_TABLE:-telemt_limit}"
     local _hook="${NFT_HOOK:-input}"
@@ -951,7 +980,6 @@ generate_nft_script() {
         _bridge_precise="true"
     fi
 
-    # Пишем заголовок скрипта
     cat > "$NFT_SCRIPT" << NFTEOF
 #!/bin/sh
 set -eu
@@ -964,44 +992,12 @@ nft add table inet "\$TABLE"
 nft "add chain inet \$TABLE \$CHAIN { type filter hook ${_hook} priority 0; policy accept; }"
 NFTEOF
 
-    # Основное правило — bridge precise
-    if [ "$_bridge_precise" = "true" ]; then
-        cat >> "$NFT_SCRIPT" << BRIDGEOF
-CONTAINER="${DETECTED_CONTAINER}"
-TARGET_IP=""
-for i in \$(seq 1 60); do
-    RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
-    if [ "\$RUNNING" = "true" ]; then
-        TARGET_IP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
-        [ -n "\$TARGET_IP" ] && break
-    fi
-    sleep 1
-done
-if [ -z "\$TARGET_IP" ]; then
-    echo "Не удалось определить IP контейнера: \$CONTAINER" >&2
-    exit 1
-fi
-nft "add rule inet \$TABLE \$CHAIN ip daddr \$TARGET_IP tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
-BRIDGEOF
-
-    # Основное правило — bridge simple (без ip daddr)
-    elif [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ]; then
-        cat >> "$NFT_SCRIPT" << SIMPLEBRIDGEOF
-nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
-SIMPLEBRIDGEOF
-
-    # Основное правило — host/local с IP или без
-    elif [ -n "$_ip" ]; then
-        cat >> "$NFT_SCRIPT" << HOSTIPEOF
-nft "add rule inet \$TABLE \$CHAIN ip daddr ${_ip} tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
-HOSTIPEOF
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        _generate_smart_rules "$_bridge_precise" "$_ip" "$_port" "$_timeout"
     else
-        cat >> "$NFT_SCRIPT" << HOSTNIPEOF
-nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
-HOSTNIPEOF
+        _generate_classic_rules "$_bridge_precise" "$_ip" "$_port" "$_timeout"
     fi
 
-    # Доп. правила
     local _i
     for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
         local _eport="${EXTRA_RULES_PORT[$_i]:-}"
@@ -1009,26 +1005,25 @@ HOSTNIPEOF
         local _erate="${EXTRA_RULES_RATE[$_i]:-1/second}"
         local _eburst="${EXTRA_RULES_BURST[$_i]:-1}"
         [ -z "$_eport" ] && continue
-
+        local _extra_action="drop"
+        [ "${NFT_MODE:-classic}" = "smart" ] && _extra_action="reject with tcp reset"
         if [ -n "$_eip" ]; then
             cat >> "$NFT_SCRIPT" << EXTRAIPEOF
-nft "add rule inet \$TABLE \$CHAIN ip daddr ${_eip} tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter drop comment \\"mtpr_extra_${_i}\\""
+nft "add rule inet \$TABLE \$CHAIN ip daddr ${_eip} tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter ${_extra_action} comment \\"mtpr_extra_${_i}\\""
 EXTRAIPEOF
         else
             cat >> "$NFT_SCRIPT" << EXTRANIPEOF
-nft "add rule inet \$TABLE \$CHAIN tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter drop comment \\"mtpr_extra_${_i}\\""
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter ${_extra_action} comment \\"mtpr_extra_${_i}\\""
 EXTRANIPEOF
         fi
     done
 
-    # iOS fix v2
-    if [ "$_ios2_enabled" = "true" ]; then
+    if [ "$_ios2_enabled" = "true" ] && [ "${NFT_MODE:-classic}" = "classic" ]; then
         cat >> "$NFT_SCRIPT" << IOS2EOF
 nft add table inet "\$IOS2_TABLE"
 nft "add chain inet \$IOS2_TABLE mangle_pre { type filter hook prerouting priority mangle; policy accept; }"
 nft "add chain inet \$IOS2_TABLE nat_pre { type nat hook prerouting priority dstnat; policy accept; }"
 IOS2EOF
-
         if [ -n "$_ip" ]; then
             cat >> "$NFT_SCRIPT" << IOS2IPEOF
 nft "add rule inet \$IOS2_TABLE mangle_pre ip daddr ${_ip} tcp dport ${_ios2_ext} tcp flags & (syn | rst) == syn tcp option maxseg size set ${_ios2_mss} counter comment \\"mtpr_ios2_mss\\""
@@ -1049,6 +1044,169 @@ nft list table inet "$IOS2_TABLE" 2>/dev/null || true
 TAILEOF
 
     chmod +x "$NFT_SCRIPT"
+}
+
+# ── Classic правила ───────────────────────────────────────────
+_generate_classic_rules() {
+    local _bridge_precise="$1" _ip="$2" _port="$3" _timeout="$4"
+    local _rate="${NFT_RATE:-1/second}"
+    local _burst="${NFT_BURST:-1}"
+
+    if [ "$_bridge_precise" = "true" ]; then
+        cat >> "$NFT_SCRIPT" << BRIDGEOF
+CONTAINER="${DETECTED_CONTAINER}"
+TARGET_IP=""
+for i in \$(seq 1 60); do
+    RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
+    if [ "\$RUNNING" = "true" ]; then
+        TARGET_IP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+        [ -n "\$TARGET_IP" ] && break
+    fi
+    sleep 1
+done
+if [ -z "\$TARGET_IP" ]; then
+    echo "Не удалось определить IP контейнера: \$CONTAINER" >&2
+    exit 1
+fi
+nft "add rule inet \$TABLE \$CHAIN ip daddr \$TARGET_IP tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+BRIDGEOF
+    elif [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ]; then
+        cat >> "$NFT_SCRIPT" << SIMPLEBRIDGEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+SIMPLEBRIDGEOF
+    elif [ -n "$_ip" ]; then
+        cat >> "$NFT_SCRIPT" << HOSTIPEOF
+nft "add rule inet \$TABLE \$CHAIN ip daddr ${_ip} tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+HOSTIPEOF
+    else
+        cat >> "$NFT_SCRIPT" << HOSTNIPEOF
+nft "add rule inet \$TABLE \$CHAIN tcp dport ${_port} tcp flags & (syn | ack) == syn meter telemt_in_syn_main { ip saddr timeout ${_timeout} limit rate over ${_rate} burst ${_burst} packets } counter drop comment \\"mtpr_main\\""
+HOSTNIPEOF
+    fi
+}
+
+# ── Smart By-MEKO правила ─────────────────────────────────────
+_generate_smart_rules() {
+    local _bridge_precise="$1" _ip="$2" _port="$3" _timeout="$4"
+    local _ios_rate="${NFT_IOS_RATE:-15/second}"
+    local _ios_burst="${NFT_IOS_BURST:-30}"
+    local _other_rate="${NFT_OTHER_RATE:-54/minute}"
+    local _other_burst="${NFT_OTHER_BURST:-1}"
+
+    local _ip_match=""
+    [ -n "$_ip" ] && [ "$DETECTED_NETWORK_MODE" != "bridge" ] && _ip_match="ip daddr ${_ip} "
+
+    if [ "$_bridge_precise" = "true" ]; then
+        log_warn "Smart режим в bridge/precise: ip daddr контейнера не используется (TTL-идентификация по клиентскому IP)"
+    fi
+
+    cat >> "$NFT_SCRIPT" << SMART1EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ip ttl < 65 meta length 64 meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } accept comment \\"mtpr_smart_ios_accept\\""
+SMART1EOF
+
+    cat >> "$NFT_SCRIPT" << SMART2EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ip ttl < 65 meta length 64 counter reject with tcp reset comment \\"mtpr_smart_ios_reject\\""
+SMART2EOF
+
+    cat >> "$NFT_SCRIPT" << SMART3EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } accept comment \\"mtpr_smart_other_accept\\""
+SMART3EOF
+
+    cat >> "$NFT_SCRIPT" << SMART4EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn counter reject with tcp reset comment \\"mtpr_smart_other_reject\\""
+SMART4EOF
+}
+
+# ── Smart By-MEKO: включение ──────────────────────────────────
+enable_smart_mode() {
+    echo ""
+    echo -e "  ${CYAN}${BOLD}★ NFT Smart By-MEKO${NC}"
+    echo ""
+    echo -e "  ${BOLD}Как работает:${NC}"
+    echo ""
+    echo -e "  ${DIM}  iOS и Android/Desktop разделяются по TTL автоматически:${NC}"
+    echo -e "  ${DIM}  • iOS (TTL < 65, SYN 64 байта) — мягкий лимит ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}${NC}"
+    echo -e "  ${DIM}  • Остальные — строгий лимит ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}${NC}"
+    echo ""
+    echo -e "  ${DIM}  REJECT вместо DROP — клиент получает RST мгновенно${NC}"
+    echo -e "  ${DIM}  и переподключается за 3-8 сек вместо 10-20.${NC}"
+    echo ""
+    echo -e "  ${DIM}  Один порт для всех клиентов.${NC}"
+    echo -e "  ${DIM}  iOS Fix v2 и client_mss в конфиге не нужны.${NC}"
+    echo ""
+    echo -e "  ${DIM}  Источник идеи: github.com/Mekotofeuka/MTPR-FIX-By-MEKO${NC}"
+    echo ""
+
+    if [ "${IOS2_FIX_APPLIED:-false}" = "true" ]; then
+        echo -e "  ${YELLOW}⚠ iOS Fix v2 сейчас активен (порт ${IOS2_EXTERNAL_PORT}).${NC}"
+        echo -e "  ${YELLOW}  Smart режим заменяет его — iOS Fix v2 будет отключён.${NC}"
+        echo ""
+    fi
+
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
+        echo -e "  ${YELLOW}⚠ Bridge/precise режим: ip daddr контейнера не будет использоваться.${NC}"
+        echo -e "  ${YELLOW}  Smart идентифицирует клиентов по TTL — это работает корректно.${NC}"
+        echo ""
+    fi
+
+    echo -en "  ${BOLD}Включить Smart режим? [Y/n]:${NC} "
+    local _yn; read -r _yn
+    [[ "$_yn" =~ ^[nN]$ ]] && { log_info "Отменено"; return 0; }
+
+    if [ "${IOS2_FIX_APPLIED:-false}" = "true" ]; then
+        IOS2_FIX_APPLIED="false"
+        nft delete table inet "${IOS2_TABLE}" 2>/dev/null || true
+        log_info "iOS Fix v2 отключён (Smart режим его заменяет)"
+    fi
+
+    NFT_MODE="smart"
+    save_settings
+    apply_nft_rules || { log_error "Не удалось применить правила"; return 1; }
+    [ "${NFT_SERVICE_ENABLED:-false}" = "true" ] && install_service
+
+    echo ""
+    log_success "Smart By-MEKO активирован"
+    echo ""
+    echo -e "  ${BOLD}Что изменилось:${NC}"
+    echo -e "    ${GREEN}✓${NC} iOS и Android на одном порту ${SERVER_PORT}"
+    echo -e "    ${GREEN}✓${NC} REJECT вместо DROP — быстрый reconnect"
+    echo -e "    ${GREEN}✓${NC} iOS Fix v2 / отдельный порт не нужен"
+    echo -e "    ${GREEN}✓${NC} client_mss в конфиге не нужен"
+    echo ""
+}
+
+show_smart_settings_menu() {
+    while true; do
+        show_header
+        echo -e "  ${BOLD}Настройки Smart By-MEKO${NC}"; echo ""
+        echo -e "  ${BOLD}Текущие параметры:${NC}"
+        echo -e "    iOS Rate:    ${NFT_IOS_RATE}"
+        echo -e "    iOS Burst:   ${NFT_IOS_BURST}"
+        echo -e "    Other Rate:  ${NFT_OTHER_RATE}"
+        echo -e "    Other Burst: ${NFT_OTHER_BURST}"
+        echo -e "    Timeout:     ${NFT_METER_TIMEOUT}"; echo ""
+        echo -e "  ${DIM}[1]${NC} iOS Rate    [${NFT_IOS_RATE}]"
+        echo -e "  ${DIM}[2]${NC} iOS Burst   [${NFT_IOS_BURST}]"
+        echo -e "  ${DIM}[3]${NC} Other Rate  [${NFT_OTHER_RATE}]"
+        echo -e "  ${DIM}[4]${NC} Other Burst [${NFT_OTHER_BURST}]"
+        echo -e "  ${DIM}[5]${NC} Переключить на Classic режим"
+        echo -e "  ${DIM}[0]${NC} Назад"; echo ""
+        echo -en "  Выбор: "; local _choice; read -r _choice
+        case "$_choice" in
+            1) echo -en "  iOS Rate [${NFT_IOS_RATE}]: "; local _v; read -r _v
+               [ -n "$_v" ] && { NFT_IOS_RATE="$_v"; save_settings; log_success "iOS Rate: ${_v}"; prompt_apply_nft_rules; } ;;
+            2) echo -en "  iOS Burst [${NFT_IOS_BURST}]: "; local _v; read -r _v
+               [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_IOS_BURST="$_v"; save_settings; log_success "iOS Burst: ${_v}"; prompt_apply_nft_rules; } ;;
+            3) echo -en "  Other Rate [${NFT_OTHER_RATE}]: "; local _v; read -r _v
+               [ -n "$_v" ] && { NFT_OTHER_RATE="$_v"; save_settings; log_success "Other Rate: ${_v}"; prompt_apply_nft_rules; } ;;
+            4) echo -en "  Other Burst [${NFT_OTHER_BURST}]: "; local _v; read -r _v
+               [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_OTHER_BURST="$_v"; save_settings; log_success "Other Burst: ${_v}"; prompt_apply_nft_rules; } ;;
+            5) NFT_MODE="classic"; save_settings; log_success "Переключено на Classic"
+               prompt_apply_nft_rules ;;
+            0|"") return ;;
+        esac
+        echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
+    done
 }
 
 generate_bridge_watch_script() {
@@ -1085,15 +1243,17 @@ while true; do
     sleep "\$INTERVAL"
 done
 EOF
-
     chmod +x "$WATCHER_SCRIPT"
     log_success "Watcher-скрипт создан: ${WATCHER_SCRIPT}"
 }
 
 apply_nft_rules() {
     generate_nft_script
-    if /bin/sh "$NFT_SCRIPT"; then log_success "NFT правила применены"
-    else log_error "Не удалось применить NFT правила"; return 1; fi
+    if /bin/sh "$NFT_SCRIPT"; then
+        log_success "NFT правила применены (режим: ${NFT_MODE:-classic})"
+    else
+        log_error "Не удалось применить NFT правила"; return 1
+    fi
 }
 
 remove_nft_rules() {
@@ -1109,18 +1269,12 @@ prompt_apply_nft_rules() {
         log_warn "Порт не задан — NFT-правила сейчас применить нельзя"
         return 0
     fi
-
     echo ""
     echo -en "  ${BOLD}Применить новые NFT-правила сейчас? [Y/n]:${NC} "
-    local _yn
-    read -r _yn
-
-    # По умолчанию = Да
+    local _yn; read -r _yn
     if [[ ! "$_yn" =~ ^[nN]$ ]]; then
         apply_nft_rules || true
-        if [ "${NFT_SERVICE_ENABLED:-false}" = "true" ]; then
-            install_service
-        fi
+        [ "${NFT_SERVICE_ENABLED:-false}" = "true" ] && install_service
     fi
 }
 
@@ -1128,7 +1282,6 @@ prompt_apply_nft_rules() {
 install_service() {
     generate_nft_script
 
-    # Сначала убираем старые службы, чтобы не было конфликта
     systemctl disable --now "$SYSTEMD_UNIT" 2>/dev/null || true
     systemctl disable --now "$WATCHER_UNIT" 2>/dev/null || true
     rm -f "/etc/systemd/system/${SYSTEMD_UNIT}"
@@ -1153,7 +1306,6 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-
         systemctl daemon-reload
         systemctl enable "$WATCHER_UNIT" 2>/dev/null
         systemctl restart "$WATCHER_UNIT" 2>/dev/null
@@ -1177,7 +1329,6 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-
         systemctl daemon-reload
         systemctl enable "$SYSTEMD_UNIT" 2>/dev/null
         systemctl restart "$SYSTEMD_UNIT" 2>/dev/null
@@ -1191,11 +1342,9 @@ EOF
 remove_service() {
     systemctl disable --now "$SYSTEMD_UNIT" 2>/dev/null || true
     systemctl disable --now "$WATCHER_UNIT" 2>/dev/null || true
-
     rm -f "/etc/systemd/system/${SYSTEMD_UNIT}"
     rm -f "/etc/systemd/system/${WATCHER_UNIT}"
     rm -f "$WATCHER_SCRIPT"
-
     systemctl daemon-reload 2>/dev/null || true
     NFT_SERVICE_ENABLED="false"
     save_settings
@@ -1206,12 +1355,24 @@ remove_service() {
 apply_preset() {
     local _preset="$1"
     case "$_preset" in
-        hard)   NFT_RATE="1/second"; NFT_BURST="1" ;;
-        medium) NFT_RATE="1/second"; NFT_BURST="3" ;;
-        soft)   NFT_RATE="2/second"; NFT_BURST="5" ;;
-        *)      log_error "Неизвестный пресет: $_preset"; return 1 ;;
+        hard)   NFT_MODE="classic"; NFT_RATE="1/second"; NFT_BURST="1" ;;
+        medium) NFT_MODE="classic"; NFT_RATE="1/second"; NFT_BURST="3" ;;
+        soft)   NFT_MODE="classic"; NFT_RATE="2/second"; NFT_BURST="5" ;;
+        smart)
+            NFT_MODE="smart"
+            NFT_IOS_RATE="15/second"
+            NFT_IOS_BURST="30"
+            NFT_OTHER_RATE="54/minute"
+            NFT_OTHER_BURST="1"
+            ;;
+        *) log_error "Неизвестный пресет: $_preset"; return 1 ;;
     esac
-    save_settings; log_success "Пресет применён: $_preset (rate=$NFT_RATE burst=$NFT_BURST)"
+    save_settings
+    if [ "$_preset" = "smart" ]; then
+        log_success "Пресет: Smart By-MEKO"
+    else
+        log_success "Пресет применён: $_preset (rate=$NFT_RATE burst=$NFT_BURST)"
+    fi
 }
 
 # ── Счётчик дропов ────────────────────────────────────────────
@@ -1220,13 +1381,19 @@ show_drop_counter() {
     local _hook="${NFT_HOOK:-input}"
     if ! nft list table inet "$_table" &>/dev/null; then
         log_warn "Активных NFT правил не найдено"; return 1; fi
-    echo ""; echo -e "  ${BOLD}Счётчик дропов (Ctrl+C для выхода):${NC}"; echo ""
+    echo ""
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo -e "  ${BOLD}Счётчик правил Smart By-MEKO (Ctrl+C для выхода):${NC}"
+    else
+        echo -e "  ${BOLD}Счётчик дропов Classic (Ctrl+C для выхода):${NC}"
+    fi
+    echo ""
     watch -n 2 "nft list chain inet $_table $_hook 2>/dev/null | grep -E 'counter|comment'"
 }
 
 # ── Полное удаление ───────────────────────────────────────────
 full_uninstall() {
-    echo "" 
+    echo ""
     echo -e "  ${RED}${BOLD}УДАЛЕНИЕ MTproxy-reanimation${NC}"
     echo ""
     echo -e "  Будет удалено:"
@@ -1245,28 +1412,30 @@ full_uninstall() {
     echo -en "  ${BOLD}Введите 'yes' для подтверждения:${NC} "
     local _confirm; read -r _confirm
     [ "$_confirm" != "yes" ] && { log_info "Отменено"; return; }
+
     if [ -f "$IOS_SYSCTL_FILE" ]; then
         rm -f "$IOS_SYSCTL_FILE"
-
         local _restore_time="${IOS_ORIG_TIME:-7200}"
         local _restore_intvl="${IOS_ORIG_INTVL:-75}"
         local _restore_probes="${IOS_ORIG_PROBES:-9}"
-
         sysctl -w "net.ipv4.tcp_keepalive_time=${_restore_time}" &>/dev/null || true
         sysctl -w "net.ipv4.tcp_keepalive_intvl=${_restore_intvl}" &>/dev/null || true
         sysctl -w "net.ipv4.tcp_keepalive_probes=${_restore_probes}" &>/dev/null || true
         sysctl --system &>/dev/null || true
-        log_success "iOS фикс откачен (восстановлены значения: time=${_restore_time} intvl=${_restore_intvl} probes=${_restore_probes})"
+        log_success "iOS фикс откачен (time=${_restore_time} intvl=${_restore_intvl} probes=${_restore_probes})"
     fi
+
     remove_nft_rules 2>/dev/null || true
     remove_service 2>/dev/null || true
-    rm -f "$NFT_SCRIPT"; rm -f /usr/local/bin/mtpr; rm -rf "$INSTALL_DIR"
+    rm -f "$NFT_SCRIPT"
+    rm -f /usr/local/bin/mtpr
+    rm -rf "$INSTALL_DIR"
     echo ""; log_success "MTproxy-reanimation полностью удалён"
+
     if [ "$DETECTED_MODE" = "mtproxymax" ]; then
         echo ""
-        echo -en "  ${BOLD}Откатить тюнинг MTProxyMax к значениям до реаниматора? [y/N]:${NC} "
-        local _revert_mpx
-        read -r _revert_mpx
+        echo -en "  ${BOLD}Откатить тюнинг MTProxyMax? [y/N]:${NC} "
+        local _revert_mpx; read -r _revert_mpx
         if [[ "$_revert_mpx" =~ ^[yY]$ ]]; then
             mtproxymax tune clear tg_connect &>/dev/null || true
             mtproxymax tune clear client_handshake &>/dev/null || true
@@ -1275,18 +1444,15 @@ full_uninstall() {
             log_success "Тюнинг MTProxyMax откачен"
         else
             echo ""
-            echo -e "  ${DIM}Для ручного отката тюнинга:${NC}"
+            echo -e "  ${DIM}Для ручного отката:${NC}"
             echo -e "  ${CYAN}mtproxymax tune clear tg_connect${NC}"
             echo -e "  ${CYAN}mtproxymax tune clear client_handshake${NC}"
             echo -e "  ${CYAN}mtproxymax tune clear client_keepalive${NC}"
             echo -e "  ${CYAN}mtproxymax restart${NC}"
         fi
-
     elif [ -n "$DETECTED_CONFIG_PATH" ]; then
-        # Ищем бэкап
         local _backup_file=""
         _backup_file=$(ls -1t "${DETECTED_CONFIG_PATH}".mtpr-backup-* 2>/dev/null | head -1)
-
         if [ -n "$_backup_file" ] && [ -f "$_backup_file" ]; then
             echo ""
             echo -e "  ${BOLD}Найден бэкап конфигурации:${NC}"
@@ -1296,19 +1462,19 @@ full_uninstall() {
             echo -e "  ${YELLOW}реаниматора, будут потеряны.${NC}"
             echo ""
             echo -en "  ${BOLD}Восстановить конфигурацию из бэкапа? [y/N]:${NC} "
-            local _restore
-            read -r _restore
-
+            local _restore; read -r _restore
             if [[ "$_restore" =~ ^[yY]$ ]]; then
                 cp "$_backup_file" "$DETECTED_CONFIG_PATH"
                 log_success "Конфигурация восстановлена из бэкапа"
-
-                # Перезапуск telemt
                 if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
-                    docker restart "$DETECTED_CONTAINER" &>/dev/null && log_success "Контейнер ${DETECTED_CONTAINER} перезапущен" || log_warn "Не удалось перезапустить контейнер"
+                    docker restart "$DETECTED_CONTAINER" &>/dev/null && \
+                        log_success "Контейнер ${DETECTED_CONTAINER} перезапущен" || \
+                        log_warn "Не удалось перезапустить контейнер"
                 elif [ "$DETECTED_MODE" = "local" ]; then
                     if systemctl is-active telemt.service &>/dev/null 2>&1; then
-                        systemctl restart telemt.service &>/dev/null && log_success "Служба telemt перезапущена" || log_warn "Не удалось перезапустить telemt"
+                        systemctl restart telemt.service &>/dev/null && \
+                            log_success "Служба telemt перезапущена" || \
+                            log_warn "Не удалось перезапустить telemt"
                     else
                         pkill -HUP telemt 2>/dev/null || log_warn "Не удалось отправить сигнал telemt"
                     fi
@@ -1337,11 +1503,18 @@ show_header() {
     echo ""; echo -e "  ${CYAN}${BOLD}MTproxy-reanimation${NC} ${DIM}v${VERSION}${NC} ${DIM}by LiafanX${NC}"
     echo -e "  ${DIM}Telemt inbound SYN limiter + тюнинг${NC}"
     echo -e "  ${DIM}────────────────────────────────────────${NC}"; echo ""
+
     local _nft_status="${RED}неактивно${NC}"
-    if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then _nft_status="${GREEN}активно${NC}"; fi
+    if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then
+        if [ "${NFT_MODE:-classic}" = "smart" ]; then
+            _nft_status="${GREEN}Smart By-MEKO${NC} (iOS: ${NFT_IOS_RATE}/${NFT_IOS_BURST} Other: ${NFT_OTHER_RATE}/${NFT_OTHER_BURST})"
+        else
+            _nft_status="${GREEN}Classic${NC} (${NFT_RATE} burst ${NFT_BURST})"
+        fi
+    fi
+
     local _svc_status="${DIM}не установлена${NC}"
-    local _active_unit
-    _active_unit=$(service_unit_name)
+    local _active_unit; _active_unit=$(service_unit_name)
     if systemctl is-enabled "$_active_unit" &>/dev/null 2>&1; then
         if systemctl is-active "$_active_unit" &>/dev/null 2>&1; then
             _svc_status="${GREEN}вкл + работает${NC}"
@@ -1349,12 +1522,17 @@ show_header() {
             _svc_status="${YELLOW}вкл + остановлена${NC}"
         fi
     fi
+
     local _tuning_status="${DIM}не применён${NC}"
     case "$TUNING_APPLIED" in
-        true) _tuning_status="${GREEN}применён${NC}" ;; manual) _tuning_status="${YELLOW}вручную${NC}" ;;
-        partial) _tuning_status="${YELLOW}частично${NC}" ;; esac
-    local _ios_status; _ios_status=$(ios_fix_status)
+        true)    _tuning_status="${GREEN}применён${NC}" ;;
+        manual)  _tuning_status="${YELLOW}вручную${NC}" ;;
+        partial) _tuning_status="${YELLOW}частично${NC}" ;;
+    esac
+
+    local _ios_status;  _ios_status=$(ios_fix_status)
     local _ios2_status; _ios2_status=$(ios2_fix_status)
+
     echo -e "  ${BOLD}Обнаружение:${NC}   ${DETECTED_MODE:-не найден}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         echo -e "  ${BOLD}Сеть:${NC}          bridge → hook ${NFT_HOOK} (${DOCKER_BRIDGE_MODE})"
@@ -1363,11 +1541,12 @@ show_header() {
     fi
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
     echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
+    echo -e "  ${BOLD}NFT режим:${NC}     ${NFT_MODE:-classic}"
     echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"; echo ""
+
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
-            local _cip
-            _cip=$(docker_container_ip)
+            local _cip; _cip=$(docker_container_ip)
             echo -e "  ${BOLD}IP режим:${NC}      ${GREEN}авто по IP контейнера${NC}"
             echo -e "  ${BOLD}IP Контейнера:${NC}  ${_cip:-${DIM}не найден${NC}}"
         else
@@ -1378,8 +1557,13 @@ show_header() {
     fi
 
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
-    echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
-    echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo -e "  ${BOLD}iOS Rate:${NC}      ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
+        echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
+    else
+        echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
+        echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
+    fi
     echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
     echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
@@ -1389,34 +1573,50 @@ show_header() {
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
         local _i; for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
             echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?} ip=${EXTRA_RULES_IP[$_i]:-любой} rate=${EXTRA_RULES_RATE[$_i]:-?} burst=${EXTRA_RULES_BURST[$_i]:-?}"
-        done; fi
+        done
+    fi
     echo ""; echo -e "  ${DIM}────────────────────────────────────────${NC}"
 }
 
 show_main_menu() {
     while true; do
         show_header
+        echo -e "  ${GREEN}[s]${NC}  ${BOLD}★ Smart By-MEKO${NC} ${DIM}(iOS/Android авторазделение + REJECT)${NC}"
+        echo ""
         echo -e "  ${CYAN}[1]${NC}  Применить NFT правила"
         echo -e "  ${CYAN}[2]${NC}  Применить тюнинг Telemt"
         echo -e "  ${CYAN}[3]${NC}  Настройки"
-        echo -e "  ${CYAN}[4]${NC}  Пресеты (жёсткий / средний / мягкий)"
+        echo -e "  ${CYAN}[4]${NC}  Пресеты (жёсткий / средний / мягкий / smart)"
         echo -e "  ${CYAN}[5]${NC}  Счётчик дропов"
         echo -e "  ${CYAN}[6]${NC}  Управление службой"
         echo -e "  ${CYAN}[7]${NC}  Доп. правила (добавить порт)"
         echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
         echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
+        if [ "${NFT_MODE:-classic}" = "smart" ]; then
+            echo -e "  ${CYAN}[c]${NC}  Настройки Smart режима"
+        fi
         echo ""
         echo -e "  ${RED}[u]${NC}  Удалить"
         echo -e "  ${CYAN}[0]${NC}  Выход"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
-            1) if [ -z "$SERVER_PORT" ]; then log_error "Порт не задан — настройте в разделе Настройки"; read -rsn1; continue; fi
-               apply_nft_rules || true; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            s|S) enable_smart_mode; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            1)
+                if [ -z "$SERVER_PORT" ]; then
+                    log_error "Порт не задан — настройте в разделе Настройки"
+                    read -rsn1; continue
+                fi
+                apply_nft_rules || true
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             2) apply_tuning || true; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
-            3) show_settings_menu ;; 4) show_preset_menu ;; 5) show_drop_counter || true ;;
-            6) show_service_menu ;; 7) show_extra_rules_menu ;;
-            8) detect_telemt || true
+            3) show_settings_menu ;;
+            4) show_preset_menu ;;
+            5) show_drop_counter || true ;;
+            6) show_service_menu ;;
+            7) show_extra_rules_menu ;;
+            8)
+                detect_telemt || true
                 [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
                 if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
                     NFT_HOOK="forward"
@@ -1424,10 +1624,16 @@ show_main_menu() {
                     [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
                     NFT_HOOK="input"
                 fi
-               save_settings; log_success "Обнаружено: режим=$DETECTED_MODE порт=${DETECTED_PORT:-?}"
-               echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
-            9) show_ios_fix_menu ;; a|A) show_ios2_fix_menu ;;
-            u|U) full_uninstall ;; 0|q|Q) exit 0 ;; esac; done
+                save_settings
+                log_success "Обнаружено: режим=$DETECTED_MODE порт=${DETECTED_PORT:-?}"
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            9) show_ios_fix_menu ;;
+            a|A) show_ios2_fix_menu ;;
+            c|C) [ "${NFT_MODE:-classic}" = "smart" ] && show_smart_settings_menu ;;
+            u|U) full_uninstall ;;
+            0|q|Q) exit 0 ;;
+        esac
+    done
 }
 
 show_settings_menu() {
@@ -1461,160 +1667,136 @@ show_settings_menu() {
                     continue
                 fi
                 echo ""
-                echo -e "  ${DIM}IP-привязка ограничивает правило только одним IPv4 сервера.${NC}"
-                echo -e "  ${DIM}Если IP пустой — правило будет применяться ко всем IP сервера${NC}"
-                echo -e "  ${DIM}на выбранном порту.${NC}"
-                echo ""
                 echo -e "  ${DIM}Enter  — оставить текущее значение${NC}"
                 echo -e "  ${DIM}none   — убрать привязку к IP${NC}"
                 echo -e "  ${DIM}auto   — автоопределить публичный IPv4${NC}"
                 echo -e "  ${DIM}или введите свой IPv4 вручную${NC}"
                 echo ""
-
                 while true; do
                     echo -en "  ${BOLD}IPv4 сервера [${SERVER_IP:-none}]:${NC} "
-                    local _val
-                    read -r _val
-
-                    if [ -z "$_val" ]; then
-                        break
-                    fi
-
+                    local _val; read -r _val
+                    [ -z "$_val" ] && break
                     case "$_val" in
                         none|NONE|clear|CLEAR|-)
-                            SERVER_IP=""
-                            save_settings
-                            log_success "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
-                            prompt_apply_nft_rules
-                            break
-                            ;;
+                            SERVER_IP=""; save_settings
+                            log_success "Привязка к IP отключена"
+                            prompt_apply_nft_rules; break ;;
                         auto|AUTO)
-                            local _detected_ip
                             log_info "Определение публичного IP..."
-                            _detected_ip=$(detect_public_ip)
+                            local _detected_ip; _detected_ip=$(detect_public_ip)
                             if [ -n "$_detected_ip" ] && validate_ip_literal "$_detected_ip"; then
-                                SERVER_IP="$_detected_ip"
-                                save_settings
+                                SERVER_IP="$_detected_ip"; save_settings
                                 log_success "IP определён: ${SERVER_IP}"
-                                prompt_apply_nft_rules
-                                break
+                                prompt_apply_nft_rules; break
                             else
                                 log_error "Не удалось определить корректный публичный IPv4"
-                            fi
-                            ;;
+                            fi ;;
                         *)
                             if validate_ip_literal "$_val"; then
-                                SERVER_IP="$_val"
-                                save_settings
+                                SERVER_IP="$_val"; save_settings
                                 log_success "IP установлен: ${SERVER_IP}"
-                                prompt_apply_nft_rules
-                                break
+                                prompt_apply_nft_rules; break
                             else
                                 log_error "Некорректный IPv4. Введите IPv4, Enter, none, clear, - или auto"
-                            fi
-                            ;;
+                            fi ;;
                     esac
-                done
-                ;;
+                done ;;
             2)
                 echo -en "  Новый порт [${SERVER_PORT:-}]: "
                 local _val; read -r _val
                 if [[ "$_val" =~ ^[0-9]+$ ]] && [ "$_val" -ge 1 ] && [ "$_val" -le 65535 ]; then
-                    SERVER_PORT="$_val"
-                    save_settings
-                    log_success "Порт установлен: ${SERVER_PORT}"
-                    prompt_apply_nft_rules
-                elif [ -n "$_val" ]; then
-                    log_error "Некорректный порт"
-                fi
-                ;;
+                    SERVER_PORT="$_val"; save_settings
+                    log_success "Порт установлен: ${SERVER_PORT}"; prompt_apply_nft_rules
+                elif [ -n "$_val" ]; then log_error "Некорректный порт"; fi ;;
             3)
                 echo -en "  Новый rate (напр. 1/second, 2/second): "
                 local _val; read -r _val
                 if [ -n "$_val" ]; then
-                    NFT_RATE="$_val"
-                    save_settings
-                    log_success "Rate установлен: ${NFT_RATE}"
-                    prompt_apply_nft_rules
-                fi
-                ;;
+                    NFT_RATE="$_val"; save_settings
+                    log_success "Rate установлен: ${NFT_RATE}"; prompt_apply_nft_rules
+                fi ;;
             4)
                 echo -en "  Новый burst: "
                 local _val; read -r _val
                 if [[ "$_val" =~ ^[0-9]+$ ]]; then
-                    NFT_BURST="$_val"
-                    save_settings
-                    log_success "Burst установлен: ${NFT_BURST}"
-                    prompt_apply_nft_rules
-                elif [ -n "$_val" ]; then
-                    log_error "Некорректный burst"
-                fi
-                ;;
+                    NFT_BURST="$_val"; save_settings
+                    log_success "Burst установлен: ${NFT_BURST}"; prompt_apply_nft_rules
+                elif [ -n "$_val" ]; then log_error "Некорректный burst"; fi ;;
             5)
                 echo -en "  Новый meter timeout (напр. 30s, 60s, 120s): "
                 local _val; read -r _val
                 if [ -n "$_val" ]; then
-                    NFT_METER_TIMEOUT="$_val"
-                    save_settings
-                    log_success "Meter timeout установлен: ${NFT_METER_TIMEOUT}"
-                    prompt_apply_nft_rules
-                fi
-                ;;
+                    NFT_METER_TIMEOUT="$_val"; save_settings
+                    log_success "Meter timeout установлен: ${NFT_METER_TIMEOUT}"; prompt_apply_nft_rules
+                fi ;;
             6) echo -en "  tg_connect [${TUNING_TG_CONNECT}]: "; local _val; read -r _val
-               [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_TG_CONNECT="$_val" && save_settings ;;
+               [[ "$_val" =~ ^[0-9]+$ ]] && { TUNING_TG_CONNECT="$_val"; save_settings; } ;;
             7) echo -en "  client_handshake [${TUNING_CLIENT_HANDSHAKE}]: "; local _val; read -r _val
-               [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_CLIENT_HANDSHAKE="$_val" && save_settings ;;
+               [[ "$_val" =~ ^[0-9]+$ ]] && { TUNING_CLIENT_HANDSHAKE="$_val"; save_settings; } ;;
             8) echo -en "  client_keepalive [${TUNING_CLIENT_KEEPALIVE}]: "; local _val; read -r _val
-               [[ "$_val" =~ ^[0-9]+$ ]] && TUNING_CLIENT_KEEPALIVE="$_val" && save_settings ;;
-            9) log_info "Определение публичного IP..."; local _detected_ip; _detected_ip=$(detect_public_ip)
-               if [ -n "$_detected_ip" ]; then SERVER_IP="$_detected_ip"; save_settings; log_success "IP определён: $_detected_ip"; prompt_apply_nft_rules
-               else log_error "Не удалось определить публичный IP"; fi
-               echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+               [[ "$_val" =~ ^[0-9]+$ ]] && { TUNING_CLIENT_KEEPALIVE="$_val"; save_settings; } ;;
+            9)
+                log_info "Определение публичного IP..."
+                local _detected_ip; _detected_ip=$(detect_public_ip)
+                if [ -n "$_detected_ip" ]; then
+                    SERVER_IP="$_detected_ip"; save_settings
+                    log_success "IP определён: $_detected_ip"; prompt_apply_nft_rules
+                else
+                    log_error "Не удалось определить публичный IP"
+                fi
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             b|B)
                 if [ "$DETECTED_NETWORK_MODE" != "bridge" ]; then
                     log_info "Режим Docker bridge недоступен"
                 else
-                    prompt_bridge_mode
-                    prompt_apply_nft_rules
-                fi
-                ;;
+                    prompt_bridge_mode; prompt_apply_nft_rules
+                fi ;;
             c|C)
-                SERVER_IP=""
-                save_settings
+                SERVER_IP=""; save_settings
                 log_success "IP очищен — правила будут применяться ко всем адресам"
                 prompt_apply_nft_rules
-                echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
-                ;;
-            0|"") return ;; esac; done
+                echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            0|"") return ;;
+        esac
+    done
 }
 
 show_preset_menu() {
-    show_header; echo -e "  ${BOLD}Пресеты скорости${NC}"; echo ""
-    echo -e "  ${RED}[1]${NC} Жёсткий  — 1/second burst 1   ${DIM}(макс. ограничение)${NC}"
-    echo -e "  ${YELLOW}[2]${NC} Средний  — 1/second burst 3   ${DIM}(баланс)${NC}"
-    echo -e "  ${GREEN}[3]${NC} Мягкий   — 2/second burst 5   ${DIM}(мин. ограничение)${NC}"
-    echo -e "  ${DIM}[4]${NC} Свой вариант"; echo -e "  ${DIM}[0]${NC} Назад"; echo ""
+    show_header; echo -e "  ${BOLD}Пресеты${NC}"; echo ""
+    echo -e "  ${GREEN}[s]${NC} ${BOLD}★ Smart By-MEKO${NC} ${DIM}(рекомендуется)${NC}"
+    echo -e "      ${DIM}iOS/Android авторазделение + REJECT. Подключение 3-8 сек.${NC}"; echo ""
+    echo -e "  ${RED}[1]${NC} Жёсткий (Classic)  — 1/second burst 1"
+    echo -e "  ${YELLOW}[2]${NC} Средний (Classic)  — 1/second burst 3"
+    echo -e "  ${GREEN}[3]${NC} Мягкий (Classic)   — 2/second burst 5"
+    echo -e "  ${DIM}[4]${NC} Свой вариант (Classic)"
+    echo -e "  ${DIM}[0]${NC} Назад"; echo ""
     echo -en "  Выбор: "; local _choice; read -r _choice
-    case "$_choice" in 1) apply_preset hard ;; 2) apply_preset medium ;; 3) apply_preset soft ;;
-        4) echo -en "  Rate (напр. 1/second): "; local _r; read -r _r
-           echo -en "  Burst: "; local _b; read -r _b
-           [ -n "$_r" ] && NFT_RATE="$_r"; [[ "$_b" =~ ^[0-9]+$ ]] && NFT_BURST="$_b"
-           save_settings; log_success "Свой вариант: rate=$NFT_RATE burst=$NFT_BURST" ;;
-        0|"") return ;; esac
+    case "$_choice" in
+        s|S) enable_smart_mode; return ;;
+        1) apply_preset hard ;;
+        2) apply_preset medium ;;
+        3) apply_preset soft ;;
+        4)
+            echo -en "  Rate (напр. 1/second): "; local _r; read -r _r
+            echo -en "  Burst: "; local _b; read -r _b
+            [ -n "$_r" ] && NFT_RATE="$_r"
+            [[ "$_b" =~ ^[0-9]+$ ]] && NFT_BURST="$_b"
+            NFT_MODE="classic"; save_settings
+            log_success "Свой вариант: rate=$NFT_RATE burst=$NFT_BURST" ;;
+        0|"") return ;;
+    esac
     echo ""; echo -en "  Применить NFT правила сейчас? [Y/n]: "; local _yn; read -r _yn
-    if [[ ! "$_yn" =~ ^[nN] ]]; then apply_nft_rules || true
-        [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service; fi
+    if [[ ! "$_yn" =~ ^[nN] ]]; then
+        apply_nft_rules || true
+        [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service
+    fi
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
 
 show_service_menu() {
     show_header
-    echo -e "  ${BOLD}Управление службой${NC}"
-    echo ""
-
-    local _unit
-    _unit=$(service_unit_name)
-
+    echo -e "  ${BOLD}Управление службой${NC}"; echo ""
+    local _unit; _unit=$(service_unit_name)
     local _status="${DIM}не установлена${NC}"
     if systemctl is-enabled "$_unit" &>/dev/null 2>&1; then
         if systemctl is-active "$_unit" &>/dev/null 2>&1; then
@@ -1623,70 +1805,97 @@ show_service_menu() {
             _status="${YELLOW}вкл + остановлена${NC}"
         fi
     fi
-
     echo -e "  Активная служба: ${_unit}"
     echo -e "  Статус: ${_status}"; echo ""
     echo -e "  ${DIM}[1]${NC} Установить и включить службу"
     echo -e "  ${DIM}[2]${NC} Удалить службу"
     echo -e "  ${DIM}[3]${NC} Перезапустить службу"
     echo -e "  ${DIM}[4]${NC} Остановить службу (правила сохранятся)"
-    echo -e "  ${DIM}[5]${NC} Логи службы"; echo -e "  ${DIM}[0]${NC} Назад"; echo ""
+    echo -e "  ${DIM}[5]${NC} Логи службы"
+    echo -e "  ${DIM}[0]${NC} Назад"; echo ""
     echo -en "  Выбор: "; local _choice; read -r _choice
     case "$_choice" in
-        1) if [ -z "$SERVER_PORT" ]; then log_error "Порт не задан — настройте в разделе Настройки"; else install_service; fi ;;
+        1)
+            if [ -z "$SERVER_PORT" ]; then
+                log_error "Порт не задан — настройте в разделе Настройки"
+            else
+                install_service
+            fi ;;
         2) remove_service ;;
         3) systemctl restart "$_unit" 2>/dev/null && log_success "Служба перезапущена" || log_error "Не удалось перезапустить" ;;
         4) systemctl stop "$_unit" 2>/dev/null && log_success "Служба остановлена" || log_error "Не удалось остановить" ;;
         5) echo ""; journalctl -u "$_unit" -n 20 --no-pager 2>/dev/null || log_warn "Логов нет" ;;
-        0|"") return ;; esac
+        0|"") return ;;
+    esac
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
 
 show_extra_rules_menu() {
     while true; do
         show_header; echo -e "  ${BOLD}Дополнительные правила${NC}"; echo ""
-        if [ "$EXTRA_RULES_COUNT" -eq 0 ]; then echo -e "  ${DIM}Нет дополнительных правил${NC}"
-        else local _i; for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
-            echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?}  ip=${EXTRA_RULES_IP[$_i]:-любой}  rate=${EXTRA_RULES_RATE[$_i]:-?}  burst=${EXTRA_RULES_BURST[$_i]:-?}"
-        done; fi; echo ""
-        echo -e "  ${DIM}[a]${NC} Добавить правило"; echo -e "  ${DIM}[d]${NC} Удалить правило"
-        echo -e "  ${DIM}[0]${NC} Назад"; echo ""; echo -en "  Выбор: "; local _choice; read -r _choice
+        if [ "$EXTRA_RULES_COUNT" -eq 0 ]; then
+            echo -e "  ${DIM}Нет дополнительных правил${NC}"
+        else
+            local _i
+            for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
+                echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?}  ip=${EXTRA_RULES_IP[$_i]:-любой}  rate=${EXTRA_RULES_RATE[$_i]:-?}  burst=${EXTRA_RULES_BURST[$_i]:-?}"
+            done
+        fi
+        echo ""
+        echo -e "  ${DIM}[a]${NC} Добавить правило"
+        echo -e "  ${DIM}[d]${NC} Удалить правило"
+        echo -e "  ${DIM}[0]${NC} Назад"; echo ""
+        echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
             a|A)
                 echo -en "  Порт: "; local _p; read -r _p
                 if ! [[ "$_p" =~ ^[0-9]+$ ]] || [ "$_p" -lt 1 ] || [ "$_p" -gt 65535 ]; then
-                    log_error "Некорректный порт"; echo ""; read -rsn1 -p "  Нажмите любую клавишу..."; continue; fi
+                    log_error "Некорректный порт"; echo ""; read -rsn1 -p "  Нажмите любую клавишу..."; continue
+                fi
                 echo -en "  IP (пусто = любой): "; local _eip; read -r _eip
                 echo -en "  Rate [1/second]: "; local _r; read -r _r; [ -z "$_r" ] && _r="1/second"
                 echo -en "  Burst [1]: "; local _b; read -r _b; [ -z "$_b" ] && _b="1"
-                EXTRA_RULES_COUNT=$((EXTRA_RULES_COUNT + 1)); local _idx=$EXTRA_RULES_COUNT
+                EXTRA_RULES_COUNT=$((EXTRA_RULES_COUNT + 1))
+                local _idx=$EXTRA_RULES_COUNT
                 EXTRA_RULES_PORT[$_idx]="$_p"; EXTRA_RULES_IP[$_idx]="$_eip"
                 EXTRA_RULES_RATE[$_idx]="$_r"; EXTRA_RULES_BURST[$_idx]="$_b"
                 save_settings; log_success "Доп. правило $_idx добавлено"
                 echo -en "  Применить правила сейчас? [Y/n]: "; local _yn; read -r _yn
-                if [[ ! "$_yn" =~ ^[nN] ]]; then apply_nft_rules || true
-                    [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service; fi
+                if [[ ! "$_yn" =~ ^[nN] ]]; then
+                    apply_nft_rules || true
+                    [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service
+                fi
                 echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             d|D)
                 [ "$EXTRA_RULES_COUNT" -eq 0 ] && { log_info "Нет правил для удаления"; echo ""; read -rsn1 -p "  Нажмите любую клавишу..."; continue; }
                 echo -en "  Номер правила для удаления: "; local _idx; read -r _idx
                 if [[ "$_idx" =~ ^[0-9]+$ ]] && [ "$_idx" -ge 1 ] && [ "$_idx" -le "$EXTRA_RULES_COUNT" ]; then
-                    local _i; for _i in $(seq "$_idx" $((EXTRA_RULES_COUNT - 1))); do
+                    local _i
+                    for _i in $(seq "$_idx" $((EXTRA_RULES_COUNT - 1))); do
                         local _next=$((_i + 1))
                         EXTRA_RULES_PORT[$_i]="${EXTRA_RULES_PORT[$_next]:-}"
                         EXTRA_RULES_IP[$_i]="${EXTRA_RULES_IP[$_next]:-}"
                         EXTRA_RULES_RATE[$_i]="${EXTRA_RULES_RATE[$_next]:-}"
                         EXTRA_RULES_BURST[$_i]="${EXTRA_RULES_BURST[$_next]:-}"
                     done
-                    unset "EXTRA_RULES_PORT[$EXTRA_RULES_COUNT]"; unset "EXTRA_RULES_IP[$EXTRA_RULES_COUNT]"
-                    unset "EXTRA_RULES_RATE[$EXTRA_RULES_COUNT]"; unset "EXTRA_RULES_BURST[$EXTRA_RULES_COUNT]"
-                    EXTRA_RULES_COUNT=$((EXTRA_RULES_COUNT - 1)); save_settings; log_success "Правило удалено"
+                    unset "EXTRA_RULES_PORT[$EXTRA_RULES_COUNT]"
+                    unset "EXTRA_RULES_IP[$EXTRA_RULES_COUNT]"
+                    unset "EXTRA_RULES_RATE[$EXTRA_RULES_COUNT]"
+                    unset "EXTRA_RULES_BURST[$EXTRA_RULES_COUNT]"
+                    EXTRA_RULES_COUNT=$((EXTRA_RULES_COUNT - 1))
+                    save_settings; log_success "Правило удалено"
                     echo -en "  Применить правила заново? [Y/n]: "; local _yn; read -r _yn
-                    if [[ ! "$_yn" =~ ^[nN] ]]; then apply_nft_rules || true
-                        [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service; fi
-                else log_error "Некорректный номер правила"; fi
+                    if [[ ! "$_yn" =~ ^[nN] ]]; then
+                        apply_nft_rules || true
+                        [ "$NFT_SERVICE_ENABLED" = "true" ] && install_service
+                    fi
+                else
+                    log_error "Некорректный номер правила"
+                fi
                 echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
-            0|"") return ;; esac; done
+            0|"") return ;;
+        esac
+    done
 }
 
 # ── Мастер первого запуска ────────────────────────────────────
@@ -1706,57 +1915,68 @@ first_run_wizard() {
             echo ""; echo -en "  ${DIM}Указать другой путь к конфигу? [N/путь]:${NC} "
             local _alt_cfg; read -r _alt_cfg
             if [ -n "$_alt_cfg" ] && [ "$_alt_cfg" != "n" ] && [ "$_alt_cfg" != "N" ]; then
-                if [ -f "$_alt_cfg" ]; then DETECTED_CONFIG_PATH="$_alt_cfg"; log_success "Конфиг: $_alt_cfg"
+                if [ -f "$_alt_cfg" ]; then
+                    DETECTED_CONFIG_PATH="$_alt_cfg"; log_success "Конфиг: $_alt_cfg"
                     local _p; _p=$(_toml_get_value "port" "$_alt_cfg"); [ -n "$_p" ] && DETECTED_PORT="$_p"
-                else log_error "Файл не найден: $_alt_cfg"; fi; fi; fi
+                else
+                    log_error "Файл не найден: $_alt_cfg"
+                fi
+            fi
+        fi
     else
         log_warn "Telemt не обнаружен автоматически"; echo ""
-        echo -en "  ${BOLD}Указать путь к конфигу Telemt вручную? [n(Enter, если ставите на входящей точке даб хоп)/путь]:${NC} "
+        echo -en "  ${BOLD}Указать путь к конфигу Telemt вручную? [n/путь]:${NC} "
         local _manual_cfg; read -r _manual_cfg
         if [ -n "$_manual_cfg" ] && [ "$_manual_cfg" != "n" ] && [ "$_manual_cfg" != "N" ]; then
-            if [ -f "$_manual_cfg" ]; then DETECTED_CONFIG_PATH="$_manual_cfg"; DETECTED_MODE="manual"; DETECTED_NETWORK_MODE="host"
-                log_success "Конфиг: $_manual_cfg"; local _p; _p=$(_toml_get_value "port" "$_manual_cfg"); [ -n "$_p" ] && DETECTED_PORT="$_p"
-            else log_error "Файл не найден: $_manual_cfg"; fi; fi; fi
+            if [ -f "$_manual_cfg" ]; then
+                DETECTED_CONFIG_PATH="$_manual_cfg"; DETECTED_MODE="manual"; DETECTED_NETWORK_MODE="host"
+                log_success "Конфиг: $_manual_cfg"
+                local _p; _p=$(_toml_get_value "port" "$_manual_cfg"); [ -n "$_p" ] && DETECTED_PORT="$_p"
+            else
+                log_error "Файл не найден: $_manual_cfg"
+            fi
+        fi
+    fi
 
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
-        NFT_HOOK="forward"
-        SERVER_IP=""
+        NFT_HOOK="forward"; SERVER_IP=""
     else
         NFT_HOOK="input"
     fi
+
     echo ""
     install_dependencies || exit 1
+
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         prompt_bridge_mode
     fi
-    #-----ПОРТ-----
+
+    # Порт
     echo ""; SERVER_PORT="${DETECTED_PORT:-443}"
     echo -en "  ${BOLD}Порт прокси [${SERVER_PORT}]:${NC} "
     local _port_input; read -r _port_input
-    if [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -ge 1 ] && [ "$_port_input" -le 65535 ]; then SERVER_PORT="$_port_input"; fi
-    #-----IP-----
+    if [[ "$_port_input" =~ ^[0-9]+$ ]] && [ "$_port_input" -ge 1 ] && [ "$_port_input" -le 65535 ]; then
+        SERVER_PORT="$_port_input"
+    fi
+
+    # IP
     echo ""
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         if [ "${DOCKER_BRIDGE_MODE:-simple}" = "simple" ]; then
             log_info "Docker bridge / простой режим: внешний IP не используется"
-            log_info "Правило будет применяться ко всему трафику на выбранный порт"
         else
-            local _cip
-            _cip=$(docker_container_ip)
+            local _cip; _cip=$(docker_container_ip)
             log_info "Docker bridge / точный режим: будет использоваться IP контейнера"
             [ -n "$_cip" ] && log_info "Текущий IP контейнера: ${_cip}"
         fi
         SERVER_IP=""
     else
         echo -e "  ${DIM}Можно привязать правило к конкретному IPv4-адресу сервера.${NC}"
-        echo -e "  ${DIM}Если IP указан — правило будет работать только для трафика${NC}"
-        echo -e "  ${DIM}на этот IP и выбранный порт.${NC}"
         echo -e "  ${DIM}Если IP не указывать — правило будет работать для всех${NC}"
         echo -e "  ${DIM}локальных IP сервера на выбранном порту.${NC}"
         echo ""
         echo -en "  ${BOLD}Указать IPv4 сервера? [Y/n]:${NC} "
-        local _use_ip
-        read -r _use_ip
+        local _use_ip; read -r _use_ip
 
         if [[ ! "$_use_ip" =~ ^[nN]$ ]]; then
             if [ -n "$DETECTED_IP" ]; then
@@ -1776,23 +1996,13 @@ first_run_wizard() {
 
             while true; do
                 echo -en "  ${BOLD}IPv4 сервера [${SERVER_IP:-none}]:${NC} "
-                local _ip_input
-                read -r _ip_input
-
-                if [ -z "$_ip_input" ]; then
-                    break
-                fi
-
+                local _ip_input; read -r _ip_input
+                [ -z "$_ip_input" ] && break
                 case "$_ip_input" in
-                    none|NONE|clear|CLEAR|-)
-                        SERVER_IP=""
-                        break
-                        ;;
+                    none|NONE|clear|CLEAR|-) SERVER_IP=""; break ;;
                 esac
-
                 if validate_ip_literal "$_ip_input"; then
-                    SERVER_IP="$_ip_input"
-                    break
+                    SERVER_IP="$_ip_input"; break
                 else
                     log_error "Некорректный IPv4. Введите IPv4, Enter, none, clear или -"
                 fi
@@ -1801,24 +2011,35 @@ first_run_wizard() {
             if [ -n "$SERVER_IP" ]; then
                 log_success "Будет использоваться IP: $SERVER_IP"
             else
-                log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
+                log_info "Привязка к IP отключена"
             fi
         else
             SERVER_IP=""
-            log_info "Привязка к IP отключена — правило будет работать для всех IP сервера на этом порту"
+            log_info "Привязка к IP отключена"
         fi
     fi
-    #-----Пресет-----
-    echo ""; echo -e "  ${BOLD}Пресет ограничения:${NC}"
-    echo -e "    ${RED}[1]${NC} Жёсткий  — 1/sec burst 1  ${DIM}(рекомендуется)${NC}"
+
+    # Пресет NFT
+    echo ""; echo -e "  ${BOLD}Режим NFT SYN Limiter:${NC}"; echo ""
+    echo -e "  ${GREEN}[s]${NC} ${BOLD}★ Smart By-MEKO${NC} ${DIM}(рекомендуется)${NC}"
+    echo -e "      ${DIM}iOS/Android авторазделение по TTL + REJECT. Подключение 3-8 сек.${NC}"
+    echo -e "      ${DIM}Один порт для всех клиентов.${NC}"; echo ""
+    echo -e "  ${DIM}Или Classic режим:${NC}"
+    echo -e "    ${RED}[1]${NC} Жёсткий  — 1/sec burst 1"
     echo -e "    ${YELLOW}[2]${NC} Средний  — 1/sec burst 3"
     echo -e "    ${GREEN}[3]${NC} Мягкий   — 2/sec burst 5"; echo ""
-    echo -en "  Выбор [1]: "; local _preset_input; read -r _preset_input
-    case "$_preset_input" in 2) apply_preset medium ;; 3) apply_preset soft ;; *) apply_preset hard ;; esac
+    echo -en "  Выбор [s]: "; local _preset_input; read -r _preset_input
+    case "$_preset_input" in
+        1) apply_preset hard ;;
+        2) apply_preset medium ;;
+        3) apply_preset soft ;;
+        *) apply_preset smart ;;
+    esac
     save_settings
+
+    # Тюнинг
     echo ""
-    echo -e "  ${BOLD}Тюнинг Telemt — будут применены следующие параметры:${NC}"
-    echo ""
+    echo -e "  ${BOLD}Тюнинг Telemt — будут применены следующие параметры:${NC}"; echo ""
     echo -e "  ${DIM}[general]${NC}"
     echo -e "    tg_connect       = ${BOLD}${TUNING_TG_CONNECT}${NC}  ${DIM}(таймаут подключения к Telegram DC)${NC}"
     echo ""
@@ -1829,29 +2050,42 @@ first_run_wizard() {
     echo -en "  ${BOLD}Применить тюнинг Telemt? [Y/n]:${NC} "
     local _yn_tuning; read -r _yn_tuning
     if [[ ! "$_yn_tuning" =~ ^[nN] ]]; then apply_tuning || true; fi
-    echo ""; echo -en "  ${BOLD}Применить фикс для iOS вариант 1 (TCP keepalive)? [y/N]:${NC} "
+
+    # iOS Fix v1
+    echo ""
+    echo -en "  ${BOLD}Применить фикс для iOS вариант 1 (TCP keepalive)? [y/N]:${NC} "
     local _yn_ios; read -r _yn_ios
     if [[ "$_yn_ios" =~ ^[yY]$ ]]; then
-        # Сохраняем оригинальные значения
         if [ -z "$IOS_ORIG_TIME" ]; then
             IOS_ORIG_TIME=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "7200")
             IOS_ORIG_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
             IOS_ORIG_PROBES=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "9")
         fi
-        cat > "$IOS_SYSCTL_FILE" << 'SYSEOF'
-# MTproxy-reanimation: фикс для iOS — TCP keepalive
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
-SYSEOF
-        sysctl --system &>/dev/null || true; IOS_FIX_APPLIED="true"; save_settings
-        log_success "Фикс для iOS применён"; fi
-    echo ""; echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
+        printf '# MTproxy-reanimation: фикс для iOS — TCP keepalive\nnet.ipv4.tcp_keepalive_time = 60\nnet.ipv4.tcp_keepalive_intvl = 15\nnet.ipv4.tcp_keepalive_probes = 3\n' \
+            > "$IOS_SYSCTL_FILE"
+        sysctl --system &>/dev/null || true
+        IOS_FIX_APPLIED="true"; save_settings
+        log_success "Фикс для iOS применён"
+    fi
+
+    # Подсказка про iOS Fix v2 при Classic режиме
+    if [ "${NFT_MODE:-classic}" = "classic" ]; then
+        echo ""
+        log_info "iOS Fix v2 (MSS + redirect) доступен в меню: [a] Фикс для iOS вариант 2"
+    fi
+
+    # NFT правила
+    echo ""
+    echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
     local _yn_nft; read -r _yn_nft
     if [[ ! "$_yn_nft" =~ ^[nN] ]]; then apply_nft_rules || true; fi
-    echo ""; echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
+
+    # Служба
+    echo ""
+    echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
     local _yn_svc; read -r _yn_svc
     if [[ ! "$_yn_svc" =~ ^[nN] ]]; then install_service || true; fi
+
     echo ""; log_success "Настройка завершена!"; echo ""
     echo -e "  ${DIM}Запускайте ${CYAN}mtpr${DIM} в любое время для управления${NC}"; echo ""
     read -rsn1 -p "  Нажмите любую клавишу для входа в меню..."
@@ -1860,12 +2094,9 @@ SYSEOF
 # ── Проверка обновлений ───────────────────────────────────────
 check_for_update() {
     local _remote_ver
-    _remote_ver=$(curl -fsS --max-time 5 "${GITHUB_RAW}/version" 2>/dev/null | tr -d '[:space:]')
+    _remote_ver=$(curl -fsS --max-time 5 "${GITHUB_RAW}/version" 2>/dev/null | tr -d '[:space:]') || true
     [ -z "$_remote_ver" ] && return 0
-
-    if [ "$_remote_ver" = "$VERSION" ]; then
-        return 0
-    fi
+    [ "$_remote_ver" = "$VERSION" ] && return 0
 
     echo ""
     echo -e "  ${YELLOW}${BOLD}Доступно обновление: v${VERSION} → v${_remote_ver}${NC}"
@@ -1894,18 +2125,26 @@ check_for_update() {
 
 # ── Главная точка входа ───────────────────────────────────────
 main() {
-    check_root; mkdir -p "$INSTALL_DIR"
+    check_root
+    mkdir -p "$INSTALL_DIR"
     local _self="${BASH_SOURCE[0]}"
-    if [ -f "$_self" ] && [ "$(realpath "$_self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
-        cp "$_self" "${INSTALL_DIR}/mtpr.sh"; chmod +x "${INSTALL_DIR}/mtpr.sh"; fi
+    if [ -f "$_self" ] && \
+       [ "$(realpath "$_self" 2>/dev/null)" != "$(realpath "${INSTALL_DIR}/mtpr.sh" 2>/dev/null)" ]; then
+        cp "$_self" "${INSTALL_DIR}/mtpr.sh"
+        chmod +x "${INSTALL_DIR}/mtpr.sh"
+    fi
     ln -sf "${INSTALL_DIR}/mtpr.sh" /usr/local/bin/mtpr 2>/dev/null || true
     load_settings
     detect_telemt || true
     [ -z "$SERVER_PORT" ] && [ -n "$DETECTED_PORT" ] && SERVER_PORT="$DETECTED_PORT"
-    [ -z "$SERVER_IP" ] && [ -n "$DETECTED_IP" ] && SERVER_IP="$DETECTED_IP"
-    check_for_update
+    [ -z "$SERVER_IP" ]   && [ -n "$DETECTED_IP" ]   && SERVER_IP="$DETECTED_IP"
+    check_for_update || true
     if [ ! -f "$SETTINGS_FILE" ]; then
-        if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then NFT_HOOK="forward"; else NFT_HOOK="input"; fi
+        if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
+            NFT_HOOK="forward"
+        else
+            NFT_HOOK="input"
+        fi
         first_run_wizard
     fi
     show_main_menu
