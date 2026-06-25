@@ -178,7 +178,10 @@ load_settings() {
         fi
     done < "$SETTINGS_FILE"
     [[ "$EXTRA_RULES_COUNT" =~ ^[0-9]+$ ]] || EXTRA_RULES_COUNT=0
-    [ "$NFT_MODE" != "classic" ] && [ "$NFT_MODE" != "smart" ] && NFT_MODE="classic"
+    case "$NFT_MODE" in
+        classic|smart) ;;
+        *) NFT_MODE="classic" ;;
+    esac
 }
 
 # ── Безопасное чтение значения из TOML ────────────────────────
