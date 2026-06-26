@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.10
+#  MTproxy-reanimation v1.0.11
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.10"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
+VERSION="1.0.11"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -45,6 +45,7 @@ NFT_IOS_RATE="15/second"
 NFT_IOS_BURST="30"
 NFT_OTHER_RATE="54/minute"
 NFT_OTHER_BURST="1"
+NFT_OTHER_ACTION="reject"
 
 TUNING_TG_CONNECT="30"
 TUNING_CLIENT_HANDSHAKE="90"
@@ -120,6 +121,7 @@ NFT_IOS_RATE='${NFT_IOS_RATE}'
 NFT_IOS_BURST='${NFT_IOS_BURST}'
 NFT_OTHER_RATE='${NFT_OTHER_RATE}'
 NFT_OTHER_BURST='${NFT_OTHER_BURST}'
+NFT_OTHER_ACTION='${NFT_OTHER_ACTION}'
 TUNING_TG_CONNECT='${TUNING_TG_CONNECT}'
 TUNING_CLIENT_HANDSHAKE='${TUNING_CLIENT_HANDSHAKE}'
 TUNING_CLIENT_KEEPALIVE='${TUNING_CLIENT_KEEPALIVE}'
@@ -174,7 +176,7 @@ load_settings() {
             case "$_key" in
                 SERVER_IP|SERVER_PORT|NFT_RATE|NFT_BURST|NFT_METER_TIMEOUT|\
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
-                NFT_MODE|NFT_IOS_RATE|NFT_IOS_BURST|NFT_OTHER_RATE|NFT_OTHER_BURST|\
+                NFT_MODE|NFT_IOS_RATE|NFT_IOS_BURST|NFT_OTHER_RATE|NFT_OTHER_BURST|NFT_OTHER_ACTION|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
                 IOS_FIX_APPLIED|IOS_KA_TIME|IOS_KA_INTVL|IOS_KA_PROBES|\
                 IOS_ORIG_TIME|IOS_ORIG_INTVL|IOS_ORIG_PROBES|\
@@ -1236,7 +1238,13 @@ NFTEOF
         local _eburst="${EXTRA_RULES_BURST[$_i]:-1}"
         [ -z "$_eport" ] && continue
         local _extra_action="drop"
-        [ "${NFT_MODE:-classic}" = "smart" ] && _extra_action="reject with tcp reset"
+        if [ "${NFT_MODE:-classic}" = "smart" ]; then
+            if [ "${NFT_OTHER_ACTION:-reject}" = "drop" ]; then
+                _extra_action="drop"
+            else
+                _extra_action="reject with tcp reset"
+            fi
+        fi
         if [ -n "$_eip" ]; then
             cat >> "$NFT_SCRIPT" << EXTRAIPEOF
 nft "add rule inet \$TABLE \$CHAIN ip daddr ${_eip} tcp dport ${_eport} tcp flags & (syn | ack) == syn meter telemt_in_syn_extra_${_i} { ip saddr timeout ${_timeout} limit rate over ${_erate} burst ${_eburst} packets } counter ${_extra_action} comment \\"mtpr_extra_${_i}\\""
@@ -1342,8 +1350,13 @@ SMART2EOF
 nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } accept comment \\"mtpr_smart_other_accept\\""
 SMART3EOF
 
+    local _other_action_cmd="reject with tcp reset"
+    if [ "${NFT_OTHER_ACTION:-reject}" = "drop" ]; then
+        _other_action_cmd="drop"
+    fi
+
     cat >> "$NFT_SCRIPT" << SMART4EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn counter reject with tcp reset comment \\"mtpr_smart_other_reject\\""
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn counter ${_other_action_cmd} comment \\"mtpr_smart_other_reject\\""
 SMART4EOF
 }
 
@@ -1410,16 +1423,18 @@ show_smart_settings_menu() {
         show_header
         echo -e "  ${BOLD}Настройки Smart By-MEKO${NC}"; echo ""
         echo -e "  ${BOLD}Текущие параметры:${NC}"
-        echo -e "    iOS Rate:    ${NFT_IOS_RATE}"
-        echo -e "    iOS Burst:   ${NFT_IOS_BURST}"
-        echo -e "    Other Rate:  ${NFT_OTHER_RATE}"
-        echo -e "    Other Burst: ${NFT_OTHER_BURST}"
-        echo -e "    Timeout:     ${NFT_METER_TIMEOUT}"; echo ""
+        echo -e "    iOS Rate:     ${NFT_IOS_RATE}"
+        echo -e "    iOS Burst:    ${NFT_IOS_BURST}"
+        echo -e "    Other Rate:   ${NFT_OTHER_RATE}"
+        echo -e "    Other Burst:  ${NFT_OTHER_BURST}"
+        echo -e "    Other Action: ${NFT_OTHER_ACTION:-reject} ${DIM}(drop - лучше для отправки медиа)${NC}"
+        echo -e "    Timeout:      ${NFT_METER_TIMEOUT}"; echo ""
         echo -e "  ${DIM}[1]${NC} iOS Rate    [${NFT_IOS_RATE}]"
         echo -e "  ${DIM}[2]${NC} iOS Burst   [${NFT_IOS_BURST}]"
         echo -e "  ${DIM}[3]${NC} Other Rate  [${NFT_OTHER_RATE}]"
         echo -e "  ${DIM}[4]${NC} Other Burst [${NFT_OTHER_BURST}]"
-        echo -e "  ${DIM}[5]${NC} Переключить на Classic режим"
+        echo -e "  ${DIM}[5]${NC} Переключить Other Action (reject <-> drop)"
+        echo -e "  ${DIM}[6]${NC} Переключить на Classic режим"
         echo -e "  ${DIM}[0]${NC} Назад"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
@@ -1431,7 +1446,16 @@ show_smart_settings_menu() {
                [ -n "$_v" ] && { NFT_OTHER_RATE="$_v"; save_settings; log_success "Other Rate: ${_v}"; prompt_apply_nft_rules; } ;;
             4) echo -en "  Other Burst [${NFT_OTHER_BURST}]: "; local _v; read -r _v
                [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_OTHER_BURST="$_v"; save_settings; log_success "Other Burst: ${_v}"; prompt_apply_nft_rules; } ;;
-            5) NFT_MODE="classic"; save_settings; log_success "Переключено на Classic"
+            5) 
+               if [ "${NFT_OTHER_ACTION:-reject}" = "reject" ]; then
+                   NFT_OTHER_ACTION="drop"
+               else
+                   NFT_OTHER_ACTION="reject"
+               fi
+               save_settings
+               log_success "Other Action изменено на: ${NFT_OTHER_ACTION}"
+               prompt_apply_nft_rules ;;
+            6) NFT_MODE="classic"; save_settings; log_success "Переключено на Classic"
                prompt_apply_nft_rules ;;
             0|"") return ;;
         esac
