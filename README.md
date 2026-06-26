@@ -347,7 +347,7 @@ systemctl restart telemt
 
 ## Поддержать автора
 
-Если хотите поддержать проект на пачку кириешек: [Cloudtips](https://pay.cloudtips.ru/p/ad2f7e4d)
+Если хотите поддержать проект, закинуть на пачку кириешек: [Cloudtips](https://pay.cloudtips.ru/p/ad2f7e4d)
 
 ---
 
