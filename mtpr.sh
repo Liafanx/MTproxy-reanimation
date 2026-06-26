@@ -1842,6 +1842,7 @@ show_main_menu() {
         echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
         echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
+        echo -e "  ${CYAN}[m]${NC}  Оптимизация системы By-MEKO"
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
             echo -e "  ${CYAN}[c]${NC}  Настройки Smart режима"
         fi
