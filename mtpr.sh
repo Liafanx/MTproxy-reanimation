@@ -68,6 +68,20 @@ BRIDGE_WATCH_INTERVAL="5"
 WATCHER_SCRIPT="/usr/local/sbin/mtpr-bridge-watch.sh"
 WATCHER_UNIT="mtpr-bridge-watch.service"
 
+# Оптимизация By-MEKO
+MEKO_OPT_FILE="/etc/sysctl.d/99-mtpr-meko-opt.conf"
+MEKO_OPT_APPLIED="false"
+MEKO_ORIG_KEEPALIVE_TIME=""
+MEKO_ORIG_KEEPALIVE_INTVL=""
+MEKO_ORIG_KEEPALIVE_PROBES=""
+MEKO_ORIG_SOMAXCONN=""
+MEKO_ORIG_TCP_MAX_SYN_BACKLOG=""
+MEKO_ORIG_NETDEV_MAX_BACKLOG=""
+MEKO_ORIG_TCP_FASTOPEN=""
+MEKO_ORIG_FILE_MAX=""
+MEKO_ORIG_DEFAULT_QDISC=""
+MEKO_ORIG_TCP_CONGESTION=""
+
 declare -A EXTRA_RULES_PORT
 declare -A EXTRA_RULES_IP
 declare -A EXTRA_RULES_RATE
@@ -123,6 +137,17 @@ IOS2_EXTERNAL_PORT='${IOS2_EXTERNAL_PORT}'
 IOS2_TARGET_PORT='${IOS2_TARGET_PORT}'
 IOS2_MSS='${IOS2_MSS}'
 IOS2_TABLE='${IOS2_TABLE}'
+MEKO_OPT_APPLIED='${MEKO_OPT_APPLIED}'
+MEKO_ORIG_KEEPALIVE_TIME='${MEKO_ORIG_KEEPALIVE_TIME}'
+MEKO_ORIG_KEEPALIVE_INTVL='${MEKO_ORIG_KEEPALIVE_INTVL}'
+MEKO_ORIG_KEEPALIVE_PROBES='${MEKO_ORIG_KEEPALIVE_PROBES}'
+MEKO_ORIG_SOMAXCONN='${MEKO_ORIG_SOMAXCONN}'
+MEKO_ORIG_TCP_MAX_SYN_BACKLOG='${MEKO_ORIG_TCP_MAX_SYN_BACKLOG}'
+MEKO_ORIG_NETDEV_MAX_BACKLOG='${MEKO_ORIG_NETDEV_MAX_BACKLOG}'
+MEKO_ORIG_TCP_FASTOPEN='${MEKO_ORIG_TCP_FASTOPEN}'
+MEKO_ORIG_FILE_MAX='${MEKO_ORIG_FILE_MAX}'
+MEKO_ORIG_DEFAULT_QDISC='${MEKO_ORIG_DEFAULT_QDISC}'
+MEKO_ORIG_TCP_CONGESTION='${MEKO_ORIG_TCP_CONGESTION}'
 DOCKER_BRIDGE_MODE='${DOCKER_BRIDGE_MODE}'
 BRIDGE_WATCH_INTERVAL='${BRIDGE_WATCH_INTERVAL}'
 EXTRA_RULES_COUNT='${EXTRA_RULES_COUNT}'
@@ -155,7 +180,12 @@ load_settings() {
                 IOS_ORIG_TIME|IOS_ORIG_INTVL|IOS_ORIG_PROBES|\
                 IOS2_FIX_APPLIED|IOS2_EXTERNAL_PORT|\
                 IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|\
-                DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT)
+                DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT|\
+                MEKO_OPT_APPLIED|\
+                MEKO_ORIG_KEEPALIVE_TIME|MEKO_ORIG_KEEPALIVE_INTVL|MEKO_ORIG_KEEPALIVE_PROBES|\
+                MEKO_ORIG_SOMAXCONN|MEKO_ORIG_TCP_MAX_SYN_BACKLOG|MEKO_ORIG_NETDEV_MAX_BACKLOG|\
+                MEKO_ORIG_TCP_FASTOPEN|MEKO_ORIG_FILE_MAX|\
+                MEKO_ORIG_DEFAULT_QDISC|MEKO_ORIG_TCP_CONGESTION)
                     printf -v "$_key" '%s' "$_val"
                     ;;
                 EXTRA_RULES_*_PORT)
@@ -960,6 +990,206 @@ show_ios2_fix_menu() {
     echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
 }
 
+# ── Оптимизация By-MEKO ───────────────────────────────────────
+meko_opt_status() {
+    if [ -f "$MEKO_OPT_FILE" ]; then
+        local _ka
+        _ka=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+        echo -e "${GREEN}применена${NC} (keepalive: ${_ka}s/$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)s×$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null))"
+    else
+        echo -e "${DIM}не применена${NC}"
+    fi
+}
+
+meko_opt_apply() {
+    echo ""
+    echo -e "  ${CYAN}${BOLD}Оптимизация системы By-MEKO${NC}"
+    echo ""
+    echo -e "  ${DIM}Применяет набор sysctl-параметров из проекта MTPROTO-FIX-By-MEKO:${NC}"
+    echo ""
+    echo -e "  ${BOLD}TCP keepalive${NC} — ускоряет обнаружение мёртвых сокетов:"
+    echo -e "    tcp_keepalive_time  = ${YELLOW}45${NC}   ${DIM}(было: $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null), дефолт: 7200)${NC}"
+    echo -e "    tcp_keepalive_intvl = ${YELLOW}15${NC}   ${DIM}(было: $(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null), дефолт: 75)${NC}"
+    echo -e "    tcp_keepalive_probes= ${YELLOW}3${NC}    ${DIM}(было: $(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null), дефолт: 9)${NC}"
+    echo ""
+    echo -e "  ${BOLD}Сетевые очереди:${NC}"
+    echo -e "    net.core.somaxconn              = ${YELLOW}65535${NC}  ${DIM}(было: $(sysctl -n net.core.somaxconn 2>/dev/null))${NC}"
+    echo -e "    net.ipv4.tcp_max_syn_backlog    = ${YELLOW}65535${NC}  ${DIM}(было: $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null))${NC}"
+    echo -e "    net.core.netdev_max_backlog     = ${YELLOW}65535${NC}  ${DIM}(было: $(sysctl -n net.core.netdev_max_backlog 2>/dev/null))${NC}"
+    echo ""
+    echo -e "  ${BOLD}Прочее:${NC}"
+    echo -e "    net.ipv4.tcp_fastopen           = ${YELLOW}3${NC}      ${DIM}(было: $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null))${NC}"
+    echo -e "    fs.file-max                     = ${YELLOW}2097152${NC} ${DIM}(было: $(sysctl -n fs.file-max 2>/dev/null))${NC}"
+    echo -e "    net.core.default_qdisc          = ${YELLOW}fq${NC}     ${DIM}(было: $(sysctl -n net.core.default_qdisc 2>/dev/null))${NC}"
+    echo -e "    net.ipv4.tcp_congestion_control = ${YELLOW}bbr${NC}    ${DIM}(было: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null))${NC}"
+    echo ""
+    echo -e "  ${DIM}Все текущие значения будут сохранены для последующего отката.${NC}"
+    echo ""
+
+    if [ -f "$MEKO_OPT_FILE" ]; then
+        echo -e "  ${YELLOW}Оптимизация уже применена. Применить заново?${NC}"
+        echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
+    else
+        echo -en "  ${BOLD}Применить оптимизацию? [Y/n]:${NC} "
+    fi
+    local _confirm; read -r _confirm
+    [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
+
+    # Сохраняем текущие значения (только если ещё не сохранены)
+    if [ -z "$MEKO_ORIG_KEEPALIVE_TIME" ]; then
+        MEKO_ORIG_KEEPALIVE_TIME=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "7200")
+        MEKO_ORIG_KEEPALIVE_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
+        MEKO_ORIG_KEEPALIVE_PROBES=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "9")
+        MEKO_ORIG_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "4096")
+        MEKO_ORIG_TCP_MAX_SYN_BACKLOG=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo "512")
+        MEKO_ORIG_NETDEV_MAX_BACKLOG=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "1000")
+        MEKO_ORIG_TCP_FASTOPEN=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "1")
+        MEKO_ORIG_FILE_MAX=$(sysctl -n fs.file-max 2>/dev/null || echo "65536")
+        MEKO_ORIG_DEFAULT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "pfifo_fast")
+        MEKO_ORIG_TCP_CONGESTION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "cubic")
+        log_info "Сохранены оригинальные значения для отката"
+    fi
+
+    # Записываем файл оптимизации
+    cat > "$MEKO_OPT_FILE" << 'SYSEOF'
+# MTproxy-reanimation: оптимизация By-MEKO
+# Источник: github.com/Mekotofeuka/MTPR-FIX-By-MEKO
+net.ipv4.tcp_keepalive_time = 45
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_fastopen = 3
+fs.file-max = 2097152
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+SYSEOF
+
+    # Применяем
+    if sysctl --system &>/dev/null; then
+        log_success "sysctl применён"
+    else
+        log_warn "sysctl --system вернул ошибку, применяем вручную"
+        sysctl -w net.ipv4.tcp_keepalive_time=45 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_keepalive_intvl=15 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_keepalive_probes=3 2>/dev/null || true
+        sysctl -w net.core.somaxconn=65535 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_max_syn_backlog=65535 2>/dev/null || true
+        sysctl -w net.core.netdev_max_backlog=65535 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+        sysctl -w fs.file-max=2097152 2>/dev/null || true
+        sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+        sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    fi
+
+    # Проверяем результат
+    echo ""
+    echo -e "  ${BOLD}Применённые значения:${NC}"
+    echo -e "    tcp_keepalive_time   = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)"
+    echo -e "    tcp_keepalive_intvl  = $(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)"
+    echo -e "    tcp_keepalive_probes = $(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)"
+    echo -e "    somaxconn            = $(sysctl -n net.core.somaxconn 2>/dev/null)"
+    echo -e "    congestion_control   = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+
+    MEKO_OPT_APPLIED="true"
+    save_settings
+    echo ""
+    log_success "Оптимизация By-MEKO применена"
+    echo -e "  ${DIM}Для отката: меню → [m] Оптимизация By-MEKO → Откатить${NC}"
+}
+
+meko_opt_remove() {
+    echo ""
+    if [ ! -f "$MEKO_OPT_FILE" ]; then
+        log_info "Оптимизация By-MEKO не установлена"
+        MEKO_OPT_APPLIED="false"
+        save_settings
+        return 0
+    fi
+
+    echo -e "  ${BOLD}Откат оптимизации By-MEKO${NC}"; echo ""
+    echo -e "  ${DIM}Будет удалён: ${MEKO_OPT_FILE}${NC}"
+    echo -e "  ${DIM}Значения будут восстановлены к тем, что были до применения:${NC}"
+    echo ""
+    echo -e "    tcp_keepalive_time   → ${MEKO_ORIG_KEEPALIVE_TIME:-7200}"
+    echo -e "    tcp_keepalive_intvl  → ${MEKO_ORIG_KEEPALIVE_INTVL:-75}"
+    echo -e "    tcp_keepalive_probes → ${MEKO_ORIG_KEEPALIVE_PROBES:-9}"
+    echo -e "    somaxconn            → ${MEKO_ORIG_SOMAXCONN:-4096}"
+    echo -e "    tcp_max_syn_backlog  → ${MEKO_ORIG_TCP_MAX_SYN_BACKLOG:-512}"
+    echo -e "    netdev_max_backlog   → ${MEKO_ORIG_NETDEV_MAX_BACKLOG:-1000}"
+    echo -e "    tcp_fastopen         → ${MEKO_ORIG_TCP_FASTOPEN:-1}"
+    echo -e "    file-max             → ${MEKO_ORIG_FILE_MAX:-65536}"
+    echo -e "    default_qdisc        → ${MEKO_ORIG_DEFAULT_QDISC:-pfifo_fast}"
+    echo -e "    congestion_control   → ${MEKO_ORIG_TCP_CONGESTION:-cubic}"
+    echo ""
+    echo -en "  ${BOLD}Продолжить? [Y/n]:${NC} "
+    local _confirm; read -r _confirm
+    [[ "$_confirm" =~ ^[nN] ]] && { log_info "Отменено"; return 0; }
+
+    rm -f "$MEKO_OPT_FILE"
+
+    # Восстанавливаем
+    sysctl -w "net.ipv4.tcp_keepalive_time=${MEKO_ORIG_KEEPALIVE_TIME:-7200}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_keepalive_intvl=${MEKO_ORIG_KEEPALIVE_INTVL:-75}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_keepalive_probes=${MEKO_ORIG_KEEPALIVE_PROBES:-9}" &>/dev/null || true
+    sysctl -w "net.core.somaxconn=${MEKO_ORIG_SOMAXCONN:-4096}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_max_syn_backlog=${MEKO_ORIG_TCP_MAX_SYN_BACKLOG:-512}" &>/dev/null || true
+    sysctl -w "net.core.netdev_max_backlog=${MEKO_ORIG_NETDEV_MAX_BACKLOG:-1000}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_fastopen=${MEKO_ORIG_TCP_FASTOPEN:-1}" &>/dev/null || true
+    sysctl -w "fs.file-max=${MEKO_ORIG_FILE_MAX:-65536}" &>/dev/null || true
+    sysctl -w "net.core.default_qdisc=${MEKO_ORIG_DEFAULT_QDISC:-pfifo_fast}" &>/dev/null || true
+    sysctl -w "net.ipv4.tcp_congestion_control=${MEKO_ORIG_TCP_CONGESTION:-cubic}" &>/dev/null || true
+    sysctl --system &>/dev/null || true
+
+    # Очищаем сохранённые оригиналы
+    MEKO_ORIG_KEEPALIVE_TIME=""
+    MEKO_ORIG_KEEPALIVE_INTVL=""
+    MEKO_ORIG_KEEPALIVE_PROBES=""
+    MEKO_ORIG_SOMAXCONN=""
+    MEKO_ORIG_TCP_MAX_SYN_BACKLOG=""
+    MEKO_ORIG_NETDEV_MAX_BACKLOG=""
+    MEKO_ORIG_TCP_FASTOPEN=""
+    MEKO_ORIG_FILE_MAX=""
+    MEKO_ORIG_DEFAULT_QDISC=""
+    MEKO_ORIG_TCP_CONGESTION=""
+
+    MEKO_OPT_APPLIED="false"
+    save_settings
+
+    echo ""
+    echo -e "  ${BOLD}Текущие значения после отката:${NC}"
+    echo -e "    tcp_keepalive_time   = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)"
+    echo -e "    tcp_keepalive_intvl  = $(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)"
+    echo -e "    congestion_control   = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo ""
+    log_success "Оптимизация By-MEKO откачена"
+}
+
+show_meko_opt_menu() {
+    show_header
+    echo -e "  ${BOLD}Оптимизация системы By-MEKO${NC}"; echo ""
+    echo -e "  Статус: $(meko_opt_status)"; echo ""
+
+    if [ -n "$MEKO_ORIG_KEEPALIVE_TIME" ]; then
+        echo -e "  ${DIM}Значения до применения оптимизации:${NC}"
+        echo -e "    keepalive: ${MEKO_ORIG_KEEPALIVE_TIME}s / ${MEKO_ORIG_KEEPALIVE_INTVL}s × ${MEKO_ORIG_KEEPALIVE_PROBES}"
+        echo -e "    congestion: ${MEKO_ORIG_TCP_CONGESTION:-cubic}  qdisc: ${MEKO_ORIG_DEFAULT_QDISC:-pfifo_fast}"
+        echo ""
+    fi
+
+    echo -e "  ${DIM}[1]${NC} Применить / обновить"
+    echo -e "  ${DIM}[2]${NC} Откатить"
+    echo -e "  ${DIM}[0]${NC} Назад"; echo ""
+    echo -en "  Выбор: "; local _choice; read -r _choice
+    case "$_choice" in
+        1) meko_opt_apply ;;
+        2) meko_opt_remove ;;
+        0|"") return ;;
+    esac
+    echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
+}
+
 # ── NFT правила ───────────────────────────────────────────────
 generate_nft_script() {
     local _ip="${SERVER_IP:-}"
@@ -1401,6 +1631,7 @@ full_uninstall() {
     echo -e "  ${DIM}- Systemd служба${NC}"
     echo -e "  ${DIM}- iOS фикс (sysctl keepalive)${NC}"
     echo -e "  ${DIM}- iOS фикс вариант 2 (MSS + redirect)${NC}"
+    echo -e "  ${DIM}- Оптимизация системы By-MEKO (sysctl)${NC}"
     echo -e "  ${DIM}- Все настройки и скрипты${NC}"
     echo -e "  ${DIM}- Симлинк /usr/local/bin/mtpr${NC}"
     echo ""
@@ -1424,6 +1655,23 @@ full_uninstall() {
         sysctl --system &>/dev/null || true
         log_success "iOS фикс откачен (time=${_restore_time} intvl=${_restore_intvl} probes=${_restore_probes})"
     fi
+
+    # Откат оптимизации By-MEKO
+    if [ -f "$MEKO_OPT_FILE" ]; then
+        rm -f "$MEKO_OPT_FILE"
+        sysctl -w "net.ipv4.tcp_keepalive_time=${MEKO_ORIG_KEEPALIVE_TIME:-7200}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_intvl=${MEKO_ORIG_KEEPALIVE_INTVL:-75}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_keepalive_probes=${MEKO_ORIG_KEEPALIVE_PROBES:-9}" &>/dev/null || true
+        sysctl -w "net.core.somaxconn=${MEKO_ORIG_SOMAXCONN:-4096}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_max_syn_backlog=${MEKO_ORIG_TCP_MAX_SYN_BACKLOG:-512}" &>/dev/null || true
+        sysctl -w "net.core.netdev_max_backlog=${MEKO_ORIG_NETDEV_MAX_BACKLOG:-1000}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_fastopen=${MEKO_ORIG_TCP_FASTOPEN:-1}" &>/dev/null || true
+        sysctl -w "fs.file-max=${MEKO_ORIG_FILE_MAX:-65536}" &>/dev/null || true
+        sysctl -w "net.core.default_qdisc=${MEKO_ORIG_DEFAULT_QDISC:-pfifo_fast}" &>/dev/null || true
+        sysctl -w "net.ipv4.tcp_congestion_control=${MEKO_ORIG_TCP_CONGESTION:-cubic}" &>/dev/null || true
+        sysctl --system &>/dev/null || true
+        log_success "Оптимизация By-MEKO откачена"
+    fi    
 
     remove_nft_rules 2>/dev/null || true
     remove_service 2>/dev/null || true
@@ -1569,6 +1817,7 @@ show_header() {
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
     echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
     echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
+    echo -e "  ${BOLD}MEKO оптимизация:${NC} $(meko_opt_status)"
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
         local _i; for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
@@ -1630,6 +1879,7 @@ show_main_menu() {
             9) show_ios_fix_menu ;;
             a|A) show_ios2_fix_menu ;;
             c|C) [ "${NFT_MODE:-classic}" = "smart" ] && show_smart_settings_menu ;;
+            m|M) show_meko_opt_menu ;;
             u|U) full_uninstall ;;
             0|q|Q) exit 0 ;;
         esac
@@ -2072,6 +2322,19 @@ first_run_wizard() {
     if [ "${NFT_MODE:-classic}" = "classic" ]; then
         echo ""
         log_info "iOS Fix v2 (MSS + redirect) доступен в меню: [a] Фикс для iOS вариант 2"
+    fi
+
+    # Оптимизация By-MEKO
+    echo ""
+    echo -e "  ${BOLD}Оптимизация системы By-MEKO${NC}"
+    echo -e "  ${DIM}Набор sysctl-параметров из проекта MTPROTO-FIX-By-MEKO.${NC}"
+    echo -e "  ${DIM}TCP keepalive 45s/15s×3, BBR, расширенные очереди.${NC}"
+    echo -e "  ${DIM}Текущие значения будут сохранены для отката.${NC}"
+    echo ""
+    echo -en "  ${BOLD}Применить оптимизацию By-MEKO? [y/N]:${NC} "
+    local _yn_meko; read -r _yn_meko
+    if [[ "$_yn_meko" =~ ^[yY]$ ]]; then
+        meko_opt_apply
     fi
 
     # NFT правила
