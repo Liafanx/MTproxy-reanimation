@@ -48,7 +48,7 @@ mtpr
 <summary><b>1.0.9 от 25.06.2026</b></summary>
 
 - Добавлен **NFT Smart By-MEKO** — новый рекомендуемый режим SYN limiter
-  - iOS и Android/Desktop разделяются автоматически по TTL — один порт для всех клиентов
+  - iOS и Android/Desktop разделяются автоматически по TTL+Length — один порт для всех клиентов
   - REJECT с tcp-reset вместо DROP — подключение за **3-8 сек** вместо 10-20
   - iOS Fix v2 и `client_mss` в конфиге не нужны при Smart режиме
   - Все параметры Smart настраиваемы через пункт `[c]` главного меню
@@ -190,7 +190,7 @@ tcp dport PORT tcp flags syn
 
 | | Classic | Smart By-MEKO |
 |---|---|---|
-| **iOS / остальные** | один общий лимит | раздельные лимиты по TTL |
+| **iOS / остальные** | один общий лимит | раздельные лимиты по TTL+Length |
 | **При превышении** | DROP → клиент ждёт 3-5 сек | REJECT → RST мгновенно |
 | **Время подключения** | 10-20 сек | **3-8 сек** |
 | **Порты** | один для всех или iOS Fix v2 | **один для всех** |
@@ -334,14 +334,14 @@ systemctl restart telemt
 - При использовании **Fix для iOS вариант 2** (Classic):
   - уберите `client_mss = ...` из конфига Telemt
   - не забудьте открыть iOS-порт в фаерволе
-- **Smart By-MEKO** в bridge/precise режиме работает без ip daddr контейнера — TTL-идентификации по клиентскому IP достаточно
+- **Smart By-MEKO** в bridge/precise режиме работает без ip daddr контейнера — TTL+Length-идентификации по клиентскому IP достаточно
 - При смене сетевых параметров лучше сразу пере-применять NFT-правила из меню
 
 ---
 
 ## Благодарности
 
-- **[MTPROTO-FIX-By-MEKO](https://github.com/Mekotofeuka/MTPR-FIX-By-MEKO)** — идея Smart режима: разделение iOS/Android по TTL и REJECT вместо DROP
+- **[MTPROTO-FIX-By-MEKO](https://github.com/Mekotofeuka/MTPR-FIX-By-MEKO)** — идея Smart режима: разделение iOS/Android по TTL+Length и REJECT вместо DROP
 
 ---
 
