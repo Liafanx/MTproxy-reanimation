@@ -44,7 +44,7 @@ mtpr
 </details>
 
 <details>
-<summary><b>1.0.10 — 26.06.2026</b></summary>
+<summary><b>1.0.10 от 26.06.2026</b></summary>
 
 ### Новое
 
