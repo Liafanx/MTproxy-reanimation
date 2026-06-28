@@ -1904,7 +1904,7 @@ show_main_menu() {
         echo -e "  ${CYAN}[2]${NC}  Применить тюнинг Telemt"
         echo -e "  ${CYAN}[3]${NC}  Настройки"
         echo -e "  ${CYAN}[4]${NC}  Пресеты (жёсткий / средний / мягкий / smart)"
-        echo -e "  ${CYAN}[5]${NC}  Счётчик дропов"
+        echo -e "  ${CYAN}[5]${NC}  Счётчик срабатывания правил (смотреть live) - выход ctrl+c"
         echo -e "  ${CYAN}[6]${NC}  Управление службой"
         echo -e "  ${CYAN}[7]${NC}  Доп. правила (добавить порт)"
         echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
