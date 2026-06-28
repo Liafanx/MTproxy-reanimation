@@ -45,7 +45,7 @@ NFT_IOS_RATE="15/second"
 NFT_IOS_BURST="30"
 NFT_OTHER_RATE="54/minute"
 NFT_OTHER_BURST="1"
-NFT_OTHER_ACTION="reject"
+NFT_OTHER_ACTION="icmp-host-unreachable"
 
 TUNING_TG_CONNECT="30"
 TUNING_CLIENT_HANDSHAKE="90"
@@ -214,6 +214,10 @@ load_settings() {
         classic|smart) ;;
         *) NFT_MODE="classic" ;;
     esac
+    case "$NFT_OTHER_ACTION" in
+        reject|drop|icmp-host-unreachable) ;;
+        *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
+    esac    
 }
 
 # ── Безопасное чтение значения из TOML ────────────────────────
@@ -1239,11 +1243,14 @@ NFTEOF
         [ -z "$_eport" ] && continue
         local _extra_action="drop"
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
-            if [ "${NFT_OTHER_ACTION:-reject}" = "drop" ]; then
-                _extra_action="drop"
-            else
-                _extra_action="reject with tcp reset"
-            fi
+            case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
+                drop)
+                    _extra_action="drop" ;;
+                icmp-host-unreachable)
+                    _extra_action="reject with icmp type host-unreachable" ;;
+                *)
+                    _extra_action="reject with tcp reset" ;;
+            esac
         fi
         if [ -n "$_eip" ]; then
             cat >> "$NFT_SCRIPT" << EXTRAIPEOF
@@ -1350,10 +1357,15 @@ SMART2EOF
 nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } accept comment \\"mtpr_smart_other_accept\\""
 SMART3EOF
 
-    local _other_action_cmd="reject with tcp reset"
-    if [ "${NFT_OTHER_ACTION:-reject}" = "drop" ]; then
-        _other_action_cmd="drop"
-    fi
+    local _other_action_cmd
+    case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
+        drop)
+            _other_action_cmd="drop" ;;
+        icmp-host-unreachable)
+            _other_action_cmd="reject with icmp type host-unreachable" ;;
+        *)
+            _other_action_cmd="reject with tcp reset" ;;
+    esac
 
     cat >> "$NFT_SCRIPT" << SMART4EOF
 nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn counter ${_other_action_cmd} comment \\"mtpr_smart_other_reject\\""
@@ -1371,8 +1383,16 @@ enable_smart_mode() {
     echo -e "  ${DIM}  • iOS (TTL < 65, SYN 64 байта) — мягкий лимит ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}${NC}"
     echo -e "  ${DIM}  • Остальные — строгий лимит ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}${NC}"
     echo ""
-    echo -e "  ${DIM}  REJECT вместо DROP — клиент получает RST мгновенно${NC}"
-    echo -e "  ${DIM}  и переподключается за 3-8 сек вместо 10-20.${NC}"
+    local _action_desc
+    case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
+        icmp-host-unreachable)
+            _action_desc="ICMP host-unreachable — клиент мгновенно понимает что путь закрыт,\n             переключается на основное соединение, медиа без задержек." ;;
+        drop)
+            _action_desc="DROP — тихое уничтожение (может вызывать задержки медиа)." ;;
+        *)
+            _action_desc="REJECT (tcp reset) — быстрый reconnect, небольшая задержка медиа." ;;
+    esac
+    echo -e "  ${DIM}  Non-iOS action: ${_action_desc}${NC}"
     echo ""
     echo -e "  ${DIM}  Один порт для всех клиентов.${NC}"
     echo -e "  ${DIM}  iOS Fix v2 и client_mss в конфиге не нужны.${NC}"
@@ -1427,7 +1447,13 @@ show_smart_settings_menu() {
         echo -e "    iOS Burst:    ${NFT_IOS_BURST}"
         echo -e "    Other Rate:   ${NFT_OTHER_RATE}"
         echo -e "    Other Burst:  ${NFT_OTHER_BURST}"
-        echo -e "    Other Action: ${NFT_OTHER_ACTION:-reject} ${DIM}(drop - лучше для отправки медиа)${NC}"
+        local _action_display
+        case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
+            icmp-host-unreachable) _action_display="${GREEN}icmp-host-unreachable${NC} ${DIM}(рекомендуется, ускоряет медиа)${NC}" ;;
+            drop)                  _action_display="${YELLOW}drop${NC} ${DIM}(медиа может зависать)${NC}" ;;
+            *)                     _action_display="${DIM}reject (tcp reset стандарт)${NC}" ;;
+        esac
+        echo -e "    Other Action: ${_action_display}"
         echo -e "    Timeout:      ${NFT_METER_TIMEOUT}"; echo ""
         echo -e "  ${DIM}[1]${NC} iOS Rate    [${NFT_IOS_RATE}]"
         echo -e "  ${DIM}[2]${NC} iOS Burst   [${NFT_IOS_BURST}]"
@@ -1446,14 +1472,32 @@ show_smart_settings_menu() {
                [ -n "$_v" ] && { NFT_OTHER_RATE="$_v"; save_settings; log_success "Other Rate: ${_v}"; prompt_apply_nft_rules; } ;;
             4) echo -en "  Other Burst [${NFT_OTHER_BURST}]: "; local _v; read -r _v
                [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_OTHER_BURST="$_v"; save_settings; log_success "Other Burst: ${_v}"; prompt_apply_nft_rules; } ;;
-            5) 
-               if [ "${NFT_OTHER_ACTION:-reject}" = "reject" ]; then
-                   NFT_OTHER_ACTION="drop"
-               else
-                   NFT_OTHER_ACTION="reject"
-               fi
+            5)
+               echo ""
+               echo -e "  ${BOLD}Выбор действия для non-iOS устройств:${NC}"; echo ""
+               echo -e "  ${GREEN}[1]${NC} icmp-host-unreachable ${DIM}(рекомендуется)${NC}"
+               echo -e "      ${DIM}Сервер притворяется недоступным узлом.${NC}"
+               echo -e "      ${DIM}Telegram мгновенно понимает: «этот путь закрыт» —${NC}"
+               echo -e "      ${DIM}и сразу переключается на основное соединение.${NC}"
+               echo -e "      ${DIM}Медиа начинает отправляться без задержек.${NC}"
+               echo ""
+               echo -e "  ${CYAN}[2]${NC} reject (tcp reset) ${DIM}(оригинал By-MEKO)${NC}"
+               echo -e "      ${DIM}Жёсткий сброс TCP. Быстрый reconnect,${NC}"
+               echo -e "      ${DIM}но небольшая задержка при старте отправки медиа.${NC}"
+               echo ""
+               echo -e "  ${YELLOW}[3]${NC} drop ${DIM}(не рекомендуется)${NC}"
+               echo -e "      ${DIM}Тихое уничтожение пакета. Telegram ждёт таймаута —${NC}"
+               echo -e "      ${DIM}отправка медиа может полностью зависать.${NC}"
+               echo ""
+               echo -en "  ${BOLD}Выбор [1]: ${NC}"
+               local _ac; read -r _ac
+               case "${_ac:-1}" in
+                   2) NFT_OTHER_ACTION="reject" ;;
+                   3) NFT_OTHER_ACTION="drop" ;;
+                   *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
+               esac
                save_settings
-               log_success "Other Action изменено на: ${NFT_OTHER_ACTION}"
+               log_success "Other Action: ${NFT_OTHER_ACTION}"
                prompt_apply_nft_rules ;;
             6) NFT_MODE="classic"; save_settings; log_success "Переключено на Classic"
                prompt_apply_nft_rules ;;
@@ -2310,6 +2354,34 @@ first_run_wizard() {
         3) apply_preset soft ;;
         *) apply_preset smart ;;
     esac
+
+    # Выбор действия для non-iOS (только для Smart режима)
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo ""
+        echo -e "  ${BOLD}Действие для non-iOS устройств (Android / Desktop):${NC}"; echo ""
+        echo -e "  ${GREEN}[1]${NC} ${BOLD}icmp-host-unreachable${NC} ${DIM}(рекомендуется — по умолчанию)${NC}"
+        echo -e "      ${DIM}Сервер притворяется недоступным узлом сети.${NC}"
+        echo -e "      ${DIM}Telegram сразу понимает что параллельный путь закрыт${NC}"
+        echo -e "      ${DIM}и переключается на основное соединение без задержек.${NC}"
+        echo -e "      ${DIM}Результат: медиа начинает отправляться быстро.${NC}"
+        echo ""
+        echo -e "  ${CYAN}[2]${NC} reject (tcp reset)  ${DIM}(оригинал By-MEKO)${NC}"
+        echo -e "      ${DIM}Жёсткий TCP сброс. Быстрый reconnect,${NC}"
+        echo -e "      ${DIM}но небольшая задержка при старте отправки медиа.${NC}"
+        echo ""
+        echo -e "  ${YELLOW}[3]${NC} drop  ${DIM}(не рекомендуется)${NC}"
+        echo -e "      ${DIM}Telegram зависает в ожидании — отправка медиа может не работать.${NC}"
+        echo ""
+        echo -en "  ${BOLD}Выбор [1]:${NC} "
+        local _action_choice; read -r _action_choice
+        case "${_action_choice:-1}" in
+            2) NFT_OTHER_ACTION="reject" ;;
+            3) NFT_OTHER_ACTION="drop" ;;
+            *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
+        esac
+        log_success "Other Action: ${NFT_OTHER_ACTION}"
+    fi
+
     save_settings
 
     # Тюнинг
