@@ -1,6 +1,6 @@
 # MTproxy-reanimation
 
-**MTproxy-reanimation** — утилита для серверов с **Telemt / MTProxyMax**, которая стабилизирует первичное TCP-подключение клиентов с помощью **inbound SYN limiter через nftables** и применяет базовый безопасный тюнинг Telemt.
+**MTproxy-reanimation** — утилита для серверов с **Telemt / MTProxyMax / других ТГ прокси**, которая стабилизирует первичное TCP-подключение клиентов с помощью **inbound SYN limiter через nftables** и применяет базовый безопасный тюнинг Telemt.
 
 За основу взяты мануалы сообщества: [Ссылка №1](https://h1de0x.github.io/telemt-tune) · [Ссылка №2](https://assyoucandy.github.io/telemt-server-guide/) · [Ссылка №3](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [MTPROTO-FIX-By-MEKO](https://github.com/Mekotofeuka/MTPR-FIX-By-MEKO)
 
