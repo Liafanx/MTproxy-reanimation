@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.0.11
+#  MTproxy-reanimation v1.1.0
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.0.11"
+VERSION="1.1.0"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -45,6 +45,8 @@ NFT_IOS_RATE="15/second"
 NFT_IOS_BURST="30"
 NFT_OTHER_RATE="54/minute"
 NFT_OTHER_BURST="1"
+NFT_IOS_LIMIT_ENABLED="true"
+NFT_OTHER_LIMIT_ENABLED="true"
 NFT_OTHER_ACTION="icmp-host-unreachable"
 
 TUNING_TG_CONNECT="30"
@@ -121,6 +123,8 @@ NFT_IOS_RATE='${NFT_IOS_RATE}'
 NFT_IOS_BURST='${NFT_IOS_BURST}'
 NFT_OTHER_RATE='${NFT_OTHER_RATE}'
 NFT_OTHER_BURST='${NFT_OTHER_BURST}'
+NFT_IOS_LIMIT_ENABLED='${NFT_IOS_LIMIT_ENABLED}'
+NFT_OTHER_LIMIT_ENABLED='${NFT_OTHER_LIMIT_ENABLED}'
 NFT_OTHER_ACTION='${NFT_OTHER_ACTION}'
 TUNING_TG_CONNECT='${TUNING_TG_CONNECT}'
 TUNING_CLIENT_HANDSHAKE='${TUNING_CLIENT_HANDSHAKE}'
@@ -187,7 +191,7 @@ load_settings() {
                 MEKO_ORIG_KEEPALIVE_TIME|MEKO_ORIG_KEEPALIVE_INTVL|MEKO_ORIG_KEEPALIVE_PROBES|\
                 MEKO_ORIG_SOMAXCONN|MEKO_ORIG_TCP_MAX_SYN_BACKLOG|MEKO_ORIG_NETDEV_MAX_BACKLOG|\
                 MEKO_ORIG_TCP_FASTOPEN|MEKO_ORIG_FILE_MAX|\
-                MEKO_ORIG_DEFAULT_QDISC|MEKO_ORIG_TCP_CONGESTION)
+                MEKO_ORIG_DEFAULT_QDISC|MEKO_ORIG_TCP_CONGESTION|NFT_IOS_LIMIT_ENABLED|NFT_OTHER_LIMIT_ENABLED)
                     printf -v "$_key" '%s' "$_val"
                     ;;
                 EXTRA_RULES_*_PORT)
@@ -1337,26 +1341,36 @@ _generate_smart_rules() {
     local _ios_burst="${NFT_IOS_BURST:-30}"
     local _other_rate="${NFT_OTHER_RATE:-54/minute}"
     local _other_burst="${NFT_OTHER_BURST:-1}"
+    local _ios_limit="${NFT_IOS_LIMIT_ENABLED:-true}"
+    local _other_limit="${NFT_OTHER_LIMIT_ENABLED:-true}"
 
     local _ip_match=""
     [ -n "$_ip" ] && [ "$DETECTED_NETWORK_MODE" != "bridge" ] && _ip_match="ip daddr ${_ip} "
 
     if [ "$_bridge_precise" = "true" ]; then
-        log_warn "Smart режим в bridge/precise: ip daddr контейнера не используется (TTL-идентификация по клиентскому IP)"
+        log_warn "Smart режим в bridge/precise: ip daddr контейнера не используется (TCP fingerprint идентификация)"
     fi
 
-    cat >> "$NFT_SCRIPT" << SMART1EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ip ttl < 65 meta length 64 meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } accept comment \\"mtpr_smart_ios_accept\\""
+    # ── iOS fingerprint ──────────────────────────────────────
+    local _ios_fp="@th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000"
+
+    if [ "$_ios_limit" = "true" ]; then
+        # ── 1. iOS → meter лимит → ACCEPT
+        cat >> "$NFT_SCRIPT" << SMART1EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } accept comment \\"mtpr_smart_ios_accept\\""
 SMART1EOF
-
-    cat >> "$NFT_SCRIPT" << SMART2EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ip ttl < 65 meta length 64 counter reject with tcp reset comment \\"mtpr_smart_ios_reject\\""
+        # ── 2. iOS превысившие → reject tcp reset
+        cat >> "$NFT_SCRIPT" << SMART2EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} counter reject with tcp reset comment \\"mtpr_smart_ios_reject\\""
 SMART2EOF
+    else
+        # ── 1. iOS → безусловный ACCEPT (лимит отключён)
+        cat >> "$NFT_SCRIPT" << SMART1NOLIMEOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} counter accept comment \\"mtpr_smart_ios_accept\\""
+SMART1NOLIMEOF
+    fi
 
-    cat >> "$NFT_SCRIPT" << SMART3EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } accept comment \\"mtpr_smart_other_accept\\""
-SMART3EOF
-
+    # ── Other action cmd ────────────────────────────────────
     local _other_action_cmd
     case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
         drop)
@@ -1367,9 +1381,21 @@ SMART3EOF
             _other_action_cmd="reject with tcp reset" ;;
     esac
 
-    cat >> "$NFT_SCRIPT" << SMART4EOF
+    if [ "$_other_limit" = "true" ]; then
+        # ── 3. Other → meter лимит → ACCEPT
+        cat >> "$NFT_SCRIPT" << SMART3EOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } accept comment \\"mtpr_smart_other_accept\\""
+SMART3EOF
+        # ── 4. Other превысившие → настраиваемое действие
+        cat >> "$NFT_SCRIPT" << SMART4EOF
 nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn counter ${_other_action_cmd} comment \\"mtpr_smart_other_reject\\""
 SMART4EOF
+    else
+        # ── 3. Other → безусловный ACCEPT (лимит отключён)
+        cat >> "$NFT_SCRIPT" << SMART3NOLIMEOF
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn counter accept comment \\"mtpr_smart_other_accept\\""
+SMART3NOLIMEOF
+    fi
 }
 
 # ── Smart By-MEKO: включение ──────────────────────────────────
@@ -1443,64 +1469,170 @@ show_smart_settings_menu() {
         show_header
         echo -e "  ${BOLD}Настройки Smart By-MEKO${NC}"; echo ""
         echo -e "  ${BOLD}Текущие параметры:${NC}"
-        echo -e "    iOS Rate:     ${NFT_IOS_RATE}"
-        echo -e "    iOS Burst:    ${NFT_IOS_BURST}"
-        echo -e "    Other Rate:   ${NFT_OTHER_RATE}"
-        echo -e "    Other Burst:  ${NFT_OTHER_BURST}"
-        local _action_display
-        case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
-            icmp-host-unreachable) _action_display="${GREEN}icmp-host-unreachable${NC} ${DIM}(рекомендуется, ускоряет медиа)${NC}" ;;
-            drop)                  _action_display="${YELLOW}drop${NC} ${DIM}(медиа может зависать)${NC}" ;;
-            *)                     _action_display="${DIM}reject (tcp reset стандарт)${NC}" ;;
-        esac
-        echo -e "    Other Action: ${_action_display}"
+
+        # iOS статус
+        if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
+            echo -e "    iOS лимит:    ${GREEN}включён${NC} — ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
+        else
+            echo -e "    iOS лимит:    ${YELLOW}отключён${NC} ${DIM}(безусловный ACCEPT)${NC}"
+        fi
+
+        # Other статус
+        if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
+            local _action_display
+            case "${NFT_OTHER_ACTION:-icmp-host-unreachable}" in
+                icmp-host-unreachable) _action_display="${GREEN}icmp-host-unreachable${NC}" ;;
+                drop)                  _action_display="${YELLOW}drop${NC}" ;;
+                *)                     _action_display="${DIM}reject (tcp reset)${NC}" ;;
+            esac
+            echo -e "    Other лимит:  ${GREEN}включён${NC} — ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST} → ${_action_display}"
+        else
+            echo -e "    Other лимит:  ${YELLOW}отключён${NC} ${DIM}(безусловный ACCEPT)${NC}"
+        fi
+
         echo -e "    Timeout:      ${NFT_METER_TIMEOUT}"; echo ""
-        echo -e "  ${DIM}[1]${NC} iOS Rate    [${NFT_IOS_RATE}]"
-        echo -e "  ${DIM}[2]${NC} iOS Burst   [${NFT_IOS_BURST}]"
-        echo -e "  ${DIM}[3]${NC} Other Rate  [${NFT_OTHER_RATE}]"
-        echo -e "  ${DIM}[4]${NC} Other Burst [${NFT_OTHER_BURST}]"
-        echo -e "  ${DIM}[5]${NC} Переключить Other Action (reject <-> drop)"
-        echo -e "  ${DIM}[6]${NC} Переключить на Classic режим"
+
+        echo -e "  ${BOLD}iOS настройки:${NC}"
+        if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
+            echo -e "  ${DIM}[1]${NC} iOS Rate    [${NFT_IOS_RATE}]"
+            echo -e "  ${DIM}[2]${NC} iOS Burst   [${NFT_IOS_BURST}]"
+            echo -e "  ${DIM}[3]${NC} ${YELLOW}Отключить лимит для iOS${NC} ${DIM}(→ безусловный ACCEPT)${NC}"
+        else
+            echo -e "  ${DIM}[1]${NC} iOS Rate    ${DIM}[${NFT_IOS_RATE}] (лимит отключён)${NC}"
+            echo -e "  ${DIM}[2]${NC} iOS Burst   ${DIM}[${NFT_IOS_BURST}] (лимит отключён)${NC}"
+            echo -e "  ${DIM}[3]${NC} ${GREEN}Включить лимит для iOS${NC} ${DIM}(${NFT_IOS_RATE} burst ${NFT_IOS_BURST})${NC}"
+        fi
+
+        echo ""
+        echo -e "  ${BOLD}Other настройки (Android/Desktop):${NC}"
+        if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
+            echo -e "  ${DIM}[4]${NC} Other Rate  [${NFT_OTHER_RATE}]"
+            echo -e "  ${DIM}[5]${NC} Other Burst [${NFT_OTHER_BURST}]"
+            echo -e "  ${DIM}[6]${NC} Other Action"
+            echo -e "  ${DIM}[7]${NC} ${YELLOW}Отключить лимит для Other${NC} ${DIM}(→ безусловный ACCEPT)${NC}"
+        else
+            echo -e "  ${DIM}[4]${NC} Other Rate  ${DIM}[${NFT_OTHER_RATE}] (лимит отключён)${NC}"
+            echo -e "  ${DIM}[5]${NC} Other Burst ${DIM}[${NFT_OTHER_BURST}] (лимит отключён)${NC}"
+            echo -e "  ${DIM}[6]${NC} Other Action ${DIM}(лимит отключён — action не применяется)${NC}"
+            echo -e "  ${DIM}[7]${NC} ${GREEN}Включить лимит для Other${NC} ${DIM}(${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST})${NC}"
+        fi
+
+        echo ""
+        echo -e "  ${DIM}[8]${NC} Переключить на Classic режим"
         echo -e "  ${DIM}[0]${NC} Назад"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
-            1) echo -en "  iOS Rate [${NFT_IOS_RATE}]: "; local _v; read -r _v
-               [ -n "$_v" ] && { NFT_IOS_RATE="$_v"; save_settings; log_success "iOS Rate: ${_v}"; prompt_apply_nft_rules; } ;;
-            2) echo -en "  iOS Burst [${NFT_IOS_BURST}]: "; local _v; read -r _v
-               [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_IOS_BURST="$_v"; save_settings; log_success "iOS Burst: ${_v}"; prompt_apply_nft_rules; } ;;
-            3) echo -en "  Other Rate [${NFT_OTHER_RATE}]: "; local _v; read -r _v
-               [ -n "$_v" ] && { NFT_OTHER_RATE="$_v"; save_settings; log_success "Other Rate: ${_v}"; prompt_apply_nft_rules; } ;;
-            4) echo -en "  Other Burst [${NFT_OTHER_BURST}]: "; local _v; read -r _v
-               [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_OTHER_BURST="$_v"; save_settings; log_success "Other Burst: ${_v}"; prompt_apply_nft_rules; } ;;
+            1)
+                if [ "${NFT_IOS_LIMIT_ENABLED:-true}" != "true" ]; then
+                    log_warn "Лимит iOS отключён — сначала включите его [3]"
+                else
+                    echo -en "  iOS Rate [${NFT_IOS_RATE}]: "; local _v; read -r _v
+                    [ -n "$_v" ] && { NFT_IOS_RATE="$_v"; save_settings; log_success "iOS Rate: ${_v}"; prompt_apply_nft_rules; }
+                fi ;;
+            2)
+                if [ "${NFT_IOS_LIMIT_ENABLED:-true}" != "true" ]; then
+                    log_warn "Лимит iOS отключён — сначала включите его [3]"
+                else
+                    echo -en "  iOS Burst [${NFT_IOS_BURST}]: "; local _v; read -r _v
+                    [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_IOS_BURST="$_v"; save_settings; log_success "iOS Burst: ${_v}"; prompt_apply_nft_rules; }
+                fi ;;
+            3)
+                if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
+                    echo ""
+                    echo -e "  ${YELLOW}Отключение лимита для iOS:${NC}"
+                    echo -e "  ${DIM}Все iOS-устройства будут пропускаться без ограничений.${NC}"
+                    echo -e "  ${DIM}Правило: fingerprint совпал → ACCEPT (без meter).${NC}"
+                    echo ""
+                    echo -en "  ${BOLD}Отключить лимит iOS? [y/N]:${NC} "
+                    local _yn; read -r _yn
+                    if [[ "$_yn" =~ ^[yY]$ ]]; then
+                        NFT_IOS_LIMIT_ENABLED="false"
+                        save_settings
+                        log_success "Лимит iOS отключён"
+                        prompt_apply_nft_rules
+                    else
+                        log_info "Отменено"
+                    fi
+                else
+                    NFT_IOS_LIMIT_ENABLED="true"
+                    save_settings
+                    log_success "Лимит iOS включён (${NFT_IOS_RATE} burst ${NFT_IOS_BURST})"
+                    prompt_apply_nft_rules
+                fi ;;
+            4)
+                if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" != "true" ]; then
+                    log_warn "Лимит Other отключён — сначала включите его [7]"
+                else
+                    echo -en "  Other Rate [${NFT_OTHER_RATE}]: "; local _v; read -r _v
+                    [ -n "$_v" ] && { NFT_OTHER_RATE="$_v"; save_settings; log_success "Other Rate: ${_v}"; prompt_apply_nft_rules; }
+                fi ;;
             5)
-               echo ""
-               echo -e "  ${BOLD}Выбор действия для non-iOS устройств:${NC}"; echo ""
-               echo -e "  ${GREEN}[1]${NC} icmp-host-unreachable ${DIM}(рекомендуется)${NC}"
-               echo -e "      ${DIM}Сервер притворяется недоступным узлом.${NC}"
-               echo -e "      ${DIM}Telegram мгновенно понимает: «этот путь закрыт» —${NC}"
-               echo -e "      ${DIM}и сразу переключается на основное соединение.${NC}"
-               echo -e "      ${DIM}Медиа начинает отправляться без задержек.${NC}"
-               echo ""
-               echo -e "  ${CYAN}[2]${NC} reject (tcp reset) ${DIM}(оригинал By-MEKO)${NC}"
-               echo -e "      ${DIM}Жёсткий сброс TCP. Быстрый reconnect,${NC}"
-               echo -e "      ${DIM}но небольшая задержка при старте отправки медиа.${NC}"
-               echo ""
-               echo -e "  ${YELLOW}[3]${NC} drop ${DIM}(не рекомендуется)${NC}"
-               echo -e "      ${DIM}Тихое уничтожение пакета. Telegram ждёт таймаута —${NC}"
-               echo -e "      ${DIM}отправка медиа может полностью зависать.${NC}"
-               echo ""
-               echo -en "  ${BOLD}Выбор [1]: ${NC}"
-               local _ac; read -r _ac
-               case "${_ac:-1}" in
-                   2) NFT_OTHER_ACTION="reject" ;;
-                   3) NFT_OTHER_ACTION="drop" ;;
-                   *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
-               esac
-               save_settings
-               log_success "Other Action: ${NFT_OTHER_ACTION}"
-               prompt_apply_nft_rules ;;
-            6) NFT_MODE="classic"; save_settings; log_success "Переключено на Classic"
-               prompt_apply_nft_rules ;;
+                if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" != "true" ]; then
+                    log_warn "Лимит Other отключён — сначала включите его [7]"
+                else
+                    echo -en "  Other Burst [${NFT_OTHER_BURST}]: "; local _v; read -r _v
+                    [[ "$_v" =~ ^[0-9]+$ ]] && { NFT_OTHER_BURST="$_v"; save_settings; log_success "Other Burst: ${_v}"; prompt_apply_nft_rules; }
+                fi ;;
+            6)
+                if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" != "true" ]; then
+                    log_warn "Лимит Other отключён — action не применяется"
+                else
+                    echo ""
+                    echo -e "  ${BOLD}Выбор действия для non-iOS устройств:${NC}"; echo ""
+                    echo -e "  ${GREEN}[1]${NC} icmp-host-unreachable ${DIM}(рекомендуется)${NC}"
+                    echo -e "      ${DIM}Сервер притворяется недоступным узлом.${NC}"
+                    echo -e "      ${DIM}Telegram мгновенно понимает: «этот путь закрыт» —${NC}"
+                    echo -e "      ${DIM}и сразу переключается на основное соединение.${NC}"
+                    echo -e "      ${DIM}Медиа начинает отправляться без задержек.${NC}"
+                    echo ""
+                    echo -e "  ${CYAN}[2]${NC} reject (tcp reset) ${DIM}(оригинал By-MEKO)${NC}"
+                    echo -e "      ${DIM}Жёсткий сброс TCP. Быстрый reconnect,${NC}"
+                    echo -e "      ${DIM}но небольшая задержка при старте отправки медиа.${NC}"
+                    echo ""
+                    echo -e "  ${YELLOW}[3]${NC} drop ${DIM}(не рекомендуется)${NC}"
+                    echo -e "      ${DIM}Тихое уничтожение пакета. Telegram ждёт таймаута —${NC}"
+                    echo -e "      ${DIM}отправка медиа может полностью зависать.${NC}"
+                    echo ""
+                    echo -en "  ${BOLD}Выбор [1]: ${NC}"
+                    local _ac; read -r _ac
+                    case "${_ac:-1}" in
+                        2) NFT_OTHER_ACTION="reject" ;;
+                        3) NFT_OTHER_ACTION="drop" ;;
+                        *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
+                    esac
+                    save_settings
+                    log_success "Other Action: ${NFT_OTHER_ACTION}"
+                    prompt_apply_nft_rules
+                fi ;;
+            7)
+                if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
+                    echo ""
+                    echo -e "  ${YELLOW}Отключение лимита для Other (Android/Desktop):${NC}"
+                    echo -e "  ${DIM}Все non-iOS устройства будут пропускаться без ограничений.${NC}"
+                    echo -e "  ${DIM}Правило: fingerprint НЕ совпал → ACCEPT (без meter).${NC}"
+                    echo -e "  ${YELLOW}Внимание: это отключает защиту от SYN-флуда!${NC}"
+                    echo ""
+                    echo -en "  ${BOLD}Отключить лимит Other? [y/N]:${NC} "
+                    local _yn; read -r _yn
+                    if [[ "$_yn" =~ ^[yY]$ ]]; then
+                        NFT_OTHER_LIMIT_ENABLED="false"
+                        save_settings
+                        log_success "Лимит Other отключён"
+                        prompt_apply_nft_rules
+                    else
+                        log_info "Отменено"
+                    fi
+                else
+                    NFT_OTHER_LIMIT_ENABLED="true"
+                    save_settings
+                    log_success "Лимит Other включён (${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST})"
+                    prompt_apply_nft_rules
+                fi ;;
+            8)
+                NFT_MODE="classic"
+                save_settings
+                log_success "Переключено на Classic"
+                prompt_apply_nft_rules ;;
             0|"") return ;;
         esac
         echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -1823,8 +1955,19 @@ show_header() {
     local _nft_status="${RED}неактивно${NC}"
     if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
-            _nft_status="${GREEN}Smart By-MEKO${NC} (iOS: ${NFT_IOS_RATE}/${NFT_IOS_BURST} Other: ${NFT_OTHER_RATE}/${NFT_OTHER_BURST})"
-        else
+            local _ios_lim_info _other_lim_info
+            if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
+                _ios_lim_info="iOS: ${NFT_IOS_RATE}/${NFT_IOS_BURST}"
+            else
+                _ios_lim_info="iOS: unlimited"
+            fi
+            if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
+                _other_lim_info="Other: ${NFT_OTHER_RATE}/${NFT_OTHER_BURST}"
+            else
+                _other_lim_info="Other: unlimited"
+            fi
+            _nft_status="${GREEN}Smart By-MEKO${NC} (${_ios_lim_info} ${_other_lim_info})"
+            else
             _nft_status="${GREEN}Classic${NC} (${NFT_RATE} burst ${NFT_BURST})"
         fi
     fi
@@ -1874,8 +2017,16 @@ show_header() {
 
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
     if [ "${NFT_MODE:-classic}" = "smart" ]; then
-        echo -e "  ${BOLD}iOS Rate:${NC}      ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
-        echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
+        if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
+            echo -e "  ${BOLD}iOS Rate:${NC}      ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
+        else
+            echo -e "  ${BOLD}iOS Rate:${NC}      ${YELLOW}отключён (unlimited)${NC}"
+        fi
+        if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
+            echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
+        else
+            echo -e "  ${BOLD}Other Rate:${NC}    ${YELLOW}отключён (unlimited)${NC}"
+        fi
     else
         echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
         echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
