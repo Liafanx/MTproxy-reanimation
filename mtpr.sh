@@ -1357,7 +1357,7 @@ _generate_smart_rules() {
     if [ "$_ios_limit" = "true" ]; then
         # ── 1. iOS → meter лимит → ACCEPT
         cat >> "$NFT_SCRIPT" << SMART1EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } accept comment \\"mtpr_smart_ios_accept\\""
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } counter accept comment \\"mtpr_smart_ios_accept\\""
 SMART1EOF
         # ── 2. iOS превысившие → reject tcp reset
         cat >> "$NFT_SCRIPT" << SMART2EOF
@@ -1384,7 +1384,7 @@ SMART1NOLIMEOF
     if [ "$_other_limit" = "true" ]; then
         # ── 3. Other → meter лимит → ACCEPT
         cat >> "$NFT_SCRIPT" << SMART3EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } accept comment \\"mtpr_smart_other_accept\\""
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn meter mtpr_other { ip saddr timeout ${_timeout} limit rate ${_other_rate} burst ${_other_burst} packets } counter accept comment \\"mtpr_smart_other_accept\\""
 SMART3EOF
         # ── 4. Other превысившие → настраиваемое действие
         cat >> "$NFT_SCRIPT" << SMART4EOF
