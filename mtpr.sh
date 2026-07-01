@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.1.0
+#  MTproxy-reanimation v1.1.1
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.1.0"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
+VERSION="1.1.1"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -48,6 +48,7 @@ NFT_OTHER_BURST="1"
 NFT_IOS_LIMIT_ENABLED="true"
 NFT_OTHER_LIMIT_ENABLED="true"
 NFT_OTHER_ACTION="icmp-host-unreachable"
+NFT_IOS_DETECT="fingerprint"
 
 TUNING_TG_CONNECT="30"
 TUNING_CLIENT_HANDSHAKE="90"
@@ -126,6 +127,7 @@ NFT_OTHER_BURST='${NFT_OTHER_BURST}'
 NFT_IOS_LIMIT_ENABLED='${NFT_IOS_LIMIT_ENABLED}'
 NFT_OTHER_LIMIT_ENABLED='${NFT_OTHER_LIMIT_ENABLED}'
 NFT_OTHER_ACTION='${NFT_OTHER_ACTION}'
+NFT_IOS_DETECT='${NFT_IOS_DETECT}'
 TUNING_TG_CONNECT='${TUNING_TG_CONNECT}'
 TUNING_CLIENT_HANDSHAKE='${TUNING_CLIENT_HANDSHAKE}'
 TUNING_CLIENT_KEEPALIVE='${TUNING_CLIENT_KEEPALIVE}'
@@ -180,7 +182,7 @@ load_settings() {
             case "$_key" in
                 SERVER_IP|SERVER_PORT|NFT_RATE|NFT_BURST|NFT_METER_TIMEOUT|\
                 NFT_TABLE|NFT_HOOK|TUNING_TG_CONNECT|TUNING_CLIENT_HANDSHAKE|\
-                NFT_MODE|NFT_IOS_RATE|NFT_IOS_BURST|NFT_OTHER_RATE|NFT_OTHER_BURST|NFT_OTHER_ACTION|\
+                NFT_MODE|NFT_IOS_RATE|NFT_IOS_BURST|NFT_OTHER_RATE|NFT_OTHER_BURST|NFT_OTHER_ACTION|NFT_IOS_DETECT|\
                 TUNING_CLIENT_KEEPALIVE|TUNING_APPLIED|NFT_SERVICE_ENABLED|\
                 IOS_FIX_APPLIED|IOS_KA_TIME|IOS_KA_INTVL|IOS_KA_PROBES|\
                 IOS_ORIG_TIME|IOS_ORIG_INTVL|IOS_ORIG_PROBES|\
@@ -221,7 +223,11 @@ load_settings() {
     case "$NFT_OTHER_ACTION" in
         reject|drop|icmp-host-unreachable) ;;
         *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
-    esac    
+    esac
+    case "$NFT_IOS_DETECT" in
+        fingerprint|ttl) ;;
+        *) NFT_IOS_DETECT="fingerprint" ;;
+    esac
 }
 
 # ── Безопасное чтение значения из TOML ────────────────────────
@@ -1343,30 +1349,36 @@ _generate_smart_rules() {
     local _other_burst="${NFT_OTHER_BURST:-1}"
     local _ios_limit="${NFT_IOS_LIMIT_ENABLED:-true}"
     local _other_limit="${NFT_OTHER_LIMIT_ENABLED:-true}"
+    local _ios_detect="${NFT_IOS_DETECT:-fingerprint}"
 
     local _ip_match=""
     [ -n "$_ip" ] && [ "$DETECTED_NETWORK_MODE" != "bridge" ] && _ip_match="ip daddr ${_ip} "
 
     if [ "$_bridge_precise" = "true" ]; then
-        log_warn "Smart режим в bridge/precise: ip daddr контейнера не используется (TCP fingerprint идентификация)"
+        log_warn "Smart режим в bridge/precise: ip daddr контейнера не используется"
     fi
 
-    # ── iOS fingerprint ──────────────────────────────────────
-    local _ios_fp="@th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000"
+    # ── Выбор метода идентификации iOS ──────────────────────
+    local _ios_match
+    if [ "$_ios_detect" = "ttl" ]; then
+        _ios_match="ip ttl < 65 meta length 64"
+    else
+        _ios_match="@th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103 @th,224,24 0x10108 @th,320,32 0x4020000"
+    fi
 
     if [ "$_ios_limit" = "true" ]; then
         # ── 1. iOS → meter лимит → ACCEPT
         cat >> "$NFT_SCRIPT" << SMART1EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } counter accept comment \\"mtpr_smart_ios_accept\\""
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_match} meter mtpr_ios { ip saddr timeout ${_timeout} limit rate ${_ios_rate} burst ${_ios_burst} packets } counter accept comment \\"mtpr_smart_ios_accept\\""
 SMART1EOF
         # ── 2. iOS превысившие → reject tcp reset
         cat >> "$NFT_SCRIPT" << SMART2EOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} counter reject with tcp reset comment \\"mtpr_smart_ios_reject\\""
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_match} counter reject with tcp reset comment \\"mtpr_smart_ios_reject\\""
 SMART2EOF
     else
         # ── 1. iOS → безусловный ACCEPT (лимит отключён)
         cat >> "$NFT_SCRIPT" << SMART1NOLIMEOF
-nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_fp} counter accept comment \\"mtpr_smart_ios_accept\\""
+nft "add rule inet \$TABLE \$CHAIN ${_ip_match}tcp dport ${_port} tcp flags & (syn | ack) == syn ${_ios_match} counter accept comment \\"mtpr_smart_ios_accept\\""
 SMART1NOLIMEOF
     fi
 
@@ -1405,8 +1417,14 @@ enable_smart_mode() {
     echo ""
     echo -e "  ${BOLD}Как работает:${NC}"
     echo ""
-    echo -e "  ${DIM}  iOS и Android/Desktop разделяются по TTL автоматически:${NC}"
-    echo -e "  ${DIM}  • iOS (TTL < 65, SYN 64 байта) — мягкий лимит ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}${NC}"
+    local _detect_method="${NFT_IOS_DETECT:-fingerprint}"
+    if [ "$_detect_method" = "ttl" ]; then
+        echo -e "  ${DIM}  iOS определяются по TTL+Length (устаревший метод):${NC}"
+        echo -e "  ${DIM}  • iOS (ip ttl < 65, len 64) — лимит ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}${NC}"
+    else
+        echo -e "  ${DIM}  iOS определяются по TCP SYN fingerprint:${NC}"
+        echo -e "  ${DIM}  • iOS (TCP fingerprint) — лимит ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}${NC}"
+    fi
     echo -e "  ${DIM}  • Остальные — строгий лимит ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}${NC}"
     echo ""
     local _action_desc
@@ -1434,7 +1452,11 @@ enable_smart_mode() {
 
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
         echo -e "  ${YELLOW}⚠ Bridge/precise режим: ip daddr контейнера не будет использоваться.${NC}"
-        echo -e "  ${YELLOW}  Smart идентифицирует клиентов по TTL — это работает корректно.${NC}"
+        if [ "${NFT_IOS_DETECT:-fingerprint}" = "ttl" ]; then
+            echo -e "  ${YELLOW}  Smart идентифицирует клиентов по TTL+Length — это работает корректно.${NC}"
+        else
+            echo -e "  ${YELLOW}  Smart идентифицирует клиентов по TCP fingerprint — это работает корректно.${NC}"
+        fi
         echo ""
     fi
 
@@ -1490,7 +1512,15 @@ show_smart_settings_menu() {
             echo -e "    Other лимит:  ${YELLOW}отключён${NC} ${DIM}(безусловный ACCEPT)${NC}"
         fi
 
-        echo -e "    Timeout:      ${NFT_METER_TIMEOUT}"; echo ""
+        echo -e "    Timeout:      ${NFT_METER_TIMEOUT}"
+        local _detect_display
+        if [ "${NFT_IOS_DETECT:-fingerprint}" = "ttl" ]; then
+            _detect_display="${YELLOW}TTL+Length${NC} ${DIM}(ip ttl < 65, len 64 — устаревший)${NC}"
+        else
+            _detect_display="${GREEN}TCP fingerprint${NC} ${DIM}(рекомендуется)${NC}"
+        fi
+        echo -e "    iOS detect:   ${_detect_display}"
+        echo ""
 
         echo -e "  ${BOLD}iOS настройки:${NC}"
         if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
@@ -1519,6 +1549,7 @@ show_smart_settings_menu() {
 
         echo ""
         echo -e "  ${DIM}[8]${NC} Переключить на Classic режим"
+        echo -e "  ${DIM}[9]${NC} Метод идентификации iOS [$([ "${NFT_IOS_DETECT:-fingerprint}" = "ttl" ] && echo "TTL+Length" || echo "fingerprint")]"
         echo -e "  ${DIM}[0]${NC} Назад"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
@@ -1633,6 +1664,40 @@ show_smart_settings_menu() {
                 save_settings
                 log_success "Переключено на Classic"
                 prompt_apply_nft_rules ;;
+            9)
+                echo ""
+                echo -e "  ${BOLD}Метод идентификации iOS-устройств:${NC}"; echo ""
+                echo -e "  ${GREEN}[1]${NC} TCP fingerprint ${DIM}(рекомендуется)${NC}"
+                echo -e "      ${DIM}Точное определение iOS по TCP SYN payload:${NC}"
+                echo -e "      ${DIM}@th,108,20 0x2ffff @th,160,16 0x204 @th,192,16 0x103${NC}"
+                echo -e "      ${DIM}@th,224,24 0x10108 @th,320,32 0x4020000${NC}"
+                echo -e "      ${DIM}Работает независимо от TTL и длины пакета.${NC}"
+                echo ""
+                echo -e "  ${YELLOW}[2]${NC} TTL + Length ${DIM}(устаревший, v1.0.9)${NC}"
+                echo -e "      ${DIM}Определение iOS по: ip ttl < 65 AND meta length 64${NC}"
+                echo -e "      ${DIM}Менее точно. Используйте если fingerprint не работает.${NC}"
+                echo ""
+                local _cur_detect="${NFT_IOS_DETECT:-fingerprint}"
+                if [ "$_cur_detect" = "ttl" ]; then
+                    echo -e "  ${DIM}Текущий метод: ${YELLOW}TTL+Length${NC}"
+                else
+                    echo -e "  ${DIM}Текущий метод: ${GREEN}fingerprint${NC}"
+                fi
+                echo ""
+                echo -en "  ${BOLD}Выбор [1]: ${NC}"
+                local _dm; read -r _dm
+                case "${_dm:-1}" in
+                    2)
+                        NFT_IOS_DETECT="ttl"
+                        save_settings
+                        log_success "Метод идентификации iOS: TTL+Length"
+                        prompt_apply_nft_rules ;;
+                    *)
+                        NFT_IOS_DETECT="fingerprint"
+                        save_settings
+                        log_success "Метод идентификации iOS: TCP fingerprint"
+                        prompt_apply_nft_rules ;;
+                esac ;;
             0|"") return ;;
         esac
         echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -2022,6 +2087,9 @@ show_header() {
         else
             echo -e "  ${BOLD}iOS Rate:${NC}      ${YELLOW}отключён (unlimited)${NC}"
         fi
+        local _detect_short
+        [ "${NFT_IOS_DETECT:-fingerprint}" = "ttl" ] && _detect_short="${YELLOW}TTL+Len${NC}" || _detect_short="${GREEN}fingerprint${NC}"
+        echo -e "  ${BOLD}iOS detect:${NC}    ${_detect_short}"        
         if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
             echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
         else
