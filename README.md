@@ -6,7 +6,7 @@
 
 ## Реклама
 
-Сделал свой Прокси менеджер ставится в докере, вся установка автоматическая, образ есть в GitHub, управление через tui меню со встроенным syn limiter, версия 1.0.8 https://github.com/Liafanx/MTProxyL
+Сделал свой Прокси менеджер ставится в докере, вся установка автоматическая, образ есть в GitHub, управление через tui меню со встроенным syn limiter, версия 1.0.9 https://github.com/Liafanx/MTProxyL
 
 ## Установка и обновление
 
@@ -511,3 +511,13 @@ systemctl restart telemt
 ---
 
 MTproxy-reanimation by LiafanX · [GitHub](https://github.com/Liafanx/MTproxy-reanimation)
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=Liafanx%2FMTproxy-reanimation&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Liafanx/MTproxy-reanimation&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Liafanx/MTproxy-reanimation&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Liafanx/MTproxy-reanimation&type=date&legend=top-left" />
+ </picture>
+</a>
