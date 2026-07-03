@@ -28,7 +28,7 @@ mtpr
 ## Обновления
 
 <details>
-<summary><b>1.1.2 от 05.07.2026</b></summary>
+<summary><b>1.1.2 от 03.07.2026</b></summary>
 
 ### Ссылки прокси через API Telemt
 
