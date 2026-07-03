@@ -265,18 +265,22 @@ _set_config_param() {
     local _cfg="${DETECTED_CONFIG_PATH:-}"
     [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && { log_error "Конфиг не найден"; return 1; }
 
+    # Раскомментировать и установить
     if grep -E "^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -q .; then
-        sed -i "s/^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=.*/${_key} = ${_value}/" "$_cfg"
+        sed -i "/^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=/c\\${_key} = ${_value}" "$_cfg"
         return 0
     fi
+    # Обновить существующее значение
     if _toml_has_key "$_key" "$_cfg"; then
-        sed -i "s/^[[:space:]]*${_key}[[:space:]]*=.*/${_key} = ${_value}/" "$_cfg"
+        sed -i "/^[[:space:]]*${_key}[[:space:]]*=/c\\${_key} = ${_value}" "$_cfg"
         return 0
     fi
+    # Добавить в секцию
     if [ -n "$_section" ] && _toml_has_section "$_section" "$_cfg"; then
         sed -i "/^\\[${_section}\\]/a ${_key} = ${_value}" "$_cfg"
         return 0
     fi
+    # Создать секцию
     if [ -n "$_section" ]; then
         printf '\n[%s]\n%s = %s\n' "$_section" "$_key" "$_value" >> "$_cfg"
         return 0
@@ -307,8 +311,8 @@ _comment_config_param() {
     local _key="$1"
     local _cfg="${DETECTED_CONFIG_PATH:-}"
     [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
-    if grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -v '^#' | grep -q .; then
-        sed -i "s/^[[:space:]]*${_key}[[:space:]]*=.*/#${_key} = 0/" "$_cfg"
+    if grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -vE "^[[:space:]]*#" | grep -q .; then
+        sed -i "/^[[:space:]]*${_key}[[:space:]]*=/s/^/#/" "$_cfg"
         return 0
     fi
     return 1
@@ -643,7 +647,7 @@ _toml_has_section() {
 
 _toml_has_key() {
     local _key="$1" _file="$2"
-    grep -qE "^${_key}[[:space:]]*=" "$_file" 2>/dev/null
+    grep -qE "^[[:space:]]*${_key}[[:space:]]*=" "$_file" 2>/dev/null
 }
 
 _toml_safe_set() {
