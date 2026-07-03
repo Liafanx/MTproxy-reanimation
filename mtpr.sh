@@ -165,7 +165,6 @@ show_proxy_links() {
         return 1
     fi
 
-    # Проверяем что API вернул валидный JSON с пользователями
     local _ok
     _ok=$(echo "$_json" | jq -r '.ok // empty' 2>/dev/null)
     if [ "$_ok" != "true" ]; then
@@ -180,25 +179,16 @@ show_proxy_links() {
         return 0
     fi
 
-    # Формируем jq-фильтр с подстановкой public_host/public_port
-    local _jq_host_sub=""
-    local _jq_port_sub=""
-    if [ -n "$_public_host" ]; then
-        _jq_host_sub='| sub("server=[^&]+"; "server='"${_public_host}"'")'
-    fi
-    if [ -n "$_public_port" ]; then
-        _jq_port_sub='| sub("port=[0-9]+"; "port='"${_public_port}"'")'
-    fi
-
     echo "$_json" | jq -r --arg GREEN $'\033[0;32m' \
                            --arg RED $'\033[0;31m' \
                            --arg CYAN $'\033[0;36m' \
                            --arg BOLD $'\033[1m' \
                            --arg DIM $'\033[2m' \
                            --arg NC $'\033[0m' \
+                           --arg PUB_HOST "$_public_host" \
+                           --arg PUB_PORT "$_public_port" \
     '
     .data[] |
-    . as $user |
     "  " + $BOLD + .username + $NC +
     "  [" + (if .enabled then ($GREEN + "вкл" + $NC) else ($RED + "выкл" + $NC) end) + "]" +
     "  подключений: " + (.current_connections // 0 | tostring) +
@@ -213,13 +203,18 @@ show_proxy_links() {
         if length == 0 then
             ["    " + $DIM + "ссылки отсутствуют" + $NC]
         else
-            [.[] | '"${_jq_host_sub}"' '"${_jq_port_sub}"' | "    " + $CYAN + . + $NC]
+            [.[] |
+                (if ($PUB_HOST | length) > 0 then sub("server=[^&]+"; "server=" + $PUB_HOST) else . end) |
+                (if ($PUB_PORT | length) > 0 then sub("port=[0-9]+"; "port=" + $PUB_PORT) else . end) |
+                "    " + $CYAN + . + $NC
+            ]
         end | .[]
     ),
 
     ""
     '
 }
+
 
 # ── Управление client_mss / mss_bulk / synlimit ──────────────
 _get_config_param() {
