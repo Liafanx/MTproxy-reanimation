@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.1.1
+#  MTproxy-reanimation v1.1.2
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -86,11 +86,411 @@ MEKO_ORIG_FILE_MAX=""
 MEKO_ORIG_DEFAULT_QDISC=""
 MEKO_ORIG_TCP_CONGESTION=""
 
+# ── Telemt config params ──────────────────────────────────────
+TELEMT_API_PORT=""
+TELEMT_SERVICE_STATUS=""
+
 declare -A EXTRA_RULES_PORT
 declare -A EXTRA_RULES_IP
 declare -A EXTRA_RULES_RATE
 declare -A EXTRA_RULES_BURST
 EXTRA_RULES_COUNT=0
+
+# ── Определение API порта Telemt ──────────────────────────────
+_get_telemt_api_port() {
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    local _listen="" _port=""
+    if [ -n "$_cfg" ] && [ -f "$_cfg" ]; then
+        _listen=$(_toml_get_string_in_section "server.api" "listen" "$_cfg")
+        if [ -n "$_listen" ]; then
+            _port=$(printf '%s\n' "$_listen" | sed -nE 's/.*:([0-9]+)$/\1/p')
+        fi
+    fi
+    [ -z "$_port" ] && _port="9091"
+    echo "$_port"
+}
+
+# ── Получение ссылок прокси через API ─────────────────────────
+_get_links_public_host() {
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -n "$_cfg" ] && [ -f "$_cfg" ] || return 1
+    _toml_get_string_in_section "general.links" "public_host" "$_cfg"
+}
+
+_get_links_public_port() {
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -n "$_cfg" ] && [ -f "$_cfg" ] || return 1
+    _toml_get_number_in_section "general.links" "public_port" "$_cfg"
+}
+
+get_proxy_links() {
+    local _api_port
+    _api_port=$(_get_telemt_api_port)
+    local _json
+    _json=$(curl -s --max-time 3 --connect-timeout 2 "http://127.0.0.1:${_api_port}/v1/users" 2>/dev/null) || return 1
+    [ -z "$_json" ] && return 1
+    echo "$_json" | grep -q '"ok":true' || return 1
+    echo "$_json"
+}
+
+show_proxy_links() {
+    echo ""
+    echo -e "  ${BOLD}Ссылки прокси (через API Telemt)${NC}"
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo ""
+
+    if ! command -v jq &>/dev/null; then
+        log_info "jq не установлен, устанавливаю..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq jq
+        elif command -v yum &>/dev/null; then
+            yum install -y -q jq
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q jq
+        elif command -v apk &>/dev/null; then
+            apk add --no-cache jq
+        else
+            log_error "Не удалось установить jq автоматически. Установите вручную: apt install jq"
+            return 1
+        fi
+        if ! command -v jq &>/dev/null; then
+            log_error "jq не удалось установить"
+            return 1
+        fi
+        log_success "jq установлен"
+    fi
+
+    local _api_port _public_host _public_port
+    _api_port=$(_get_telemt_api_port)
+    _public_host=$(_get_links_public_host 2>/dev/null || true)
+    _public_port=$(_get_links_public_port 2>/dev/null || true)
+
+    log_info "API порт: ${_api_port}"
+    [ -n "$_public_host" ] && log_info "public_host: ${_public_host}"
+    [ -n "$_public_port" ] && log_info "public_port: ${_public_port}"
+    echo ""
+
+    local _json
+    _json=$(get_proxy_links)
+    if [ $? -ne 0 ] || [ -z "$_json" ]; then
+        log_error "Не удалось получить данные от API (http://127.0.0.1:${_api_port}/v1/users)"
+        log_info "Проверьте что API включён в конфиге Telemt:"
+        echo -e "    ${DIM}[server.api]${NC}"
+        echo -e "    ${DIM}enabled = true${NC}"
+        echo -e "    ${DIM}listen = \"127.0.0.1:9091\"${NC}"
+        return 1
+    fi
+
+    local _ok
+    _ok=$(echo "$_json" | jq -r '.ok // empty' 2>/dev/null)
+    if [ "$_ok" != "true" ]; then
+        log_error "API вернул ошибку или невалидный ответ"
+        return 1
+    fi
+
+    local _user_count
+    _user_count=$(echo "$_json" | jq '.data | length' 2>/dev/null)
+    if [ -z "$_user_count" ] || [ "$_user_count" -eq 0 ]; then
+        log_info "Пользователи не найдены"
+        return 0
+    fi
+
+    echo "$_json" | jq -r --arg GREEN $'\033[0;32m' \
+                           --arg RED $'\033[0;31m' \
+                           --arg CYAN $'\033[0;36m' \
+                           --arg BOLD $'\033[1m' \
+                           --arg DIM $'\033[2m' \
+                           --arg NC $'\033[0m' \
+                           --arg PUB_HOST "$_public_host" \
+                           --arg PUB_PORT "$_public_port" \
+    '
+    .data[] |
+    "  " + $BOLD + .username + $NC +
+    "  [" + (if .enabled then ($GREEN + "вкл" + $NC) else ($RED + "выкл" + $NC) end) + "]" +
+    "  подключений: " + (.current_connections // 0 | tostring) +
+    "  уник. IP: " + (.active_unique_ips // 0 | tostring),
+
+    (
+        [
+            (.links.tls // [] | .[] | select(contains("server=::") | not)),
+            (.links.secure // [] | .[] | select(contains("server=::") | not)),
+            (.links.classic // [] | .[] | select(contains("server=::") | not))
+        ] |
+        if length == 0 then
+            ["    " + $DIM + "ссылки отсутствуют" + $NC]
+        else
+            [.[] |
+                (if ($PUB_HOST | length) > 0 then sub("server=[^&]+"; "server=" + $PUB_HOST) else . end) |
+                (if ($PUB_PORT | length) > 0 then sub("port=[0-9]+"; "port=" + $PUB_PORT) else . end) |
+                "    " + $CYAN + . + $NC
+            ]
+        end | .[]
+    ),
+
+    ""
+    '
+}
+
+
+# ── Управление client_mss / mss_bulk / synlimit ──────────────
+_get_config_param() {
+    local _key="$1"
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
+    local _val
+    _val=$(grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -v '^#' | head -1 | sed -E "s/^[[:space:]]*${_key}[[:space:]]*=[[:space:]]*//" | tr -d '"' | xargs)
+    [ -n "$_val" ] && echo "$_val" && return 0
+    return 1
+}
+
+_get_config_param_commented() {
+    local _key="$1"
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
+    local _val
+    _val=$(grep -E "^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=[[:space:]]*//" | tr -d '"' | xargs)
+    [ -n "$_val" ] && echo "$_val" && return 0
+    return 1
+}
+
+_is_param_active() {
+    local _key="$1"
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
+    grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -v '^#' | grep -q .
+}
+
+_set_config_param() {
+    local _key="$1" _value="$2" _section="$3"
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && { log_error "Конфиг не найден"; return 1; }
+
+    # Раскомментировать и установить
+    if grep -E "^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -q .; then
+        sed -i "/^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=/c\\${_key} = ${_value}" "$_cfg"
+        return 0
+    fi
+    # Обновить существующее значение
+    if _toml_has_key "$_key" "$_cfg"; then
+        sed -i "/^[[:space:]]*${_key}[[:space:]]*=/c\\${_key} = ${_value}" "$_cfg"
+        return 0
+    fi
+    # Добавить в секцию
+    if [ -n "$_section" ] && _toml_has_section "$_section" "$_cfg"; then
+        sed -i "/^\\[${_section}\\]/a ${_key} = ${_value}" "$_cfg"
+        return 0
+    fi
+    # Создать секцию
+    if [ -n "$_section" ]; then
+        printf '\n[%s]\n%s = %s\n' "$_section" "$_key" "$_value" >> "$_cfg"
+        return 0
+    fi
+    echo "${_key} = ${_value}" >> "$_cfg"
+}
+
+_validate_mss_value() {
+    local _val="$1"
+    case "$_val" in
+        extreme-low|tspu|2in8)
+            return 0 ;;
+    esac
+    if [[ "$_val" =~ ^[0-9]+$ ]]; then
+        if [ "$_val" -ge 88 ] && [ "$_val" -le 4096 ]; then
+            return 0
+        else
+            log_error "Число должно быть в диапазоне 88..4096 (получено: $_val)"
+            return 1
+        fi
+    fi
+    log_error "Некорректное значение: $_val"
+    log_info "Допустимо: extreme-low | tspu | 2in8 | число 88..4096"
+    return 1
+}
+
+_comment_config_param() {
+    local _key="$1"
+    local _cfg="${DETECTED_CONFIG_PATH:-}"
+    [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
+    if grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -vE "^[[:space:]]*#" | grep -q .; then
+        sed -i "/^[[:space:]]*${_key}[[:space:]]*=/s/^/#/" "$_cfg"
+        return 0
+    fi
+    return 1
+}
+
+_telemt_param_status() {
+    local _key="$1"
+    local _val
+    if _val=$(_get_config_param "$_key"); then
+        _val="${_val#\"}"
+        _val="${_val%\"}"
+        echo -e "${GREEN}${_val}${NC}"
+    else
+        echo -e "${DIM}отключен${NC}"
+    fi
+}
+
+_get_telemt_service_status() {
+    if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
+        local _running
+        _running=$(docker inspect -f '{{.State.Running}}' "$DETECTED_CONTAINER" 2>/dev/null || echo "false")
+        if [ "$_running" = "true" ]; then
+            echo -e "${GREEN}работает${NC} (docker: ${DETECTED_CONTAINER})"
+        else
+            echo -e "${RED}остановлен${NC} (docker: ${DETECTED_CONTAINER})"
+        fi
+    elif [ "$DETECTED_MODE" = "mtproxymax" ]; then
+        if systemctl is-active mtproxymax.service &>/dev/null 2>&1 || \
+           (command -v docker &>/dev/null && docker inspect -f '{{.State.Running}}' mtproxymax 2>/dev/null | grep -q true); then
+            echo -e "${GREEN}работает${NC} (mtproxymax)"
+        else
+            echo -e "${RED}остановлен${NC} (mtproxymax)"
+        fi
+    elif systemctl is-active telemt.service &>/dev/null 2>&1; then
+        echo -e "${GREEN}работает${NC}"
+    elif pgrep -x telemt &>/dev/null; then
+        echo -e "${GREEN}работает${NC} (процесс)"
+    else
+        echo -e "${RED}остановлен${NC}"
+    fi
+}
+
+_restart_telemt() {
+    if [ "$DETECTED_MODE" = "docker" ] && [ -n "$DETECTED_CONTAINER" ]; then
+        docker restart "$DETECTED_CONTAINER" &>/dev/null && log_success "Контейнер ${DETECTED_CONTAINER} перезапущен" || log_warn "Не удалось перезапустить"
+    elif [ "$DETECTED_MODE" = "mtproxymax" ]; then
+        mtproxymax restart &>/dev/null && log_success "MTProxyMax перезапущен" || log_warn "Не удалось перезапустить"
+    elif systemctl is-active telemt.service &>/dev/null 2>&1; then
+        systemctl restart telemt.service &>/dev/null && log_success "Telemt перезапущен" || log_warn "Не удалось перезапустить"
+    else
+        pkill -HUP telemt 2>/dev/null && log_success "SIGHUP отправлен" || log_warn "Не удалось перезапустить"
+    fi
+}
+
+_prompt_restart_telemt() {
+    echo ""
+    echo -en "  ${BOLD}Перезапустить Telemt для применения изменений? [Y/n]:${NC} "
+    local _yn; read -r _yn
+    if [[ ! "$_yn" =~ ^[nN]$ ]]; then
+        _restart_telemt
+    else
+        log_info "Перезапуск отменён. Изменения применятся после перезапуска"
+    fi
+}
+
+show_telemt_params_menu() {
+    while true; do
+        show_header
+        echo -e "  ${BOLD}Управление параметрами Telemt (MSS)${NC}"; echo ""
+
+        if [ -z "$DETECTED_CONFIG_PATH" ] || [ ! -f "$DETECTED_CONFIG_PATH" ]; then
+            log_error "Конфиг Telemt не найден"
+            echo ""; read -rsn1 -p "  Нажмите любую клавишу..."; return
+        fi
+
+        echo -e "  ${BOLD}Конфиг:${NC} ${DETECTED_CONFIG_PATH}"; echo ""
+
+        local _mss_val _mssbulk_val
+        _mss_val=$(_telemt_param_status "client_mss")
+        _mssbulk_val=$(_telemt_param_status "client_mss_bulk")
+
+        echo -e "  ${BOLD}Текущие значения:${NC}"
+        echo -e "    client_mss:      ${_mss_val}"
+        echo -e "    client_mss_bulk: ${_mssbulk_val}"
+        echo ""
+
+        if [ "${NFT_MODE:-classic}" = "smart" ]; then
+            echo -e "  ${YELLOW}⚠ Smart By-MEKO активен — client_mss не рекомендуется${NC}"
+            echo ""
+        fi
+
+        echo -e "  ${DIM}Допустимые значения MSS:${NC}"
+        echo -e "  ${DIM}  Пресеты: extreme-low (88), tspu (92), 2in8 (256)${NC}"
+        echo -e "  ${DIM}  Число:   88..4096 (вводится как строка в конфиге)${NC}"
+        echo ""
+
+        echo -e "  ${DIM}[1]${NC} Установить client_mss"
+        echo -e "  ${DIM}[2]${NC} Установить client_mss_bulk"
+        echo -e "  ${DIM}[3]${NC} Отключить client_mss"
+        echo -e "  ${DIM}[4]${NC} Отключить client_mss_bulk"
+        echo -e "  ${DIM}[5]${NC} Отключить оба параметра"
+        echo -e "  ${DIM}[6]${NC} Пресет: client_mss=\"tspu\" + client_mss_bulk=\"1400\""
+        echo -e "  ${DIM}[0]${NC} Назад"; echo ""
+        echo -en "  Выбор: "; local _choice; read -r _choice
+
+        case "$_choice" in
+            1)
+                echo ""
+                echo -e "  ${DIM}Пресеты: extreme-low | tspu | 2in8${NC}"
+                echo -e "  ${DIM}Или число: 88..4096${NC}"
+                echo -en "  client_mss [tspu]: "; local _v; read -r _v
+                [ -z "$_v" ] && _v="tspu"
+                if _validate_mss_value "$_v"; then
+                    _set_config_param "client_mss" "\"${_v}\"" "server"
+                    log_success "client_mss = \"$_v\""
+                    _prompt_restart_telemt
+                fi ;;
+            2)
+                echo ""
+                echo -e "  ${DIM}Пресеты: extreme-low | tspu | 2in8${NC}"
+                echo -e "  ${DIM}Или число: 88..4096${NC}"
+                echo -en "  client_mss_bulk [1400]: "; local _v; read -r _v
+                [ -z "$_v" ] && _v="1400"
+                if _validate_mss_value "$_v"; then
+                    _set_config_param "client_mss_bulk" "\"${_v}\"" "server"
+                    log_success "client_mss_bulk = \"$_v\""
+                    _prompt_restart_telemt
+                fi ;;
+            3)
+                if _comment_config_param "client_mss"; then
+                    log_success "client_mss отключён"
+                    _prompt_restart_telemt
+                else
+                    log_info "client_mss уже отключён или отсутствует"
+                fi ;;
+            4)
+                if _comment_config_param "client_mss_bulk"; then
+                    log_success "client_mss_bulk отключён"
+                    _prompt_restart_telemt
+                else
+                    log_info "client_mss_bulk уже отключён или отсутствует"
+                fi ;;
+            5)
+                local _any=false
+                _comment_config_param "client_mss" && _any=true
+                _comment_config_param "client_mss_bulk" && _any=true
+                if [ "$_any" = "true" ]; then
+                    log_success "Оба параметра отключены"
+                    _prompt_restart_telemt
+                else
+                    log_info "Оба параметра уже отключены"
+                fi ;;
+            6)
+                _set_config_param "client_mss" '"tspu"' "server"
+                _set_config_param "client_mss_bulk" '"1400"' "server"
+                log_success "client_mss = \"tspu\", client_mss_bulk = \"1400\""
+                _prompt_restart_telemt ;;
+            0|"") return ;;
+        esac
+        echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
+    done
+}
+
+# ── Проверка цензуры ──────────────────────────────────────────
+check_censor() {
+    echo ""
+    echo -e "  ${BOLD}Проверка ограничений на сервере${NC}"
+    echo -e "  ${DIM}Источник: censorcheck.tlab.pw${NC}"
+    echo ""
+    if command -v wget &>/dev/null; then
+        wget -qO- censorcheck.tlab.pw | bash
+    elif command -v curl &>/dev/null; then
+        curl -fsSL censorcheck.tlab.pw | bash
+    else
+        log_error "Не найден wget или curl"
+        return 1
+    fi
+}
 
 # ── Логирование ───────────────────────────────────────────────
 log_info()    { echo -e "  ${BLUE}[i]${NC} $1"; }
@@ -247,7 +647,7 @@ _toml_has_section() {
 
 _toml_has_key() {
     local _key="$1" _file="$2"
-    grep -qE "^${_key}[[:space:]]*=" "$_file" 2>/dev/null
+    grep -qE "^[[:space:]]*${_key}[[:space:]]*=" "$_file" 2>/dev/null
 }
 
 _toml_safe_set() {
@@ -262,6 +662,49 @@ _toml_safe_set() {
         return 0
     fi
     return 1
+}
+
+# ── Чтение значений из TOML по секциям ────────────────────────
+_toml_get_raw_in_section() {
+    local _section="$1" _key="$2" _file="$3"
+    [ -f "$_file" ] || return 1
+    awk -v s="$_section" -v k="$_key" '
+        function ltrim(str) { sub(/^[[:space:]]+/, "", str); return str }
+        function rtrim(str) { sub(/[[:space:]]+$/, "", str); return str }
+        function trim(str)  { return rtrim(ltrim(str)) }
+        {
+            line = $0
+            if (line ~ /^[[:space:]]*#/) next
+            t = trim(line)
+
+            if (t ~ /^\[/) {
+                insec = (t == "[" s "]")
+            }
+
+            if (insec && t ~ ("^" k "[[:space:]]*=")) {
+                sub(/^[^=]*=[[:space:]]*/, "", t)
+                sub(/[[:space:]]+#.*$/, "", t)
+                print trim(t)
+                exit
+            }
+        }
+    ' "$_file" 2>/dev/null
+}
+
+_toml_get_string_in_section() {
+    local _section="$1" _key="$2" _file="$3"
+    local _val
+    _val=$(_toml_get_raw_in_section "$_section" "$_key" "$_file") || return 1
+    _val="${_val#\"}"
+    _val="${_val%\"}"
+    printf '%s\n' "$_val"
+}
+
+_toml_get_number_in_section() {
+    local _section="$1" _key="$2" _file="$3"
+    local _val
+    _val=$(_toml_get_raw_in_section "$_section" "$_key" "$_file") || return 1
+    echo "$_val" | grep -oE '[0-9]+' | head -1
 }
 
 # ── Обнаружение Telemt ────────────────────────────────────────
@@ -484,6 +927,7 @@ install_dependencies() {
     local _missing=()
     command -v nft &>/dev/null || _missing+=("nftables")
     command -v curl &>/dev/null || _missing+=("curl")
+    command -v jq &>/dev/null || _missing+=("jq")
     if [ ${#_missing[@]} -gt 0 ]; then
         log_info "Установка: ${_missing[*]}"
         if command -v apt-get &>/dev/null; then
@@ -2105,6 +2549,13 @@ show_header() {
     echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
     echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
     echo -e "  ${BOLD}MEKO оптимизация:${NC} $(meko_opt_status)"
+    echo -e "  ${BOLD}Telemt сервис:${NC} $(_get_telemt_service_status)"
+    if [ -n "$DETECTED_CONFIG_PATH" ] && [ -f "$DETECTED_CONFIG_PATH" ]; then
+        local _mss_s _mssbulk_s _synlim_s
+        _mss_s=$(_telemt_param_status "client_mss")
+        _mssbulk_s=$(_telemt_param_status "mss_bulk")
+        echo -e "  ${BOLD}client_mss:${NC}    ${_mss_s}  ${BOLD}client_mss_bulk:${NC} ${_mssbulk_s}"
+    fi
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
         local _i; for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
@@ -2130,6 +2581,9 @@ show_main_menu() {
         echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
         echo -e "  ${CYAN}[m]${NC}  Оптимизация системы By-MEKO"
+        echo -e "  ${CYAN}[l]${NC}  Ссылки прокси (через API Telemt)"
+        echo -e "  ${CYAN}[p]${NC}  Параметры Telemt (MSS)"
+        echo -e "  ${CYAN}[x]${NC}  Проверка ограничений сервера (censorship)"
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
             echo -e "  ${CYAN}[c]${NC}  Настройки Smart режима"
         fi
@@ -2168,6 +2622,9 @@ show_main_menu() {
             a|A) show_ios2_fix_menu ;;
             c|C) [ "${NFT_MODE:-classic}" = "smart" ] && show_smart_settings_menu ;;
             m|M) show_meko_opt_menu ;;
+            l|L) show_proxy_links; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
+            p|P) show_telemt_params_menu ;;
+            x|X) check_censor; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             u|U) full_uninstall ;;
             0|q|Q) exit 0 ;;
         esac
