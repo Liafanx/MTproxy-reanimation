@@ -355,6 +355,18 @@ _set_config_param() {
     echo "${_key} = ${_value}" >> "$_cfg"
 }
 
+_format_mss_value() {
+    local _val="$1"
+    case "$_val" in
+        extreme-low|tspu|2in8)
+            echo "\"${_val}\""
+            ;;
+        *)
+            echo "$_val"
+            ;;
+    esac
+}
+
 _validate_mss_value() {
     local _val="$1"
     case "$_val" in
@@ -506,8 +518,10 @@ show_telemt_params_menu() {
                 echo -en "  client_mss [tspu]: "; local _v; read -r _v
                 [ -z "$_v" ] && _v="tspu"
                 if _validate_mss_value "$_v"; then
-                    _set_config_param "client_mss" "\"${_v}\"" "server"
-                    log_success "client_mss = \"$_v\""
+                    local _formatted
+                    _formatted=$(_format_mss_value "$_v")
+                    _set_config_param "client_mss" "$_formatted" "server"
+                    log_success "client_mss = $_formatted"
                     _prompt_restart_telemt
                 fi ;;
             2)
@@ -517,8 +531,10 @@ show_telemt_params_menu() {
                 echo -en "  client_mss_bulk [1400]: "; local _v; read -r _v
                 [ -z "$_v" ] && _v="1400"
                 if _validate_mss_value "$_v"; then
-                    _set_config_param "client_mss_bulk" "\"${_v}\"" "server"
-                    log_success "client_mss_bulk = \"$_v\""
+                    local _formatted
+                    _formatted=$(_format_mss_value "$_v")
+                    _set_config_param "client_mss_bulk" "$_formatted" "server"
+                    log_success "client_mss_bulk = $_formatted"
                     _prompt_restart_telemt
                 fi ;;
             3)
@@ -547,8 +563,8 @@ show_telemt_params_menu() {
                 fi ;;
             6)
                 _set_config_param "client_mss" '"tspu"' "server"
-                _set_config_param "client_mss_bulk" '"1400"' "server"
-                log_success "client_mss = \"tspu\", client_mss_bulk = \"1400\""
+                _set_config_param "client_mss_bulk" "1400" "server"
+                log_success "client_mss = \"tspu\", client_mss_bulk = 1400"
                 _prompt_restart_telemt ;;
             0|"") return ;;
         esac
@@ -2642,9 +2658,9 @@ show_header() {
     echo -e "  ${BOLD}MEKO оптимизация:${NC} $(meko_opt_status)"
     echo -e "  ${BOLD}Telemt сервис:${NC} $(_get_telemt_service_status)"
     if [ -n "$DETECTED_CONFIG_PATH" ] && [ -f "$DETECTED_CONFIG_PATH" ]; then
-        local _mss_s _mssbulk_s _synlim_s
+        local _mss_s _mssbulk_s
         _mss_s=$(_telemt_param_status "client_mss")
-        _mssbulk_s=$(_telemt_param_status "mss_bulk")
+        _mssbulk_s=$(_telemt_param_status "client_mss_bulk")
         echo -e "  ${BOLD}client_mss:${NC}    ${_mss_s}  ${BOLD}client_mss_bulk:${NC} ${_mssbulk_s}"
     fi
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
