@@ -195,40 +195,39 @@ show_proxy_links() {
         return 0
     fi
 
-    echo "$_json" | jq -r --arg GREEN $'\033[0;32m' \
-                           --arg RED $'\033[0;31m' \
-                           --arg CYAN $'\033[0;36m' \
-                           --arg BOLD $'\033[1m' \
-                           --arg DIM $'\033[2m' \
-                           --arg NC $'\033[0m' \
-                           --arg PUB_HOST "$_public_host" \
-                           --arg PUB_PORT "$_public_port" \
-    '
-    .data[] |
-    "  " + $BOLD + .username + $NC +
-    "  [" + (if .enabled then ($GREEN + "вкл" + $NC) else ($RED + "выкл" + $NC) end) + "]" +
-    "  подключений: " + (.current_connections // 0 | tostring) +
-    "  уник. IP: " + (.active_unique_ips // 0 | tostring),
+    # Готовим jq-фильтр как heredoc чтобы избежать проблем с кавычками
+    local _jq_filter
+    read -r -d '' _jq_filter << 'JQEOF' || true
+.data[] |
+"  \u001b[1m" + .username + "\u001b[0m" +
+"  [" + (if .enabled then "\u001b[0;32mвкл\u001b[0m" else "\u001b[0;31mвыкл\u001b[0m" end) + "]" +
+"  подключений: " + (.current_connections // 0 | tostring) +
+"  уник. IP: " + (.active_unique_ips // 0 | tostring),
 
-    (
-        [
-            (.links.tls // [] | .[] | select(contains("server=::") | not)),
-            (.links.secure // [] | .[] | select(contains("server=::") | not)),
-            (.links.classic // [] | .[] | select(contains("server=::") | not))
-        ] |
-        if length == 0 then
-            ["    " + $DIM + "ссылки отсутствуют" + $NC]
-        else
-            [.[] |
-                (if ($PUB_HOST | length) > 0 then sub("server=[^&]+"; "server=" + $PUB_HOST) else . end) |
-                (if ($PUB_PORT | length) > 0 then sub("port=[0-9]+"; "port=" + $PUB_PORT) else . end) |
-                "    " + $CYAN + . + $NC
-            ]
-        end | .[]
-    ),
+(
+    [
+        (.links.tls // [] | .[] | select(contains("server=::") | not)),
+        (.links.secure // [] | .[] | select(contains("server=::") | not)),
+        (.links.classic // [] | .[] | select(contains("server=::") | not))
+    ] |
+    if length == 0 then
+        ["    \u001b[2mссылки отсутствуют\u001b[0m"]
+    else
+        [.[] |
+            (if ($PUB_HOST | length) > 0 then sub("server=[^&]+"; "server=" + $PUB_HOST) else . end) |
+            (if ($PUB_PORT | length) > 0 then sub("port=[0-9]+"; "port=" + $PUB_PORT) else . end) |
+            "    \u001b[0;36m" + . + "\u001b[0m"
+        ]
+    end | .[]
+),
 
-    ""
-    '
+""
+JQEOF
+
+    echo "$_json" | jq -r \
+        --arg PUB_HOST "${_public_host:-}" \
+        --arg PUB_PORT "${_public_port:-}" \
+        "$_jq_filter"
 }
 
 
@@ -237,9 +236,28 @@ _get_config_param() {
     local _key="$1"
     local _cfg="${DETECTED_CONFIG_PATH:-}"
     [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
-    local _val
-    _val=$(grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -v '^#' | head -1 | sed -E "s/^[[:space:]]*${_key}[[:space:]]*=[[:space:]]*//" | tr -d '"' | xargs)
-    [ -n "$_val" ] && echo "$_val" && return 0
+    local _val _line
+    # Ищем строку где после ключа сразу пробел или = (не буква/цифра/подчёркивание)
+    _line=$(awk -v k="$_key" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            # Проверяем что строка начинается точно с ключа и после него идёт пробел или =
+            if (substr(line, 1, length(k)) == k) {
+                rest = substr(line, length(k) + 1)
+                if (rest ~ /^[[:space:]]*=/) {
+                    sub(/^[[:space:]]*=[[:space:]]*/, "", rest)
+                    gsub(/"/, "", rest)
+                    sub(/[[:space:]]*#.*$/, "", rest)
+                    sub(/[[:space:]]+$/, "", rest)
+                    print rest
+                    exit
+                }
+            }
+        }
+    ' "$_cfg" 2>/dev/null)
+    [ -n "$_line" ] && echo "$_line" && return 0
     return 1
 }
 
@@ -265,21 +283,70 @@ _set_config_param() {
     local _cfg="${DETECTED_CONFIG_PATH:-}"
     [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && { log_error "Конфиг не найден"; return 1; }
 
-    # Раскомментировать и установить
-    if grep -E "^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -q .; then
-        sed -i "/^[[:space:]]*#[[:space:]]*${_key}[[:space:]]*=/c\\${_key} = ${_value}" "$_cfg"
+    # Проверяем закомментированную строку и раскомментируем
+    local _has_commented=false
+    if awk -v k="$_key" '
+        {
+            line = $0; sub(/^[[:space:]]+/, "", line)
+            if (line ~ /^#/) {
+                sub(/^#[[:space:]]*/, "", line)
+                if (substr(line, 1, length(k)) == k) {
+                    rest = substr(line, length(k) + 1)
+                    if (rest ~ /^[[:space:]]*=/) { found=1; exit }
+                }
+            }
+        }
+        END { exit !found }
+    ' "$_cfg" 2>/dev/null; then
+        _has_commented=true
+    fi
+
+    if [ "$_has_commented" = "true" ]; then
+        awk -v k="$_key" -v val="$_value" '
+            !done {
+                line = $0; stripped = line; sub(/^[[:space:]]+/, "", stripped)
+                if (stripped ~ /^#/) {
+                    tmp = stripped; sub(/^#[[:space:]]*/, "", tmp)
+                    if (substr(tmp, 1, length(k)) == k) {
+                        rest = substr(tmp, length(k) + 1)
+                        if (rest ~ /^[[:space:]]*=/) {
+                            print k " = " val
+                            done = 1
+                            next
+                        }
+                    }
+                }
+            }
+            { print }
+        ' "$_cfg" > "${_cfg}.tmp" && mv "${_cfg}.tmp" "$_cfg"
         return 0
     fi
+
     # Обновить существующее значение
     if _toml_has_key "$_key" "$_cfg"; then
-        sed -i "/^[[:space:]]*${_key}[[:space:]]*=/c\\${_key} = ${_value}" "$_cfg"
+        awk -v k="$_key" -v val="$_value" '
+            !done {
+                line = $0; stripped = line; sub(/^[[:space:]]+/, "", stripped)
+                if (substr(stripped, 1, length(k)) == k) {
+                    rest = substr(stripped, length(k) + 1)
+                    if (rest ~ /^[[:space:]]*=/) {
+                        print k " = " val
+                        done = 1
+                        next
+                    }
+                }
+            }
+            { print }
+        ' "$_cfg" > "${_cfg}.tmp" && mv "${_cfg}.tmp" "$_cfg"
         return 0
     fi
+
     # Добавить в секцию
     if [ -n "$_section" ] && _toml_has_section "$_section" "$_cfg"; then
         sed -i "/^\\[${_section}\\]/a ${_key} = ${_value}" "$_cfg"
         return 0
     fi
+
     # Создать секцию
     if [ -n "$_section" ]; then
         printf '\n[%s]\n%s = %s\n' "$_section" "$_key" "$_value" >> "$_cfg"
@@ -311,8 +378,22 @@ _comment_config_param() {
     local _key="$1"
     local _cfg="${DETECTED_CONFIG_PATH:-}"
     [ -z "$_cfg" ] || [ ! -f "$_cfg" ] && return 1
-    if grep -E "^[[:space:]]*${_key}[[:space:]]*=" "$_cfg" 2>/dev/null | grep -vE "^[[:space:]]*#" | grep -q .; then
-        sed -i "/^[[:space:]]*${_key}[[:space:]]*=/s/^/#/" "$_cfg"
+    if _toml_has_key "$_key" "$_cfg"; then
+        awk -v k="$_key" '
+            {
+                line = $0
+                stripped = line
+                sub(/^[[:space:]]+/, "", stripped)
+                if (substr(stripped, 1, length(k)) == k) {
+                    rest = substr(stripped, length(k) + 1)
+                    if (rest ~ /^[[:space:]]*=/) {
+                        print "#" line
+                        next
+                    }
+                }
+                print line
+            }
+        ' "$_cfg" > "${_cfg}.tmp" && mv "${_cfg}.tmp" "$_cfg"
         return 0
     fi
     return 1
@@ -647,7 +728,18 @@ _toml_has_section() {
 
 _toml_has_key() {
     local _key="$1" _file="$2"
-    grep -qE "^[[:space:]]*${_key}[[:space:]]*=" "$_file" 2>/dev/null
+    awk -v k="$_key" '
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (substr(line, 1, length(k)) == k) {
+                rest = substr(line, length(k) + 1)
+                if (rest ~ /^[[:space:]]*=/) { found=1; exit }
+            }
+        }
+        END { exit !found }
+    ' "$_file" 2>/dev/null
 }
 
 _toml_safe_set() {
