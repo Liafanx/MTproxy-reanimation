@@ -140,8 +140,24 @@ show_proxy_links() {
     echo ""
 
     if ! command -v jq &>/dev/null; then
-        log_error "jq не установлен. Установите: apt install jq / yum install jq"
-        return 1
+        log_info "jq не установлен, устанавливаю..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq jq
+        elif command -v yum &>/dev/null; then
+            yum install -y -q jq
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q jq
+        elif command -v apk &>/dev/null; then
+            apk add --no-cache jq
+        else
+            log_error "Не удалось установить jq автоматически. Установите вручную: apt install jq"
+            return 1
+        fi
+        if ! command -v jq &>/dev/null; then
+            log_error "jq не удалось установить"
+            return 1
+        fi
+        log_success "jq установлен"
     fi
 
     local _api_port _public_host _public_port
@@ -907,6 +923,7 @@ install_dependencies() {
     local _missing=()
     command -v nft &>/dev/null || _missing+=("nftables")
     command -v curl &>/dev/null || _missing+=("curl")
+    command -v jq &>/dev/null || _missing+=("jq")
     if [ ${#_missing[@]} -gt 0 ]; then
         log_info "Установка: ${_missing[*]}"
         if command -v apt-get &>/dev/null; then
