@@ -401,10 +401,9 @@ _comment_config_param() {
 
 _telemt_param_status() {
     local _key="$1"
-    local _val
-    if _val=$(_get_config_param "$_key"); then
-        _val="${_val#\"}"
-        _val="${_val%\"}"
+    local _val=""
+    _val=$(_get_config_param "$_key" 2>/dev/null) || true
+    if [ -n "$_val" ]; then
         echo -e "${GREEN}${_val}${NC}"
     else
         echo -e "${DIM}отключен${NC}"
