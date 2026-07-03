@@ -268,6 +268,25 @@ _set_config_param() {
     echo "${_key} = ${_value}" >> "$_cfg"
 }
 
+_validate_mss_value() {
+    local _val="$1"
+    case "$_val" in
+        extreme-low|tspu|2in8)
+            return 0 ;;
+    esac
+    if [[ "$_val" =~ ^[0-9]+$ ]]; then
+        if [ "$_val" -ge 88 ] && [ "$_val" -le 4096 ]; then
+            return 0
+        else
+            log_error "Число должно быть в диапазоне 88..4096 (получено: $_val)"
+            return 1
+        fi
+    fi
+    log_error "Некорректное значение: $_val"
+    log_info "Допустимо: extreme-low | tspu | 2in8 | число 88..4096"
+    return 1
+}
+
 _comment_config_param() {
     local _key="$1"
     local _cfg="${DETECTED_CONFIG_PATH:-}"
@@ -283,6 +302,8 @@ _telemt_param_status() {
     local _key="$1"
     local _val
     if _val=$(_get_config_param "$_key"); then
+        _val="${_val#\"}"
+        _val="${_val%\"}"
         echo -e "${GREEN}${_val}${NC}"
     else
         echo -e "${DIM}отключен${NC}"
@@ -340,7 +361,7 @@ _prompt_restart_telemt() {
 show_telemt_params_menu() {
     while true; do
         show_header
-        echo -e "  ${BOLD}Управление параметрами Telemt${NC}"; echo ""
+        echo -e "  ${BOLD}Управление параметрами Telemt (MSS)${NC}"; echo ""
 
         if [ -z "$DETECTED_CONFIG_PATH" ] || [ ! -f "$DETECTED_CONFIG_PATH" ]; then
             log_error "Конфиг Telemt не найден"
@@ -349,100 +370,85 @@ show_telemt_params_menu() {
 
         echo -e "  ${BOLD}Конфиг:${NC} ${DETECTED_CONFIG_PATH}"; echo ""
 
-        local _mss_val _mssbulk_val _synlim_val
+        local _mss_val _mssbulk_val
         _mss_val=$(_telemt_param_status "client_mss")
-        _mssbulk_val=$(_telemt_param_status "mss_bulk")
-        _synlim_val=$(_telemt_param_status "synlimit")
+        _mssbulk_val=$(_telemt_param_status "client_mss_bulk")
 
         echo -e "  ${BOLD}Текущие значения:${NC}"
-        echo -e "    client_mss: ${_mss_val}"
-        echo -e "    mss_bulk:   ${_mssbulk_val}"
-        echo -e "    synlimit:   ${_synlim_val}"
+        echo -e "    client_mss:      ${_mss_val}"
+        echo -e "    client_mss_bulk: ${_mssbulk_val}"
         echo ""
 
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
-            echo -e "  ${YELLOW}⚠ Smart By-MEKO активен — client_mss и synlimit не рекомендуются${NC}"
+            echo -e "  ${YELLOW}⚠ Smart By-MEKO активен — client_mss не рекомендуется${NC}"
             echo ""
         fi
 
+        echo -e "  ${DIM}Допустимые значения MSS:${NC}"
+        echo -e "  ${DIM}  Пресеты: extreme-low (88), tspu (92), 2in8 (256)${NC}"
+        echo -e "  ${DIM}  Число:   88..4096 (вводится как строка в конфиге)${NC}"
+        echo ""
+
         echo -e "  ${DIM}[1]${NC} Установить client_mss"
-        echo -e "  ${DIM}[2]${NC} Установить mss_bulk"
-        echo -e "  ${DIM}[3]${NC} Установить synlimit"
-        echo -e "  ${DIM}[4]${NC} Отключить client_mss"
-        echo -e "  ${DIM}[5]${NC} Отключить mss_bulk"
-        echo -e "  ${DIM}[6]${NC} Отключить synlimit"
-        echo -e "  ${DIM}[7]${NC} Отключить все три параметра"
-        echo -e "  ${DIM}[8]${NC} Включить MSS (client_mss=92 + mss_bulk=1200)"
+        echo -e "  ${DIM}[2]${NC} Установить client_mss_bulk"
+        echo -e "  ${DIM}[3]${NC} Отключить client_mss"
+        echo -e "  ${DIM}[4]${NC} Отключить client_mss_bulk"
+        echo -e "  ${DIM}[5]${NC} Отключить оба параметра"
+        echo -e "  ${DIM}[6]${NC} Пресет: client_mss=\"tspu\" + client_mss_bulk=\"1400\""
         echo -e "  ${DIM}[0]${NC} Назад"; echo ""
         echo -en "  Выбор: "; local _choice; read -r _choice
 
         case "$_choice" in
             1)
-                echo -en "  client_mss [92]: "; local _v; read -r _v
-                [ -z "$_v" ] && _v="92"
-                if [[ "$_v" =~ ^[0-9]+$ ]]; then
-                    _set_config_param "client_mss" "$_v" "server"
-                    log_success "client_mss = $_v"
+                echo ""
+                echo -e "  ${DIM}Пресеты: extreme-low | tspu | 2in8${NC}"
+                echo -e "  ${DIM}Или число: 88..4096${NC}"
+                echo -en "  client_mss [tspu]: "; local _v; read -r _v
+                [ -z "$_v" ] && _v="tspu"
+                if _validate_mss_value "$_v"; then
+                    _set_config_param "client_mss" "\"${_v}\"" "server"
+                    log_success "client_mss = \"$_v\""
                     _prompt_restart_telemt
-                else
-                    log_error "Некорректное значение"
                 fi ;;
             2)
-                echo -en "  mss_bulk [1200]: "; local _v; read -r _v
-                [ -z "$_v" ] && _v="1200"
-                if [[ "$_v" =~ ^[0-9]+$ ]]; then
-                    _set_config_param "mss_bulk" "$_v" "server"
-                    log_success "mss_bulk = $_v"
+                echo ""
+                echo -e "  ${DIM}Пресеты: extreme-low | tspu | 2in8${NC}"
+                echo -e "  ${DIM}Или число: 88..4096${NC}"
+                echo -en "  client_mss_bulk [1400]: "; local _v; read -r _v
+                [ -z "$_v" ] && _v="1400"
+                if _validate_mss_value "$_v"; then
+                    _set_config_param "client_mss_bulk" "\"${_v}\"" "server"
+                    log_success "client_mss_bulk = \"$_v\""
                     _prompt_restart_telemt
-                else
-                    log_error "Некорректное значение"
                 fi ;;
             3)
-                echo -en "  synlimit [54]: "; local _v; read -r _v
-                [ -z "$_v" ] && _v="54"
-                if [[ "$_v" =~ ^[0-9]+$ ]]; then
-                    _set_config_param "synlimit" "$_v" "server"
-                    log_success "synlimit = $_v"
-                    _prompt_restart_telemt
-                else
-                    log_error "Некорректное значение"
-                fi ;;
-            4)
                 if _comment_config_param "client_mss"; then
                     log_success "client_mss отключён"
                     _prompt_restart_telemt
                 else
                     log_info "client_mss уже отключён или отсутствует"
                 fi ;;
+            4)
+                if _comment_config_param "client_mss_bulk"; then
+                    log_success "client_mss_bulk отключён"
+                    _prompt_restart_telemt
+                else
+                    log_info "client_mss_bulk уже отключён или отсутствует"
+                fi ;;
             5)
-                if _comment_config_param "mss_bulk"; then
-                    log_success "mss_bulk отключён"
-                    _prompt_restart_telemt
-                else
-                    log_info "mss_bulk уже отключён или отсутствует"
-                fi ;;
-            6)
-                if _comment_config_param "synlimit"; then
-                    log_success "synlimit отключён"
-                    _prompt_restart_telemt
-                else
-                    log_info "synlimit уже отключён или отсутствует"
-                fi ;;
-            7)
                 local _any=false
                 _comment_config_param "client_mss" && _any=true
-                _comment_config_param "mss_bulk" && _any=true
-                _comment_config_param "synlimit" && _any=true
+                _comment_config_param "client_mss_bulk" && _any=true
                 if [ "$_any" = "true" ]; then
-                    log_success "Все параметры отключены"
+                    log_success "Оба параметра отключены"
                     _prompt_restart_telemt
                 else
-                    log_info "Все параметры уже отключены"
+                    log_info "Оба параметра уже отключены"
                 fi ;;
-            8)
-                _set_config_param "client_mss" "92" "server"
-                _set_config_param "mss_bulk" "1200" "server"
-                log_success "client_mss = 92, mss_bulk = 1200"
+            6)
+                _set_config_param "client_mss" '"tspu"' "server"
+                _set_config_param "client_mss_bulk" '"1400"' "server"
+                log_success "client_mss = \"tspu\", client_mss_bulk = \"1400\""
                 _prompt_restart_telemt ;;
             0|"") return ;;
         esac
@@ -2527,8 +2533,7 @@ show_header() {
         local _mss_s _mssbulk_s _synlim_s
         _mss_s=$(_telemt_param_status "client_mss")
         _mssbulk_s=$(_telemt_param_status "mss_bulk")
-        _synlim_s=$(_telemt_param_status "synlimit")
-        echo -e "  ${BOLD}client_mss:${NC}    ${_mss_s}  ${BOLD}mss_bulk:${NC} ${_mssbulk_s}  ${BOLD}synlimit:${NC} ${_synlim_s}"
+        echo -e "  ${BOLD}client_mss:${NC}    ${_mss_s}  ${BOLD}client_mss_bulk:${NC} ${_mssbulk_s}"
     fi
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
@@ -2556,7 +2561,7 @@ show_main_menu() {
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
         echo -e "  ${CYAN}[m]${NC}  Оптимизация системы By-MEKO"
         echo -e "  ${CYAN}[l]${NC}  Ссылки прокси (через API Telemt)"
-        echo -e "  ${CYAN}[p]${NC}  Параметры Telemt (MSS / synlimit)"
+        echo -e "  ${CYAN}[p]${NC}  Параметры Telemt (MSS)"
         echo -e "  ${CYAN}[x]${NC}  Проверка ограничений сервера (censorship)"
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
             echo -e "  ${CYAN}[c]${NC}  Настройки Smart режима"
