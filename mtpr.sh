@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.1.3
+#  MTproxy-reanimation v1.1.4
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.1.3"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
+VERSION="1.1.4"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -135,7 +135,7 @@ get_proxy_links() {
 
 show_proxy_links() {
     echo ""
-    echo -e "  ${BOLD}Ссылки прокси (через API Telemt)${NC}"
+    echo -e "  ${BOLD}Ссылки прокси, количество уникальных подключений и трафик сессии telemt (через API Telemt)${NC}"
     echo -e "  ${DIM}────────────────────────────────────────${NC}"
     echo ""
 
@@ -198,11 +198,23 @@ show_proxy_links() {
     # Готовим jq-фильтр как heredoc чтобы избежать проблем с кавычками
     local _jq_filter
     read -r -d '' _jq_filter << 'JQEOF' || true
+def human_bytes:
+    if . >= 1073741824 then
+        ((. / 1073741824 * 100 | floor) / 100 | tostring) + " GB"
+    elif . >= 1048576 then
+        ((. / 1048576 * 100 | floor) / 100 | tostring) + " MB"
+    elif . >= 1024 then
+        ((. / 1024 * 100 | floor) / 100 | tostring) + " KB"
+    else
+        (. | tostring) + " B"
+    end;
+
 .data[] |
 "  \u001b[1m" + .username + "\u001b[0m" +
 "  [" + (if .enabled then "\u001b[0;32mвкл\u001b[0m" else "\u001b[0;31mвыкл\u001b[0m" end) + "]" +
 "  подключений: " + (.current_connections // 0 | tostring) +
-"  уник. IP: " + (.active_unique_ips // 0 | tostring),
+"  уник. IP: " + (.active_unique_ips // 0 | tostring) +
+"  трафик: \u001b[0;33m" + ((.total_octets // 0) | human_bytes) + "\u001b[0m",
 
 (
     [
@@ -2688,7 +2700,7 @@ show_main_menu() {
         echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
         echo -e "  ${CYAN}[m]${NC}  Оптимизация системы By-MEKO"
-        echo -e "  ${CYAN}[l]${NC}  Ссылки прокси (через API Telemt)"
+        echo -e "  ${CYAN}[l]${NC}  Ссылки прокси, количество уникальных подключений и трафик сессии telemt (через API Telemt)"
         echo -e "  ${CYAN}[p]${NC}  Параметры Telemt (MSS)"
         echo -e "  ${CYAN}[x]${NC}  Проверка ограничений сервера (censorship)"
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
