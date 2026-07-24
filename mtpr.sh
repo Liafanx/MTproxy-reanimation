@@ -1972,6 +1972,7 @@ zapret2_download_bundle() {
 }
 
 zapret2_write_conf() {
+    local _port="${SERVER_PORT:-443}"
     mkdir -p "$ZAPRET2_ETC_DIR"
     cat > "$ZAPRET2_CONF" << EOF
 --qnum ${ZAPRET2_QNUM}
@@ -1979,21 +1980,21 @@ zapret2_write_conf() {
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-lib.lua
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-antidpi.lua
 --lua-init=@${ZAPRET2_LUA_DIR}/telemt.lua
---filter-tcp=443
+--filter-tcp=${_port}
 --out-range=${ZAPRET2_OUT_RANGE}
 --in-range=${ZAPRET2_IN_RANGE}
 --payload-disable=all
 --lua-desync=lets_resend
 --new
 EOF
-    log_success "Конфиг записан: ${ZAPRET2_CONF}"
+    log_success "Конфиг записан: ${ZAPRET2_CONF} (порт=${_port})"
 }
 
 zapret2_write_lua() {
     mkdir -p "$ZAPRET2_LUA_DIR"
     cat > "$ZAPRET2_LUA" << LUAEOF
--- Zapret2 MTProto fix by CHIRON
--- Серверный обход ТСПУ: disorder + badsum + window control
+-- Zapret2 MTProto fix by CHKRON
+-- Серверный обход: disorder + badsum + window control
 -- https://github.com/Liafanx/MTproxy-reanimation
 
 function lets_resend(ctx, desync)
@@ -2072,6 +2073,12 @@ EOF
 zapret2_apply_nft() {
     local _table="${ZAPRET2_NFT_TABLE}"
     local _fwmark="${ZAPRET2_FWMARK}"
+    local _port="${SERVER_PORT:-443}"
+
+    if [ -z "$_port" ]; then
+        log_error "Порт не задан — невозможно применить NFT правила zapret2"
+        return 1
+    fi
 
     nft delete table ip "$_table" 2>/dev/null || true
 
@@ -2081,12 +2088,12 @@ zapret2_apply_nft() {
     nft "add rule ip $_table predefrag meta mark and $_fwmark != 0x00000000 notrack"
 
     nft "add chain ip $_table postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
-    nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport 443 queue flags bypass to ${ZAPRET2_QNUM}"
+    nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport ${_port} queue flags bypass to ${ZAPRET2_QNUM}"
 
     nft "add chain ip $_table prerouting { type filter hook prerouting priority mangle; policy accept; }"
-    nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport 443 queue flags bypass to ${ZAPRET2_QNUM}"
+    nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport ${_port} queue flags bypass to ${ZAPRET2_QNUM}"
 
-    log_success "NFT таблица ${_table} применена (qnum=${ZAPRET2_QNUM})"
+    log_success "NFT таблица ${_table} применена (порт=${_port} qnum=${ZAPRET2_QNUM})"
 }
 
 zapret2_remove_nft() {
@@ -2146,6 +2153,25 @@ zapret2_install() {
     [[ "$_yn" =~ ^[nN]$ ]] && { log_info "Отменено"; return 0; }
 
     zapret2_download_bundle || return 1
+
+    # Zapret2 fix заменяет SYN limiter — отключаем его если активен
+    if [ "${NFT_SERVICE_ENABLED:-false}" = "true" ] || nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null 2>&1; then
+        echo ""
+        echo -e "  ${YELLOW}⚠ SYN limiter активен.${NC}"
+        echo -e "  ${DIM}Zapret2 fix работает на уровне пакетов и заменяет SYN limiter.${NC}"
+        echo -e "  ${DIM}Использование обоих одновременно не рекомендуется.${NC}"
+        echo ""
+        echo -en "  ${BOLD}Отключить SYN limiter? [Y/n]:${NC} "
+        local _yn_syn; read -r _yn_syn
+        if [[ ! "$_yn_syn" =~ ^[nN]$ ]]; then
+            remove_nft_rules 2>/dev/null || true
+            remove_service 2>/dev/null || true
+            log_success "SYN limiter отключён"
+        else
+            log_warn "SYN limiter оставлен — возможны конфликты"
+        fi
+    fi
+
     zapret2_write_conf
     zapret2_write_lua
     zapret2_write_service
@@ -2237,6 +2263,7 @@ show_zapret2_menu() {
             echo -e "    win SYN+ACK:   ${ZAPRET2_WIN_SYNACK}      ${DIM}(TCP window в SYN+ACK — дробит ClientHello)${NC}"
             echo -e "    win ACK:       ${ZAPRET2_WIN_ACK}        ${DIM}(TCP window в пустых ACK — усиливает дробление)${NC}"
             echo -e "    NFQUEUE num:   ${ZAPRET2_QNUM}       ${DIM}(номер очереди NFQUEUE)${NC}"
+            echo -e "    Порт:          ${SERVER_PORT:-${DIM}не задан${NC}}       ${DIM}(берётся из настроек mtpr)${NC}"
             echo ""
 
             local _svc_status="${DIM}не установлена${NC}"
@@ -3138,10 +3165,16 @@ full_uninstall() {
 
     # Удаление zapret2 fix
     if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
-        zapret2_stop 2>/dev/null || true
+        # Останавливаем сервис и удаляем NFT
+        systemctl stop "$ZAPRET2_SERVICE" 2>/dev/null || true
         systemctl disable "$ZAPRET2_SERVICE" 2>/dev/null || true
         rm -f "/etc/systemd/system/${ZAPRET2_SERVICE}"
         systemctl daemon-reload 2>/dev/null || true
+
+        # Удаляем NFT таблицу zapret2
+        zapret2_remove_nft
+
+        # Удаляем файлы
         rm -f "$ZAPRET2_CONF"
         rm -f "$ZAPRET2_LUA"
         rm -rf "$ZAPRET2_DIR"
@@ -3830,7 +3863,72 @@ first_run_wizard() {
         log_success "Other Action: ${NFT_OTHER_ACTION}"
     fi
 
-    save_settings
+save_settings
+
+    # Zapret2 MTProto fix by CHIRON
+    echo ""
+    echo -e "  ${DIM}────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix by CHKRON${NC}"
+    echo ""
+    echo -e "  ${DIM}Серверный обход для MTProto прокси.${NC}"
+    echo -e "  ${DIM}Работает на уровне TCP пакетов — разрезает и перемешивает${NC}"
+    echo -e "  ${DIM}ClientHello так, что его нельзя проанализировать.${NC}"
+    echo -e "  ${DIM}Клиент ничего не устанавливает — всё работает на сервере.${NC}"
+    echo ""
+    echo -e "  ${DIM}Метод: disorder + badsum + TCP window control${NC}"
+    echo -e "  ${DIM}Включает автоматический iOS bypass по TCP fingerprint.${NC}"
+    echo ""
+    if [ "${NFT_MODE:-classic}" = "smart" ]; then
+        echo -e "  ${YELLOW}⚠ Если включить zapret2 fix, SYN limiter (Smart By-MEKO)${NC}"
+        echo -e "  ${YELLOW}  будет отключён — zapret2 работает на другом уровне${NC}"
+        echo -e "  ${YELLOW}  и заменяет его.${NC}"
+        echo ""
+    fi
+    echo -en "  ${BOLD}Установить Zapret2 MTProto fix? [y/N]:${NC} "
+    local _yn_zapret2; read -r _yn_zapret2
+    if [[ "$_yn_zapret2" =~ ^[yY]$ ]]; then
+        # Отключаем SYN limiter если был выбран
+        if [ "${NFT_MODE:-classic}" = "smart" ] || [ "${NFT_MODE:-classic}" = "classic" ]; then
+            log_info "SYN limiter будет отключён (zapret2 fix его заменяет)"
+            NFT_SERVICE_ENABLED="false"
+            save_settings
+        fi
+
+        zapret2_download_bundle
+        if [ $? -eq 0 ]; then
+            zapret2_write_conf
+            zapret2_write_lua
+            zapret2_write_service
+            zapret2_apply_nft
+            systemctl enable "$ZAPRET2_SERVICE" 2>/dev/null || true
+            systemctl start "$ZAPRET2_SERVICE" 2>/dev/null || true
+            sleep 1
+            if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null; then
+                ZAPRET2_APPLIED="true"
+                ZAPRET2_SERVICE_ENABLED="true"
+                save_settings
+                log_success "Zapret2 MTProto fix установлен и запущен"
+                echo ""
+                echo -e "  ${BOLD}Параметры по умолчанию:${NC}"
+                echo -e "    out-range:   ${ZAPRET2_OUT_RANGE}"
+                echo -e "    split len:   ${ZAPRET2_SPLIT_LEN}"
+                echo -e "    win SYN+ACK: ${ZAPRET2_WIN_SYNACK}"
+                echo -e "    win ACK:     ${ZAPRET2_WIN_ACK}"
+                echo -e "    порт:        ${SERVER_PORT:-443}"
+                echo ""
+                echo -e "  ${DIM}Параметры можно изменить позже: меню → [z] → Настройки${NC}"
+            else
+                log_error "zapret2 не запустился"
+                journalctl -u "$ZAPRET2_SERVICE" -n 5 --no-pager 2>/dev/null || true
+            fi
+        else
+            log_error "Не удалось скачать zapret2 — пропускаю"
+            log_info "Можно установить позже из меню: [z] Zapret2 MTProto fix"
+        fi
+    else
+        log_info "Zapret2 fix не установлен. Можно включить позже: меню → [z]"
+    fi
 
     # Тюнинг
     echo ""
@@ -3882,17 +3980,25 @@ first_run_wizard() {
         meko_opt_apply
     fi
 
-    # NFT правила
-    echo ""
-    echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
-    local _yn_nft; read -r _yn_nft
-    if [[ ! "$_yn_nft" =~ ^[nN] ]]; then apply_nft_rules || true; fi
+    # NFT правила (SYN limiter — только если zapret2 fix не установлен)
+    if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+        log_info "SYN limiter NFT пропущен — zapret2 fix уже активен"
+    else
+        echo ""
+        echo -en "  ${BOLD}Применить NFT правила сейчас? [Y/n]:${NC} "
+        local _yn_nft; read -r _yn_nft
+        if [[ ! "$_yn_nft" =~ ^[nN] ]]; then apply_nft_rules || true; fi
+    fi
 
-    # Служба
-    echo ""
-    echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
-    local _yn_svc; read -r _yn_svc
-    if [[ ! "$_yn_svc" =~ ^[nN] ]]; then install_service || true; fi
+    # Служба SYN limiter (только если zapret2 fix не установлен)
+    if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+        log_info "Служба SYN limiter пропущена — zapret2 fix уже активен"
+    else
+        echo ""
+        echo -en "  ${BOLD}Установить как службу (автозапуск при загрузке)? [Y/n]:${NC} "
+        local _yn_svc; read -r _yn_svc
+        if [[ ! "$_yn_svc" =~ ^[nN] ]]; then install_service || true; fi
+    fi
 
     echo ""; log_success "Настройка завершена!"; echo ""
     echo -e "  ${DIM}Запускайте ${CYAN}mtpr${DIM} в любое время для управления${NC}"; echo ""
