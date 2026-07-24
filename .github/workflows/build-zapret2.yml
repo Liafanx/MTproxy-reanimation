@@ -40,8 +40,10 @@ jobs:
           FROM debian:12-slim AS builder
 
           RUN apt-get update -qq && apt-get install -y -qq \
-              build-essential git ca-certificates \
-              libz-dev liblua5.3-dev lua5.3 \
+              build-essential git ca-certificates pkg-config \
+              libz-dev libcap-dev \
+              luajit libluajit-5.1-dev \
+              libnetfilter-queue-dev libmnl-dev \
               && rm -rf /var/lib/apt/lists/*
 
           RUN cd /tmp && \
@@ -61,8 +63,8 @@ jobs:
               echo "zapret2 bundle $(date -u +%Y-%m-%d)" > /out/opt/zapret2/version && \
               chmod +x /out/opt/zapret2/bin/*
 
-          # Проверка что бинарник запускается
           RUN /out/opt/zapret2/bin/nfqws2 --version || true
+          RUN ldd /out/opt/zapret2/bin/nfqws2 || true
 
           FROM scratch AS artifact
           COPY --from=builder /out /
