@@ -77,10 +77,10 @@ ZAPRET2_DIR="/opt/zapret2"
 ZAPRET2_ETC_DIR="/etc/zapret2"
 ZAPRET2_BIN="${ZAPRET2_DIR}/bin/nfqws2"
 ZAPRET2_LUA_DIR="${ZAPRET2_DIR}/lua"
-ZAPRET2_CONF="${ZAPRET2_ETC_DIR}/telemt.conf"
-ZAPRET2_LUA="${ZAPRET2_LUA_DIR}/telemt.lua"
+ZAPRET2_CONF="${ZAPRET2_ETC_DIR}/mtproto.conf"
+ZAPRET2_LUA="${ZAPRET2_LUA_DIR}/mtproto.lua"
 ZAPRET2_SERVICE="mtpr-zapret2.service"
-ZAPRET2_NFT_TABLE="telemt"
+ZAPRET2_NFT_TABLE="MTProto"
 ZAPRET2_FWMARK="0x40000000"
 ZAPRET2_QNUM="200"
 ZAPRET2_OUT_RANGE="-n5"
@@ -1981,7 +1981,7 @@ zapret2_write_conf() {
 --server
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-lib.lua
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-antidpi.lua
---lua-init=@${ZAPRET2_LUA_DIR}/telemt.lua
+--lua-init=@${ZAPRET2_LUA_DIR}/mtproto.lua
 --filter-tcp=${_port}
 --out-range=${ZAPRET2_OUT_RANGE}
 --in-range=${ZAPRET2_IN_RANGE}
@@ -1996,7 +1996,7 @@ zapret2_write_lua() {
     mkdir -p "$ZAPRET2_LUA_DIR"
     cat > "$ZAPRET2_LUA" << LUAEOF
 -- Zapret2 MTProto fix by CHKRON
--- Серверный обход: disorder + badsum + window control
+-- Серверный обход ТСПУ: disorder + badsum + window control
 -- https://github.com/Liafanx/MTproxy-reanimation
 
 function lets_resend(ctx, desync)
@@ -2051,15 +2051,49 @@ LUAEOF
 }
 
 zapret2_write_service() {
+    # Пишем скрипт запуска который применяет NFT и запускает nfqws2
+    local _nft_script="/usr/local/sbin/mtpr-zapret2-start.sh"
+    cat > "$_nft_script" << NFTSTART
+#!/bin/bash
+set -e
+
+TABLE="${ZAPRET2_NFT_TABLE}"
+FWMARK="${ZAPRET2_FWMARK}"
+PORT="${SERVER_PORT:-443}"
+QNUM="${ZAPRET2_QNUM}"
+
+# Удаляем старую таблицу если есть
+nft delete table ip "\$TABLE" 2>/dev/null || true
+
+# Применяем NFT правила
+nft add table ip "\$TABLE"
+
+nft "add chain ip \$TABLE predefrag { type filter hook output priority -401; policy accept; }"
+nft "add rule ip \$TABLE predefrag meta mark and \$FWMARK != 0x00000000 notrack"
+
+nft "add chain ip \$TABLE postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
+nft "add rule ip \$TABLE postrouting meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT queue flags bypass to \$QNUM"
+
+nft "add chain ip \$TABLE prerouting { type filter hook prerouting priority mangle; policy accept; }"
+nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT queue flags bypass to \$QNUM"
+
+echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM)"
+
+# Запускаем nfqws2
+exec ${ZAPRET2_BIN} @${ZAPRET2_CONF}
+NFTSTART
+    chmod +x "$_nft_script"
+
     cat > "/etc/systemd/system/${ZAPRET2_SERVICE}" << EOF
 [Unit]
-Description=MTproxy-reanimation zapret2 MTProto fix by CHKRON
-After=network-online.target
+Description=MTproxy-reanimation Zapret2 MTProto fix by CHKRON
+After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${ZAPRET2_BIN} @${ZAPRET2_CONF}
+ExecStart=$_nft_script
+ExecStop=/usr/sbin/nft delete table ip ${ZAPRET2_NFT_TABLE}
 Restart=on-failure
 RestartSec=2
 StandardOutput=journal
@@ -2069,7 +2103,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    log_success "Служба создана: ${ZAPRET2_SERVICE}"
+    log_success "Служба создана: ${ZAPRET2_SERVICE} (с автозапуском NFT)"
 }
 
 zapret2_apply_nft() {
@@ -2108,7 +2142,6 @@ zapret2_start() {
         log_error "Бинарник nfqws2 не найден: ${ZAPRET2_BIN}"
         return 1
     fi
-    zapret2_apply_nft
     systemctl enable "$ZAPRET2_SERVICE" 2>/dev/null || true
     systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
     sleep 1
@@ -2124,7 +2157,7 @@ zapret2_start() {
 zapret2_stop() {
     systemctl stop "$ZAPRET2_SERVICE" 2>/dev/null || true
     systemctl disable "$ZAPRET2_SERVICE" 2>/dev/null || true
-    zapret2_remove_nft
+    nft delete table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
     log_success "zapret2 остановлен"
 }
 
@@ -2288,6 +2321,10 @@ show_zapret2_menu() {
         fi
 
         echo -e "  ${GREEN}[1]${NC}  Установить / переустановить zapret2"
+        if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null 2>&1 || \
+           systemctl is-active mtpr-syn-limit.service &>/dev/null 2>&1; then
+            echo -e "  ${YELLOW}  ⚠ SYN limiter активен — zapret2 его заменит${NC}"
+        fi        
         if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
             echo -e "  ${CYAN}[2]${NC}  Перезапустить zapret2"
             echo -e "  ${CYAN}[3]${NC}  Остановить zapret2"
@@ -2358,22 +2395,34 @@ show_zapret2_settings_menu() {
         echo -e "  ${DIM}Изменение параметров автоматически перезаписывает конфиг и Lua,${NC}"
         echo -e "  ${DIM}затем перезапускает zapret2.${NC}"
         echo ""
-        echo -e "  ${DIM}[1]${NC} out-range        [${ZAPRET2_OUT_RANGE}]    ${DIM}— сколько исходящих пакетов обрабатывать${NC}"
-        echo -e "        ${DIM}Рекомендуемые: -n3 .. -n8. Меньше = быстрее отпускает,${NC}"
-        echo -e "        ${DIM}больше = дольше давит window (лучше дурит).${NC}"
-        echo -e "        ${DIM}Если не подключается: увеличить. Если тормозит upload: уменьшить.${NC}"
+        echo -e "  ${DIM}[1]${NC} out-range  [${ZAPRET2_OUT_RANGE}]"
+        echo -e "        ${DIM}Сколько исходящих пакетов сервера обрабатывает Lua.${NC}"
+        echo -e "        ${DIM}Формат: -<режим><число>  Примеры: -n5  -s1  -d2${NC}"
+        echo -e "        ${DIM}Режимы:${NC}"
+        echo -e "        ${DIM}  a  — always (всегда, не нужно число)${NC}"
+        echo -e "        ${DIM}  x  — never (никогда, не нужно число)${NC}"
+        echo -e "        ${DIM}  n  — по числу пакетов (-n5 = первые 5 пакетов)${NC}"
+        echo -e "        ${DIM}  d  — по числу пакетов с payload (-d1 = до 1-го с данными)${NC}"
+        echo -e "        ${DIM}  b  — по байтам payload (-b1000 = до 1000 байт)${NC}"
+        echo -e "        ${DIM}  s  — по TCP rseq начала пакета (-s1 = пока rseq < 1)${NC}"
+        echo -e "        ${DIM}  p  — по TCP rseq конца пакета (-p1400 = пока top < 1400)${NC}"
+        echo -e "        ${DIM}Рекомендуемые: -n5 -n6 -n8 -s1${NC}"
+        echo -e "        ${DIM}Меньше = быстрее отпускает, больше = дольше давит окно${NC}"
         echo ""
-        echo -e "  ${DIM}[2]${NC} split len        [${ZAPRET2_SPLIT_LEN}]       ${DIM}— размер частей при разрезке${NC}"
-        echo -e "        ${DIM}Рекомендуемые: 100..400. Меньше = быстрее ретрансмиссия,${NC}"
-        echo -e "        ${DIM}но слишком малый может не дурить. 512+ может ломать.${NC}"
+        echo -e "  ${DIM}[2]${NC} split len  [${ZAPRET2_SPLIT_LEN}]"
+        echo -e "        ${DIM}Размер каждой части при разрезании первого ClientHello.${NC}"
+        echo -e "        ${DIM}Рекомендуемые: 100..400. Меньше = быстрее ретрансмит, больше = лучше дурит DPI.${NC}"
+        echo -e "        ${DIM}⚠ 512 и выше ломает подключение на большинстве серверов.${NC}"
         echo ""
-        echo -e "  ${DIM}[3]${NC} win SYN+ACK      [${ZAPRET2_WIN_SYNACK}]      ${DIM}— TCP window в SYN+ACK${NC}"
-        echo -e "        ${DIM}Определяет размер первого пакета от клиента.${NC}"
-        echo -e "        ${DIM}1400 = типичный MSS, ClientHello гарантированно дробится.${NC}"
+        echo -e "  ${DIM}[3]${NC} win SYN+ACK  [${ZAPRET2_WIN_SYNACK}]"
+        echo -e "        ${DIM}TCP window в SYN+ACK от сервера клиенту.${NC}"
+        echo -e "        ${DIM}Клиент дробит ClientHello чтобы вписаться в это окно.${NC}"
+        echo -e "        ${DIM}Рекомендуемые: 1400 (один MSS). Меньше → агрессивнее дробление.${NC}"
         echo ""
-        echo -e "  ${DIM}[4]${NC} win ACK          [${ZAPRET2_WIN_ACK}]        ${DIM}— TCP window в пустых ACK${NC}"
-        echo -e "        ${DIM}Усиливает дробление. 10 = проверено.${NC}"
-        echo -e "        ${DIM}⚠ Увеличение может сломать подключение!${NC}"
+        echo -e "  ${DIM}[4]${NC} win ACK  [${ZAPRET2_WIN_ACK}]"
+        echo -e "        ${DIM}TCP window в пустых ACK от сервера до получения первого payload.${NC}"
+        echo -e "        ${DIM}Удерживает клиента от быстрой отправки всего ClientHello.${NC}"
+        echo -e "        ${DIM}Рекомендуемые: 10. ⚠ Повышение выше ломает подключение.${NC}"
         echo ""
         echo -e "  ${DIM}[5]${NC} in-range         [${ZAPRET2_IN_RANGE}]    ${DIM}— диапазон входящих${NC}"
         echo -e "  ${DIM}[6]${NC} NFQUEUE num      [${ZAPRET2_QNUM}]       ${DIM}— номер очереди${NC}"
@@ -3858,6 +3907,7 @@ first_run_wizard() {
         fi
     fi
 
+
     # Пресет NFT
     echo ""; echo -e "  ${BOLD}Режим NFT SYN Limiter:${NC}"; echo ""
     echo -e "  ${GREEN}[s]${NC} ${BOLD}★ Smart By-MEKO${NC} ${DIM}(рекомендуется)${NC}"
@@ -3902,7 +3952,7 @@ first_run_wizard() {
         log_success "Other Action: ${NFT_OTHER_ACTION}"
     fi
 
-save_settings
+    save_settings
 
     # Zapret2 MTProto fix by CHIRON
     echo ""
