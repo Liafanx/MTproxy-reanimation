@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.2.0
+#  MTproxy-reanimation v1.2.1
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -2097,7 +2097,7 @@ exec ${ZAPRET2_BIN} @${ZAPRET2_CONF}
 NFTSTART
     chmod +x "$_nft_script"
 
-    cat > "/etc/systemd/system/${ZAPRET2_SERVICE}" << EOF
+cat > "/etc/systemd/system/${ZAPRET2_SERVICE}" << EOF
 [Unit]
 Description=MTproxy-reanimation Zapret2 MTProto fix by CHKRON
 After=network-online.target nftables.service
@@ -2115,8 +2115,11 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    chmod 644 "/etc/systemd/system/${ZAPRET2_SERVICE}"
     systemctl daemon-reload
-    log_success "Служба создана: ${ZAPRET2_SERVICE} (с автозапуском NFT)"
+    systemctl reset-failed "${ZAPRET2_SERVICE}" 2>/dev/null || true
+    log_success "Служба создана: ${ZAPRET2_SERVICE}"
 }
 
 zapret2_apply_nft() {
@@ -2155,11 +2158,14 @@ zapret2_start() {
         log_error "Бинарник nfqws2 не найден: ${ZAPRET2_BIN}"
         return 1
     fi
-    systemctl enable "$ZAPRET2_SERVICE" 2>/dev/null || true
-    systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl enable --now "$ZAPRET2_SERVICE" >/dev/null 2>&1 || true
     sleep 1
+
     if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null; then
-        log_success "zapret2 запущен"
+        ZAPRET2_SERVICE_ENABLED="true"
+        save_settings
+        log_success "zapret2 запущен и добавлен в автозапуск"
     else
         log_error "zapret2 не запустился"
         journalctl -u "$ZAPRET2_SERVICE" -n 10 --no-pager 2>/dev/null || true
@@ -2229,6 +2235,13 @@ zapret2_install() {
     ZAPRET2_SERVICE_ENABLED="true"
     save_settings
 
+    # контрольная проверка
+    if systemctl is-enabled "$ZAPRET2_SERVICE" >/dev/null 2>&1; then
+        log_success "Автозапуск ${ZAPRET2_SERVICE} включён"
+    else
+        log_warn "Автозапуск ${ZAPRET2_SERVICE} не включился"
+    fi
+
     echo ""
     log_success "Zapret2 MTProto fix by CHKRON установлен и запущен"
     echo ""
@@ -2284,6 +2297,8 @@ zapret2_update_config() {
     fi
     zapret2_write_conf
     zapret2_write_lua
+    systemctl daemon-reload
+    systemctl enable "$ZAPRET2_SERVICE" >/dev/null 2>&1 || true
     systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
     sleep 1
     if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null; then
@@ -2321,14 +2336,22 @@ show_zapret2_menu() {
             echo ""
 
             local _svc_status="${DIM}не установлена${NC}"
+            local _svc_enabled="${DIM}disabled${NC}"
+
             if systemctl is-enabled "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
+                _svc_enabled="${GREEN}enabled${NC}"
                 if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
                     _svc_status="${GREEN}работает${NC}"
                 else
                     _svc_status="${YELLOW}остановлена${NC}"
                 fi
+            else
+                if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
+                    _svc_status="${YELLOW}работает без автозапуска${NC}"
+                fi
             fi
-            echo -e "  ${BOLD}Служба:${NC} ${_svc_status}"
+
+            echo -e "  ${BOLD}Служба:${NC} ${_svc_status} / ${_svc_enabled}"
 
             if nft list table ip "${ZAPRET2_NFT_TABLE}" &>/dev/null 2>&1; then
                 echo -e "  ${BOLD}NFT:${NC}    ${GREEN}таблица ip ${ZAPRET2_NFT_TABLE} активна${NC}"
