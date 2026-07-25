@@ -698,6 +698,7 @@ ZAPRET2_APPLIED='${ZAPRET2_APPLIED}'
 ZAPRET2_SERVICE_ENABLED='${ZAPRET2_SERVICE_ENABLED}'
 ZAPRET2_RELEASE_REPO='${ZAPRET2_RELEASE_REPO}'
 ZAPRET2_RELEASE_TAG='${ZAPRET2_RELEASE_TAG}'
+ZAPRET2_FWMARK='${ZAPRET2_FWMARK}'
 EOF
     local _i
     for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
@@ -729,7 +730,7 @@ load_settings() {
                 IOS2_TARGET_PORT|IOS2_MSS|IOS2_TABLE|\
                 DOCKER_BRIDGE_MODE|BRIDGE_WATCH_INTERVAL|EXTRA_RULES_COUNT|\
                 ZAPRET2_QNUM|ZAPRET2_OUT_RANGE|ZAPRET2_IN_RANGE|ZAPRET2_SPLIT_LEN|\
-                ZAPRET2_WIN_SYNACK|ZAPRET2_WIN_ACK|\
+                ZAPRET2_WIN_SYNACK|ZAPRET2_WIN_ACK|ZAPRET2_FWMARK|\
                 ZAPRET2_APPLIED|ZAPRET2_SERVICE_ENABLED|ZAPRET2_RELEASE_REPO|ZAPRET2_RELEASE_TAG|\
                 MEKO_OPT_APPLIED|\
                 MEKO_ORIG_KEEPALIVE_TIME|MEKO_ORIG_KEEPALIVE_INTVL|MEKO_ORIG_KEEPALIVE_PROBES|\
@@ -1976,6 +1977,7 @@ zapret2_write_conf() {
     mkdir -p "$ZAPRET2_ETC_DIR"
     cat > "$ZAPRET2_CONF" << EOF
 --qnum ${ZAPRET2_QNUM}
+--fwmark=${ZAPRET2_FWMARK}
 --server
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-lib.lua
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-antidpi.lua
@@ -2051,7 +2053,7 @@ LUAEOF
 zapret2_write_service() {
     cat > "/etc/systemd/system/${ZAPRET2_SERVICE}" << EOF
 [Unit]
-Description=MTproxy-reanimation zapret2 MTProto fix by CHIRON
+Description=MTproxy-reanimation zapret2 MTProto fix by CHKRON
 After=network-online.target
 Wants=network-online.target
 
@@ -2257,12 +2259,13 @@ show_zapret2_menu() {
 
         if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
             echo -e "  ${BOLD}Текущие параметры:${NC}"
-            echo -e "    out-range:     ${GREEN}${ZAPRET2_OUT_RANGE}${NC}    ${DIM}(первые N исходящих пакетов сервера обрабатываются Lua)${NC}"
+            echo -e "    out-range:     ${GREEN}${ZAPRET2_OUT_RANGE}${NC}    ${DIM}(исходящие пакеты сервера обрабатываются Lua)${NC}"
             echo -e "    in-range:      ${ZAPRET2_IN_RANGE}    ${DIM}(диапазон входящих пакетов для Lua)${NC}"
             echo -e "    split len:     ${GREEN}${ZAPRET2_SPLIT_LEN}${NC}       ${DIM}(размер частей при разрезке первого data-пакета)${NC}"
             echo -e "    win SYN+ACK:   ${ZAPRET2_WIN_SYNACK}      ${DIM}(TCP window в SYN+ACK — дробит ClientHello)${NC}"
             echo -e "    win ACK:       ${ZAPRET2_WIN_ACK}        ${DIM}(TCP window в пустых ACK — усиливает дробление)${NC}"
             echo -e "    NFQUEUE num:   ${ZAPRET2_QNUM}       ${DIM}(номер очереди NFQUEUE)${NC}"
+            echo -e "    fwmark:        ${ZAPRET2_FWMARK}    ${DIM}(маркировка сгенерированных пакетов, защита от зацикливания)${NC}"
             echo -e "    Порт:          ${SERVER_PORT:-${DIM}не задан${NC}}       ${DIM}(берётся из настроек mtpr)${NC}"
             echo ""
 
@@ -2291,7 +2294,8 @@ show_zapret2_menu() {
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua"
             echo -e "  ${CYAN}[6]${NC}  Логи службы"
-            echo -e "  ${RED}[7]${NC}  Удалить zapret2"
+            echo -e "  ${CYAN}[7]${NC}  Диагностика очереди / конфликтов"
+            echo -e "  ${RED}[8]${NC}  Удалить zapret2"
         fi
         echo -e "  ${DIM}[0]${NC}  Назад"
         echo ""
@@ -2318,7 +2322,28 @@ show_zapret2_menu() {
                     echo ""
                     journalctl -u "$ZAPRET2_SERVICE" -n 30 --no-pager 2>/dev/null || log_warn "Логов нет"
                 fi ;;
-            7) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && zapret2_remove ;;
+            7)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    echo ""
+                    echo -e "  ${BOLD}=== systemd ===${NC}"
+                    systemctl status "$ZAPRET2_SERVICE" --no-pager -l 2>/dev/null || true
+                    echo ""
+                    echo -e "  ${BOLD}=== journal ===${NC}"
+                    journalctl -u "$ZAPRET2_SERVICE" -n 30 --no-pager 2>/dev/null || true
+                    echo ""
+                    echo -e "  ${BOLD}=== queue ===${NC}"
+                    modprobe nfnetlink_queue 2>/dev/null || true
+                    cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null || echo "  queue info unavailable"
+                    echo ""
+                    echo -e "  ${BOLD}=== nft mtproto ===${NC}"
+                    nft list table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
+                    echo ""
+                    echo -e "  ${BOLD}=== old limiter ===${NC}"
+                    systemctl is-active mtpr-syn-limit.service 2>/dev/null || true
+                    systemctl is-active mtpr-bridge-watch.service 2>/dev/null || true
+                    nft list table inet "${NFT_TABLE:-telemt_limit}" 2>/dev/null || echo "  old limiter table отсутствует"
+                fi ;;
+            8) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && zapret2_remove ;;
             0|"") return ;;
         esac
         echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -2352,6 +2377,7 @@ show_zapret2_settings_menu() {
         echo ""
         echo -e "  ${DIM}[5]${NC} in-range         [${ZAPRET2_IN_RANGE}]    ${DIM}— диапазон входящих${NC}"
         echo -e "  ${DIM}[6]${NC} NFQUEUE num      [${ZAPRET2_QNUM}]       ${DIM}— номер очереди${NC}"
+        echo -e "  ${DIM}[7]${NC} fwmark          [${ZAPRET2_FWMARK}]    ${DIM}— mark generated packets${NC}"
         echo ""
         echo -e "  ${DIM}[0]${NC} Назад"
         echo ""
@@ -2424,6 +2450,17 @@ show_zapret2_settings_menu() {
                     zapret2_update_config
                 elif [ -n "$_v" ]; then
                     log_error "Допустимый диапазон: 0..65535"
+                fi ;;
+            7)
+                echo -en "  fwmark [${ZAPRET2_FWMARK}] (например 0x40000000): "
+                local _v; read -r _v
+                if [ -n "$_v" ]; then
+                    ZAPRET2_FWMARK="$_v"
+                    save_settings
+                    log_success "fwmark = ${_v}"
+                    zapret2_remove_nft
+                    zapret2_apply_nft
+                    zapret2_update_config
                 fi ;;
             0|"") return ;;
         esac
@@ -3384,7 +3421,9 @@ show_main_menu() {
         echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
         echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
         echo -e "  ${CYAN}[m]${NC}  Оптимизация системы By-MEKO"
-        echo -e "  ${CYAN}[z]${NC}  Zapret2 MTProto fix by CHKRON"
+        echo ""       
+        echo -e "  ${CYAN}[Z]${NC}  Zapret2 MTProto fix by CHKRON"
+        echo ""        
         echo -e "  ${CYAN}[l]${NC}  Ссылки прокси, количество уникальных подключений и трафик сессии telemt (через API Telemt)"
         echo -e "  ${CYAN}[p]${NC}  Параметры Telemt (MSS)"
         echo -e "  ${CYAN}[x]${NC}  Проверка ограничений сервера (censorship)"
@@ -3888,10 +3927,12 @@ save_settings
     echo -en "  ${BOLD}Установить Zapret2 MTProto fix? [y/N]:${NC} "
     local _yn_zapret2; read -r _yn_zapret2
     if [[ "$_yn_zapret2" =~ ^[yY]$ ]]; then
-        # Отключаем SYN limiter если был выбран
+        # Zapret2 fix заменяет SYN limiter полностью
         if [ "${NFT_MODE:-classic}" = "smart" ] || [ "${NFT_MODE:-classic}" = "classic" ]; then
-            log_info "SYN limiter будет отключён (zapret2 fix его заменяет)"
+            log_info "Zapret2 fix заменяет SYN limiter — очищаю его состояние"
             NFT_SERVICE_ENABLED="false"
+            remove_nft_rules 2>/dev/null || true
+            remove_service 2>/dev/null || true
             save_settings
         fi
 
