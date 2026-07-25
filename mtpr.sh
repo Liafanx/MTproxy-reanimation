@@ -86,6 +86,8 @@ ZAPRET2_QNUM="200"
 ZAPRET2_OUT_RANGE="-s1"
 ZAPRET2_IN_RANGE="-s1"
 ZAPRET2_SPLIT_LEN="400"
+ZAPRET2_DEBUG="false"
+ZAPRET2_DEBUG_LOG="/var/log/nfqws2-mtproto.log"
 ZAPRET2_WIN_SYNACK="1400"
 ZAPRET2_WIN_ACK="10"
 ZAPRET2_APPLIED="false"
@@ -699,6 +701,8 @@ ZAPRET2_SERVICE_ENABLED='${ZAPRET2_SERVICE_ENABLED}'
 ZAPRET2_RELEASE_REPO='${ZAPRET2_RELEASE_REPO}'
 ZAPRET2_RELEASE_TAG='${ZAPRET2_RELEASE_TAG}'
 ZAPRET2_FWMARK='${ZAPRET2_FWMARK}'
+ZAPRET2_DEBUG='${ZAPRET2_DEBUG}'
+ZAPRET2_DEBUG_LOG='${ZAPRET2_DEBUG_LOG}'
 EOF
     local _i
     for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
@@ -732,6 +736,7 @@ load_settings() {
                 ZAPRET2_QNUM|ZAPRET2_OUT_RANGE|ZAPRET2_IN_RANGE|ZAPRET2_SPLIT_LEN|\
                 ZAPRET2_WIN_SYNACK|ZAPRET2_WIN_ACK|ZAPRET2_FWMARK|\
                 ZAPRET2_APPLIED|ZAPRET2_SERVICE_ENABLED|ZAPRET2_RELEASE_REPO|ZAPRET2_RELEASE_TAG|\
+                ZAPRET2_DEBUG|ZAPRET2_DEBUG_LOG|\
                 MEKO_OPT_APPLIED|\
                 MEKO_ORIG_KEEPALIVE_TIME|MEKO_ORIG_KEEPALIVE_INTVL|MEKO_ORIG_KEEPALIVE_PROBES|\
                 MEKO_ORIG_SOMAXCONN|MEKO_ORIG_TCP_MAX_SYN_BACKLOG|MEKO_ORIG_NETDEV_MAX_BACKLOG|\
@@ -1819,7 +1824,9 @@ zapret2_status() {
         return
     fi
     if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
-        echo -e "${GREEN}активен${NC} (out-range=${ZAPRET2_OUT_RANGE} len=${ZAPRET2_SPLIT_LEN} win=${ZAPRET2_WIN_SYNACK}/${ZAPRET2_WIN_ACK})"
+        local _dbg=""
+        [ "${ZAPRET2_DEBUG:-false}" = "true" ] && _dbg=" ${YELLOW}debug${NC}"
+        echo -e "${GREEN}активен${NC} (out-range=${ZAPRET2_OUT_RANGE} len=${ZAPRET2_SPLIT_LEN} win=${ZAPRET2_WIN_SYNACK}/${ZAPRET2_WIN_ACK})${_dbg}"
     else
         echo -e "${YELLOW}установлен, остановлен${NC}"
     fi
@@ -1975,10 +1982,16 @@ zapret2_download_bundle() {
 zapret2_write_conf() {
     local _port="${SERVER_PORT:-443}"
     mkdir -p "$ZAPRET2_ETC_DIR"
+    local _debug_line=""
+    if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+        _debug_line="--debug=@${ZAPRET2_DEBUG_LOG}"
+    fi
+
     cat > "$ZAPRET2_CONF" << EOF
 --qnum ${ZAPRET2_QNUM}
 --fwmark=${ZAPRET2_FWMARK}
 --server
+${_debug_line}
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-lib.lua
 --lua-init=@${ZAPRET2_LUA_DIR}/zapret-antidpi.lua
 --lua-init=@${ZAPRET2_LUA_DIR}/mtproto.lua
@@ -2300,6 +2313,11 @@ show_zapret2_menu() {
             echo -e "    NFQUEUE num:   ${ZAPRET2_QNUM}       ${DIM}(номер очереди NFQUEUE)${NC}"
             echo -e "    fwmark:        ${ZAPRET2_FWMARK}    ${DIM}(маркировка сгенерированных пакетов, защита от зацикливания)${NC}"
             echo -e "    Порт:          ${SERVER_PORT:-${DIM}не задан${NC}}       ${DIM}(берётся из настроек mtpr)${NC}"
+            if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+                echo -e "    Debug:         ${YELLOW}включён${NC} → ${ZAPRET2_DEBUG_LOG}"
+            else
+                echo -e "    Debug:         ${DIM}выключен${NC}"
+            fi            
             echo ""
 
             local _svc_status="${DIM}не установлена${NC}"
@@ -2330,7 +2348,10 @@ show_zapret2_menu() {
             echo -e "  ${CYAN}[3]${NC}  Остановить zapret2"
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua"
-            echo -e "  ${CYAN}[6]${NC}  Логи службы"
+            echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
+            if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+                echo -e "  ${CYAN}[d]${NC}  Debug лог (tail -100)"
+            fi
             echo -e "  ${CYAN}[7]${NC}  Диагностика очереди / конфликтов"
             echo -e "  ${RED}[8]${NC}  Удалить zapret2"
         fi
@@ -2381,6 +2402,19 @@ show_zapret2_menu() {
                     nft list table inet "${NFT_TABLE:-telemt_limit}" 2>/dev/null || echo "  old limiter table отсутствует"
                 fi ;;
             8) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && zapret2_remove ;;
+            d|D)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ] && [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+                    echo ""
+                    if [ -f "${ZAPRET2_DEBUG_LOG}" ]; then
+                        echo -e "  ${BOLD}=== ${ZAPRET2_DEBUG_LOG} (tail -100) ===${NC}"
+                        echo ""
+                        tail -100 "${ZAPRET2_DEBUG_LOG}"
+                    else
+                        log_info "Debug лог пуст или не существует"
+                    fi
+                else
+                    log_info "Debug лог не включён. Включите через [4] → Настройки → [8]"
+                fi ;;            
             0|"") return ;;
         esac
         echo ""; read -rsn1 -p "  Нажмите любую клавишу..."
@@ -2425,8 +2459,16 @@ show_zapret2_settings_menu() {
         echo -e "        ${DIM}Рекомендуемые: 10. ⚠ Повышение выше ломает подключение.${NC}"
         echo ""
         echo -e "  ${DIM}[5]${NC} in-range         [${ZAPRET2_IN_RANGE}]    ${DIM}— диапазон входящих${NC}"
-        echo -e "  ${DIM}[6]${NC} NFQUEUE num      [${ZAPRET2_QNUM}]       ${DIM}— номер очереди${NC}"
+        echo -e "  ${DIM}[6]${NC} NFQUEUE num      [${ZAPRET2_QNUM}]       ${DIM}— номер очереди${NC}"        
         echo -e "  ${DIM}[7]${NC} fwmark          [${ZAPRET2_FWMARK}]    ${DIM}— mark generated packets${NC}"
+        echo ""
+        echo -e "  ${BOLD}Отладка:${NC}"
+        if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+            echo -e "  ${DIM}[8]${NC} Debug лог        ${YELLOW}[включён]${NC} → ${ZAPRET2_DEBUG_LOG}"
+            echo -e "  ${DIM}[9]${NC} Показать debug лог (tail -100)"
+        else
+            echo -e "  ${DIM}[8]${NC} Debug лог        ${DIM}[выключен]${NC}"
+        fi        
         echo ""
         echo -e "  ${DIM}[0]${NC} Назад"
         echo ""
@@ -2510,6 +2552,42 @@ show_zapret2_settings_menu() {
                     zapret2_remove_nft
                     zapret2_apply_nft
                     zapret2_update_config
+                fi ;;
+            8)
+                if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+                    echo ""
+                    echo -en "  ${BOLD}Выключить debug лог? [Y/n]:${NC} "
+                    local _yn; read -r _yn
+                    if [[ ! "$_yn" =~ ^[nN]$ ]]; then
+                        ZAPRET2_DEBUG="false"
+                        save_settings
+                        log_success "Debug лог выключен"
+                        zapret2_update_config
+                    fi
+                else
+                    echo ""
+                    echo -e "  ${DIM}Debug лог записывается в: ${ZAPRET2_DEBUG_LOG}${NC}"
+                    echo -e "  ${YELLOW}⚠ Debug лог может быстро расти — не забудьте выключить после отладки${NC}"
+                    echo ""
+                    echo -en "  ${BOLD}Включить debug лог? [Y/n]:${NC} "
+                    local _yn; read -r _yn
+                    if [[ ! "$_yn" =~ ^[nN]$ ]]; then
+                        ZAPRET2_DEBUG="true"
+                        save_settings
+                        log_success "Debug лог включён → ${ZAPRET2_DEBUG_LOG}"
+                        zapret2_update_config
+                    fi
+                fi ;;
+            9)
+                if [ "${ZAPRET2_DEBUG:-false}" = "true" ] && [ -f "${ZAPRET2_DEBUG_LOG}" ]; then
+                    echo ""
+                    echo -e "  ${BOLD}=== Последние 100 строк debug лога ===${NC}"
+                    echo ""
+                    tail -100 "${ZAPRET2_DEBUG_LOG}"
+                elif [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+                    log_info "Debug лог ещё пуст: ${ZAPRET2_DEBUG_LOG}"
+                else
+                    log_info "Debug лог выключен"
                 fi ;;
             0|"") return ;;
         esac
@@ -3263,6 +3341,7 @@ full_uninstall() {
         # Удаляем файлы
         rm -f "$ZAPRET2_CONF"
         rm -f "$ZAPRET2_LUA"
+        rm -f "${ZAPRET2_DEBUG_LOG}" 2>/dev/null || true    
         rm -rf "$ZAPRET2_DIR"
         rm -rf "$ZAPRET2_ETC_DIR"
         ZAPRET2_APPLIED="false"
