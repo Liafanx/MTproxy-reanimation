@@ -2206,7 +2206,30 @@ zapret2_stop() {
     systemctl stop "$ZAPRET2_SERVICE" 2>/dev/null || true
     systemctl disable "$ZAPRET2_SERVICE" 2>/dev/null || true
     nft delete table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
+    ZAPRET2_SERVICE_ENABLED="false"
+    save_settings
     log_success "zapret2 остановлен"
+}
+
+zapret2_start_existing() {
+    if [ "${ZAPRET2_APPLIED:-false}" != "true" ] || [ ! -x "$ZAPRET2_BIN" ]; then
+        log_error "Zapret2 не установлен — используйте [1] Установить"
+        return 1
+    fi
+    zapret2_apply_nft || return 1
+    systemctl daemon-reload
+    systemctl enable "$ZAPRET2_SERVICE" >/dev/null 2>&1 || true
+    systemctl start "$ZAPRET2_SERVICE" 2>/dev/null || true
+    sleep 1
+    if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null; then
+        ZAPRET2_SERVICE_ENABLED="true"
+        save_settings
+        log_success "zapret2 запущен"
+    else
+        log_error "zapret2 не запустился"
+        journalctl -u "$ZAPRET2_SERVICE" -n 10 --no-pager 2>/dev/null || true
+        return 1
+    fi
 }
 
 zapret2_install() {
@@ -2518,7 +2541,11 @@ show_zapret2_menu() {
         fi        
         if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
             echo -e "  ${CYAN}[2]${NC}  Перезапустить zapret2"
-            echo -e "  ${CYAN}[3]${NC}  Остановить zapret2"
+            if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
+                echo -e "  ${CYAN}[3]${NC}  Остановить zapret2"
+            else
+                echo -e "  ${GREEN}[3]${NC}  Запустить zapret2"
+            fi
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua"
             echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
@@ -2534,8 +2561,21 @@ show_zapret2_menu() {
         echo -en "  Выбор: "; local _choice; read -r _choice
         case "$_choice" in
             1) zapret2_install ;;
-            2) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && { zapret2_apply_nft; systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null; sleep 1; systemctl status "$ZAPRET2_SERVICE" --no-pager -l 2>/dev/null || true; } ;;
-            3) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && zapret2_stop ;;
+            2)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    zapret2_apply_nft
+                    systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
+                    sleep 1
+                    systemctl status "$ZAPRET2_SERVICE" --no-pager -l 2>/dev/null || true
+                fi ;;
+            3)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
+                        zapret2_stop
+                    else
+                        zapret2_start_existing
+                    fi
+                fi ;;
             4) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && show_zapret2_settings_menu ;;
             5)
                 if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
