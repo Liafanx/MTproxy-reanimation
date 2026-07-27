@@ -57,6 +57,14 @@ mtpr
 ## Обновления
 
 <details>
+<summary><b>1.2.3-1.2.4 от 27.07.2026</b></summary>
+
+-исправлен Ip адрес контейнера в правилах NFT Smart
+-исправлена остановка и повторный запуск zapret2
+
+</details>
+
+<details>
 <summary><b>1.2.2 от 27.07.2026</b></summary>
 
 ### Zapret2 MTProto fix — крупное обновление
