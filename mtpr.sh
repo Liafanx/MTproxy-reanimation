@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.2.1
+#  MTproxy-reanimation v1.2.2
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -72,7 +72,7 @@ BRIDGE_WATCH_INTERVAL="5"
 WATCHER_SCRIPT="/usr/local/sbin/mtpr-bridge-watch.sh"
 WATCHER_UNIT="mtpr-bridge-watch.service"
 
-# ── Zapret2 MTProto fix by CHKRON ─────────────────────────────
+# ── Zapret2 MTProto fix ─────────────────────────────
 ZAPRET2_DIR="/opt/zapret2"
 ZAPRET2_ETC_DIR="/etc/zapret2"
 ZAPRET2_BIN="${ZAPRET2_DIR}/bin/nfqws2"
@@ -83,8 +83,8 @@ ZAPRET2_SERVICE="mtpr-zapret2.service"
 ZAPRET2_NFT_TABLE="MTProto"
 ZAPRET2_FWMARK="0x40000000"
 ZAPRET2_QNUM="200"
-ZAPRET2_OUT_RANGE="-s1"
-ZAPRET2_IN_RANGE="-s1"
+ZAPRET2_OUT_RANGE="a"
+ZAPRET2_IN_RANGE="a"
 ZAPRET2_SPLIT_LEN="400"
 ZAPRET2_DEBUG="false"
 ZAPRET2_DEBUG_LOG="/var/log/nfqws2-mtproto.log"
@@ -1810,7 +1810,7 @@ show_meko_opt_menu() {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  Zapret2 MTProto fix by CHKRON
+#  Zapret2 MTProto fix
 #  Серверный обход через disorder + badsum + window control
 # ══════════════════════════════════════════════════════════════
 
@@ -2008,12 +2008,12 @@ EOF
 zapret2_write_lua() {
     mkdir -p "$ZAPRET2_LUA_DIR"
     cat > "$ZAPRET2_LUA" << LUAEOF
--- Zapret2 MTProto fix by CHKRON
--- Серверный обход ТСПУ: disorder + badsum + window control
+-- Zapret2 MTProto fix
+-- Серверный обход: disorder + badsum + window control + iOS fwmark bypass
 -- https://github.com/Liafanx/MTproxy-reanimation
 
 function lets_resend(ctx, desync)
-    -- iOS fingerprint bypass
+    -- iOS fingerprint bypass: пропускаем через fwmark без обработки
     if bitand(desync.dis.tcp.th_flags, TH_SYN + TH_ACK) == TH_SYN then
         if desync.dis.tcp.th_win == 65535 and
            #desync.dis.tcp.options == 8 and
@@ -2026,18 +2026,27 @@ function lets_resend(ctx, desync)
            desync.dis.tcp.options[7].kind == 4 and
            desync.dis.tcp.options[8].kind == 0 then
             instance_cutoff(ctx, nil)
-            return VERDICT_PASS
+            desync.arg.fwmark = 0x40000
+            rawsend_dissect_segmented(desync)
+            return VERDICT_DROP
         end
     end
 
-    -- SYN+ACK: зажимаем окно чтобы клиент дробил ClientHello
+    -- SYN+ACK: запоминаем ack и зажимаем окно чтобы клиент дробил ClientHello
     if bitand(desync.dis.tcp.th_flags, TH_SYN + TH_ACK) == (TH_SYN + TH_ACK) then
+        desync.track.lua_state["ack0"] = desync.dis.tcp.th_ack
         desync.dis.tcp.th_win = ${ZAPRET2_WIN_SYNACK}
         return VERDICT_MODIFY
     end
 
-    -- Пустые ACK от сервера: ещё сильнее зажимаем окно
+    -- Пустые ACK от сервера: зажимаем окно, но отпускаем после первого payload клиента
     if direction_check(desync) and bitand(desync.dis.tcp.th_flags, TH_SYN + TH_ACK) == (TH_ACK) then
+        if desync.track and desync.dis.tcp.th_ack - desync.track.lua_state["ack0"] >= 1400 then
+            instance_cutoff(ctx, true)
+            desync.arg.fwmark = 0x40000
+            rawsend_dissect_segmented(desync)
+            return VERDICT_DROP
+        end
         desync.dis.tcp.th_win = ${ZAPRET2_WIN_ACK}
         return VERDICT_MODIFY
     end
@@ -2049,9 +2058,9 @@ function lets_resend(ctx, desync)
 
     -- Split на 3 части, средняя с badsum (disorder)
     local len = ${ZAPRET2_SPLIT_LEN}
-    first = string.sub(desync.dis.payload, 1, len)
-    second = string.sub(desync.dis.payload, len + 1, 2 * len)
-    third = string.sub(desync.dis.payload, 2 * len + 1)
+    local first  = string.sub(desync.dis.payload, 1, len)
+    local second = string.sub(desync.dis.payload, len + 1, 2 * len)
+    local third  = string.sub(desync.dis.payload, 2 * len + 1)
     rawsend_payload_segmented(desync, first)
     rawsend_payload_segmented(desync, third, 2 * len)
     desync.arg["badsum"] = true
@@ -2062,10 +2071,13 @@ end
 LUAEOF
     log_success "Lua скрипт записан: ${ZAPRET2_LUA}"
 }
-
 zapret2_write_service() {
     # Пишем скрипт запуска который применяет NFT и запускает nfqws2
     local _nft_script="/usr/local/sbin/mtpr-zapret2-start.sh"
+    local _ct_mark="0x00040000"
+    local _combined_mark
+    printf -v _combined_mark '0x%08x' "$(( ZAPRET2_FWMARK | _ct_mark ))"
+
     cat > "$_nft_script" << NFTSTART
 #!/bin/bash
 set -e
@@ -2074,6 +2086,8 @@ TABLE="${ZAPRET2_NFT_TABLE}"
 FWMARK="${ZAPRET2_FWMARK}"
 PORT="${SERVER_PORT:-443}"
 QNUM="${ZAPRET2_QNUM}"
+CT_MARK="${_ct_mark}"
+COMBINED_MARK="${_combined_mark}"
 
 # Удаляем старую таблицу если есть
 nft delete table ip "\$TABLE" 2>/dev/null || true
@@ -2082,15 +2096,21 @@ nft delete table ip "\$TABLE" 2>/dev/null || true
 nft add table ip "\$TABLE"
 
 nft "add chain ip \$TABLE predefrag { type filter hook output priority -401; policy accept; }"
-nft "add rule ip \$TABLE predefrag meta mark and \$FWMARK != 0x00000000 notrack"
+nft "add rule ip \$TABLE predefrag meta mark \$COMBINED_MARK counter accept"
+nft "add rule ip \$TABLE predefrag meta mark and \$FWMARK != 0x00000000 counter notrack"
+
+nft "add chain ip \$TABLE output { type route hook output priority mangle; policy accept; }"
+nft "add rule ip \$TABLE output meta mark and \$COMBINED_MARK == \$COMBINED_MARK ct mark set \$CT_MARK counter accept"
 
 nft "add chain ip \$TABLE postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
-nft "add rule ip \$TABLE postrouting meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT queue flags bypass to \$QNUM"
+nft "add rule ip \$TABLE postrouting ct mark \$CT_MARK counter accept"
+nft "add rule ip \$TABLE postrouting meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue flags bypass to \$QNUM"
 
 nft "add chain ip \$TABLE prerouting { type filter hook prerouting priority mangle; policy accept; }"
-nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT queue flags bypass to \$QNUM"
+nft "add rule ip \$TABLE prerouting ct mark \$CT_MARK counter accept"
+nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue flags bypass to \$QNUM"
 
-echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM)"
+echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM fwmark=\$FWMARK ctmark=\$CT_MARK)"
 
 # Запускаем nfqws2
 exec ${ZAPRET2_BIN} @${ZAPRET2_CONF}
@@ -2099,7 +2119,7 @@ NFTSTART
 
 cat > "/etc/systemd/system/${ZAPRET2_SERVICE}" << EOF
 [Unit]
-Description=MTproxy-reanimation Zapret2 MTProto fix by CHKRON
+Description=MTproxy-reanimation Zapret2 MTProto fix
 After=network-online.target nftables.service
 Wants=network-online.target
 
@@ -2126,6 +2146,10 @@ zapret2_apply_nft() {
     local _table="${ZAPRET2_NFT_TABLE}"
     local _fwmark="${ZAPRET2_FWMARK}"
     local _port="${SERVER_PORT:-443}"
+    local _ct_mark="0x00040000"
+    local _combined_mark
+
+    printf -v _combined_mark '0x%08x' "$(( _fwmark | _ct_mark ))"
 
     if [ -z "$_port" ]; then
         log_error "Порт не задан — невозможно применить NFT правила zapret2"
@@ -2133,19 +2157,24 @@ zapret2_apply_nft() {
     fi
 
     nft delete table ip "$_table" 2>/dev/null || true
-
     nft add table ip "$_table"
 
     nft "add chain ip $_table predefrag { type filter hook output priority -401; policy accept; }"
-    nft "add rule ip $_table predefrag meta mark and $_fwmark != 0x00000000 notrack"
+    nft "add rule ip $_table predefrag meta mark ${_combined_mark} counter accept"
+    nft "add rule ip $_table predefrag meta mark and $_fwmark != 0x00000000 counter notrack"
+
+    nft "add chain ip $_table output { type route hook output priority mangle; policy accept; }"
+    nft "add rule ip $_table output meta mark and ${_combined_mark} == ${_combined_mark} ct mark set ${_ct_mark} counter accept"
 
     nft "add chain ip $_table postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
-    nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport ${_port} queue flags bypass to ${ZAPRET2_QNUM}"
+    nft "add rule ip $_table postrouting ct mark ${_ct_mark} counter accept"
+    nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue flags bypass to ${ZAPRET2_QNUM}"
 
     nft "add chain ip $_table prerouting { type filter hook prerouting priority mangle; policy accept; }"
-    nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport ${_port} queue flags bypass to ${ZAPRET2_QNUM}"
+    nft "add rule ip $_table prerouting ct mark ${_ct_mark} counter accept"
+    nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue flags bypass to ${ZAPRET2_QNUM}"
 
-    log_success "NFT таблица ${_table} применена (порт=${_port} qnum=${ZAPRET2_QNUM})"
+    log_success "NFT таблица ${_table} применена (порт=${_port} qnum=${ZAPRET2_QNUM} fwmark=${_fwmark} ctmark=${_ct_mark})"
 }
 
 zapret2_remove_nft() {
@@ -2182,7 +2211,7 @@ zapret2_stop() {
 
 zapret2_install() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix by CHKRON${NC}"
+    echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix${NC}"
     echo ""
     echo -e "  ${DIM}Серверный обход для MTProto прокси.${NC}"
     echo -e "  ${DIM}Метод: disorder + badsum + TCP window control.${NC}"
@@ -2243,7 +2272,7 @@ zapret2_install() {
     fi
 
     echo ""
-    log_success "Zapret2 MTProto fix by CHKRON установлен и запущен"
+    log_success "Zapret2 MTProto fix установлен и запущен"
     echo ""
     echo -e "  ${BOLD}Что было сделано:${NC}"
     echo -e "    ${GREEN}✓${NC} Скачан и установлен nfqws2 в ${ZAPRET2_DIR}"
@@ -2261,7 +2290,7 @@ zapret2_remove() {
         return 0
     fi
     echo ""
-    echo -e "  ${RED}${BOLD}Удаление Zapret2 MTProto fix by CHKRON${NC}"
+    echo -e "  ${RED}${BOLD}Удаление Zapret2 MTProto fix${NC}"
     echo ""
     echo -e "  ${DIM}Будет удалено:${NC}"
     echo -e "  ${DIM}- Служба ${ZAPRET2_SERVICE}${NC}"
@@ -2297,6 +2326,8 @@ zapret2_update_config() {
     fi
     zapret2_write_conf
     zapret2_write_lua
+    zapret2_write_service
+    zapret2_apply_nft
     systemctl daemon-reload
     systemctl enable "$ZAPRET2_SERVICE" >/dev/null 2>&1 || true
     systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
@@ -2309,10 +2340,129 @@ zapret2_update_config() {
     fi
 }
 
+# ── Zapret2: проверка TCP buffer / wscale ─────────────────────
+zapret2_check_wscale() {
+    local _show_only="${1:-false}"   # true = только показать, false = предложить изменить
+    local _target=1280               # идеальное реальное окно (байт)
+    local _max_allowed=1399          # реальное окно должно быть строго < 1400
+
+    # Читаем текущий rmem_max
+    local _rmem_max
+    _rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "212992")
+
+    # Читаем tcp_rmem (третье значение — максимум)
+    local _tcp_rmem_max
+    _tcp_rmem_max=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')
+    [ -z "$_tcp_rmem_max" ] && _tcp_rmem_max="$_rmem_max"
+
+    # Берём максимум из двух
+    local _buf_size
+    if [ "$_tcp_rmem_max" -gt "$_rmem_max" ]; then
+        _buf_size="$_tcp_rmem_max"
+    else
+        _buf_size="$_rmem_max"
+    fi
+
+    # Вычисляем wscale: минимальный сдвиг чтобы (buf >> wscale) <= 65535
+    local _wscale=0
+    local _shifted="$_buf_size"
+    while [ "$_shifted" -gt 65535 ]; do
+        _wscale=$((_wscale + 1))
+        _shifted=$((_buf_size >> _wscale))
+    done
+
+    # 2^wscale — гранулярность окна
+    local _scale=$((1 << _wscale))
+
+    # Рекомендуемый win_ack: максимальное значение при котором реальное окно < 1400
+    # floor(max_allowed / scale)
+    local _win_ack_rec=$(( _max_allowed / _scale ))
+    [ "$_win_ack_rec" -lt 1 ] && _win_ack_rec=1
+
+    # Реальное окно с рекомендуемым значением
+    local _real_win=$((_win_ack_rec * _scale))
+
+    # Проверяем: если даже win=1 даёт окно >= 1400 — невозможно подобрать
+    local _impossible="false"
+    if [ $(( 1 * _scale )) -ge 1400 ]; then
+        _impossible="true"
+        _win_ack_rec=1
+        _real_win=$(( 1 * _scale ))
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}=== Проверка TCP буфера / wscale ===${NC}"
+    echo ""
+    echo -e "  net.core.rmem_max:       ${_rmem_max}"
+    echo -e "  net.ipv4.tcp_rmem (max): ${_tcp_rmem_max}"
+    echo -e "  Буфер для расчёта:       ${_buf_size}"
+    echo ""
+    echo -e "  Рассчитанный wscale:     ${_wscale}"
+    echo -e "  2^wscale (гранулярность):${_scale} байт"
+    echo -e "  Целевое окно:            < 1400 байт (идеал ~${_target})"
+    echo ""
+
+    local _current_win_ack="${ZAPRET2_WIN_ACK:-10}"
+    local _current_real=$((_current_win_ack * _scale))
+
+    echo -e "  Текущий win ACK:         ${_current_win_ack}  → реальное окно: ${_current_real} байт"
+    echo -e "  Рекомендуемый win ACK:   ${_win_ack_rec}  → реальное окно: ${_real_win} байт"
+    echo ""
+
+    if [ "$_impossible" = "true" ]; then
+        echo -e "  ${RED}⚠ КРИТИЧНО: 2^wscale = ${_scale} байт — минимальный шаг окна${NC}"
+        echo -e "  ${RED}  уже >= 1400 байт. Дробление ClientHello невозможно!${NC}"
+        echo -e "  ${RED}  Нужно уменьшить net.core.rmem_max / net.ipv4.tcp_rmem${NC}"
+        echo -e "  ${RED}  чтобы ядро выбрало меньший wscale.${NC}"
+        echo ""
+        echo -e "  ${YELLOW}Пример для wscale=7 (подходит для win ACK=10):${NC}"
+        echo -e "  ${DIM}  sysctl -w net.core.rmem_max=8388608${NC}"
+        echo -e "  ${DIM}  sysctl -w net.ipv4.tcp_rmem='4096 131072 8388608'${NC}"
+        echo -e "  ${DIM}  # Затем перезапустите zapret2${NC}"
+    elif [ "$_current_real" -ge 1400 ]; then
+        echo -e "  ${RED}⚠ Реальное окно (${_current_real} байт) >= 1400 байт${NC}"
+        echo -e "  ${RED}  Дробление ClientHello НЕ произойдёт — обход не будет работать!${NC}"
+    elif [ "$_real_win" -ge 512 ] && [ "$_current_real" -lt 1400 ]; then
+        echo -e "  ${GREEN}✓ Реальное окно (${_current_real} байт) < 1400 — дробление будет работать${NC}"
+    elif [ "$_real_win" -lt 512 ]; then
+        echo -e "  ${YELLOW}⚠ Реальное окно (${_real_win} байт) — очень маленькое, возможны проблемы${NC}"
+    fi
+
+    # Предлагаем изменить если текущее значение не оптимально
+    if [ "$_impossible" != "true" ] && [ "$_show_only" != "true" ]; then
+        if [ "$_current_real" -ge 1400 ] && [ "$_win_ack_rec" != "$_current_win_ack" ]; then
+            echo ""
+            echo -e "  ${BOLD}Необходимо изменить win ACK: ${_current_win_ack} → ${_win_ack_rec}${NC}"
+            echo -e "  ${DIM}(реальное окно: ${_current_real} → ${_real_win} байт)${NC}"
+            echo -en "  Применить? [Y/n]: "
+            local _yn; read -r _yn
+            if [[ ! "$_yn" =~ ^[nN]$ ]]; then
+                ZAPRET2_WIN_ACK="$_win_ack_rec"
+                save_settings
+                log_success "win ACK установлен: ${_win_ack_rec} (реальное окно: ${_real_win} байт)"
+                zapret2_update_config
+            else
+                log_info "Значение не изменено"
+            fi
+        elif [ "$_win_ack_rec" != "$_current_win_ack" ] && [ "$_current_real" -lt 1400 ]; then
+            echo ""
+            echo -e "  ${DIM}Текущее значение работает, но можно оптимизировать:${NC}"
+            echo -e "  ${DIM}win ACK ${_current_win_ack} (${_current_real} байт) → ${_win_ack_rec} (${_real_win} байт)${NC}"
+            echo -en "  Оптимизировать? [y/N]: "
+            local _yn; read -r _yn
+            if [[ "$_yn" =~ ^[yY]$ ]]; then
+                ZAPRET2_WIN_ACK="$_win_ack_rec"
+                save_settings
+                log_success "win ACK установлен: ${_win_ack_rec} (реальное окно: ${_real_win} байт)"
+                zapret2_update_config
+            fi
+        fi
+    fi
+}
 show_zapret2_menu() {
     while true; do
         show_header
-        echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix by CHKRON${NC}"
+        echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix${NC}"
         echo -e "  ${DIM}Серверный обход: disorder + badsum + window control${NC}"
         echo ""
         echo -e "  Статус: $(zapret2_status)"
@@ -2372,10 +2522,11 @@ show_zapret2_menu() {
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua"
             echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
+            echo -e "  ${CYAN}[7]${NC}  Диагностика"
             if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
                 echo -e "  ${CYAN}[d]${NC}  Debug лог (tail -100)"
             fi
-            echo -e "  ${CYAN}[7]${NC}  Диагностика очереди / конфликтов"
+            echo -e "  ${CYAN}[r]${NC}  Сбросить настройки к значениям по умолчанию"
             echo -e "  ${RED}[8]${NC}  Удалить zapret2"
         fi
         echo -e "  ${DIM}[0]${NC}  Назад"
@@ -2423,7 +2574,37 @@ show_zapret2_menu() {
                     systemctl is-active mtpr-syn-limit.service 2>/dev/null || true
                     systemctl is-active mtpr-bridge-watch.service 2>/dev/null || true
                     nft list table inet "${NFT_TABLE:-telemt_limit}" 2>/dev/null || echo "  old limiter table отсутствует"
+                    zapret2_check_wscale "true"                    
                 fi ;;
+            r|R)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    echo ""
+                    echo -e "  ${BOLD}Сброс настроек Zapret2 к значениям по умолчанию:${NC}"
+                    echo -e "    out-range:   a"
+                    echo -e "    in-range:    a"
+                    echo -e "    split len:   400"
+                    echo -e "    win SYN+ACK: 1400"
+                    echo -e "    win ACK:     10"
+                    echo -e "    NFQUEUE:     200"
+                    echo -e "    fwmark:      0x40000000"
+                    echo ""
+                    echo -en "  ${BOLD}Сбросить настройки и перезапустить? [y/N]:${NC} "
+                    local _yn; read -r _yn
+                    if [[ "$_yn" =~ ^[yY]$ ]]; then
+                        ZAPRET2_OUT_RANGE="a"
+                        ZAPRET2_IN_RANGE="a"
+                        ZAPRET2_SPLIT_LEN="400"
+                        ZAPRET2_WIN_SYNACK="1400"
+                        ZAPRET2_WIN_ACK="10"
+                        ZAPRET2_QNUM="200"
+                        ZAPRET2_FWMARK="0x40000000"
+                        save_settings
+                        zapret2_update_config
+                        log_success "Настройки сброшены к значениям по умолчанию"
+                    else
+                        log_info "Отменено"
+                    fi
+                fi ;;                
             8) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && zapret2_remove ;;
             d|D)
                 if [ "${ZAPRET2_APPLIED:-false}" = "true" ] && [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
@@ -2447,7 +2628,7 @@ show_zapret2_menu() {
 show_zapret2_settings_menu() {
     while true; do
         show_header
-        echo -e "  ${BOLD}Настройки Zapret2 MTProto fix by CHKRON${NC}"
+        echo -e "  ${BOLD}Настройки Zapret2 MTProto fix${NC}"
         echo ""
         echo -e "  ${DIM}Изменение параметров автоматически перезаписывает конфиг и Lua,${NC}"
         echo -e "  ${DIM}затем перезапускает zapret2.${NC}"
@@ -3451,8 +3632,14 @@ show_header() {
     echo -e "  ${DIM}Telemt inbound SYN limiter + тюнинг${NC}"
     echo -e "  ${DIM}────────────────────────────────────────${NC}"; echo ""
 
+    # Определяем активен ли zapret2 и неактивен ли SYN limiter
+    local _zapret2_active="false"
+    local _limiter_active="false"
+    [ "${ZAPRET2_APPLIED:-false}" = "true" ] && nft list table ip "${ZAPRET2_NFT_TABLE}" &>/dev/null && _zapret2_active="true"
+    nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null && _limiter_active="true"
+
     local _nft_status="${RED}неактивно${NC}"
-    if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then
+    if [ "$_limiter_active" = "true" ]; then
         if [ "${NFT_MODE:-classic}" = "smart" ]; then
             local _ios_lim_info _other_lim_info
             if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
@@ -3466,7 +3653,7 @@ show_header() {
                 _other_lim_info="Other: unlimited"
             fi
             _nft_status="${GREEN}Smart By-MEKO${NC} (${_ios_lim_info} ${_other_lim_info})"
-            else
+        else
             _nft_status="${GREEN}Classic${NC} (${NFT_RATE} burst ${NFT_BURST})"
         fi
     fi
@@ -3498,9 +3685,18 @@ show_header() {
         echo -e "  ${BOLD}Сеть:${NC}          ${DETECTED_NETWORK_MODE:-неизвестно} → hook ${NFT_HOOK}"
     fi
     echo -e "  ${BOLD}Конфиг:${NC}        ${DETECTED_CONFIG_PATH:-${DIM}не найден${NC}}"
-    echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
-    echo -e "  ${BOLD}NFT режим:${NC}     ${NFT_MODE:-classic}"
-    echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"; echo ""
+    echo -e "  ${BOLD}Telemt сервис:${NC} $(_get_telemt_service_status)"
+
+    # Zapret2 — показываем перед NFT правилами
+    echo -e "  ${BOLD}Zapret2 fix:${NC}   $(zapret2_status)"
+
+    # NFT limiter — показываем только если limiter активен ИЛИ zapret2 неактивен
+    if [ "$_zapret2_active" != "true" ] || [ "$_limiter_active" = "true" ]; then
+        echo -e "  ${BOLD}NFT правила:${NC}   ${_nft_status}"
+        echo -e "  ${BOLD}NFT режим:${NC}     ${NFT_MODE:-classic}"
+        echo -e "  ${BOLD}Служба:${NC}        ${_svc_status}"
+    fi
+    echo ""
 
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ] && [ -n "$DETECTED_CONTAINER" ]; then
@@ -3515,32 +3711,41 @@ show_header() {
     fi
 
     echo -e "  ${BOLD}Порт:${NC}          ${SERVER_PORT:-${DIM}не задан${NC}}"
-    if [ "${NFT_MODE:-classic}" = "smart" ]; then
-        if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
-            echo -e "  ${BOLD}iOS Rate:${NC}      ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
+
+    # Rate/Burst/Timeout — показываем только если limiter активен ИЛИ zapret2 неактивен
+    if [ "$_zapret2_active" != "true" ] || [ "$_limiter_active" = "true" ]; then
+        if [ "${NFT_MODE:-classic}" = "smart" ]; then
+            if [ "${NFT_IOS_LIMIT_ENABLED:-true}" = "true" ]; then
+                echo -e "  ${BOLD}iOS Rate:${NC}      ${NFT_IOS_RATE} burst ${NFT_IOS_BURST}"
+            else
+                echo -e "  ${BOLD}iOS Rate:${NC}      ${YELLOW}отключён (unlimited)${NC}"
+            fi
+            local _detect_short
+            [ "${NFT_IOS_DETECT:-fingerprint}" = "ttl" ] && _detect_short="${YELLOW}TTL+Len${NC}" || _detect_short="${GREEN}fingerprint${NC}"
+            echo -e "  ${BOLD}iOS detect:${NC}    ${_detect_short}"
+            if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
+                echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
+            else
+                echo -e "  ${BOLD}Other Rate:${NC}    ${YELLOW}отключён (unlimited)${NC}"
+            fi
         else
-            echo -e "  ${BOLD}iOS Rate:${NC}      ${YELLOW}отключён (unlimited)${NC}"
+            echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
+            echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
         fi
-        local _detect_short
-        [ "${NFT_IOS_DETECT:-fingerprint}" = "ttl" ] && _detect_short="${YELLOW}TTL+Len${NC}" || _detect_short="${GREEN}fingerprint${NC}"
-        echo -e "  ${BOLD}iOS detect:${NC}    ${_detect_short}"        
-        if [ "${NFT_OTHER_LIMIT_ENABLED:-true}" = "true" ]; then
-            echo -e "  ${BOLD}Other Rate:${NC}    ${NFT_OTHER_RATE} burst ${NFT_OTHER_BURST}"
-        else
-            echo -e "  ${BOLD}Other Rate:${NC}    ${YELLOW}отключён (unlimited)${NC}"
-        fi
-    else
-        echo -e "  ${BOLD}Rate:${NC}          ${NFT_RATE}"
-        echo -e "  ${BOLD}Burst:${NC}         ${NFT_BURST}"
+        echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
     fi
-    echo -e "  ${BOLD}Meter timeout:${NC} ${NFT_METER_TIMEOUT}"
     echo ""
     echo -e "  ${BOLD}Тюнинг:${NC}        tg_connect=${TUNING_TG_CONNECT}  handshake=${TUNING_CLIENT_HANDSHAKE}  keepalive=${TUNING_CLIENT_KEEPALIVE}  (${_tuning_status})"
-    echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
-    echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
+
+    # iOS фиксы — показываем только если применены
+    if [ "${IOS_FIX_APPLIED:-false}" = "true" ]; then
+        echo -e "  ${BOLD}iOS фикс v1:${NC}   ${_ios_status}"
+    fi
+    if [ "${IOS2_FIX_APPLIED:-false}" = "true" ]; then
+        echo -e "  ${BOLD}iOS фикс v2:${NC}   ${_ios2_status}"
+    fi
+
     echo -e "  ${BOLD}MEKO оптимизация:${NC} $(meko_opt_status)"
-    echo -e "  ${BOLD}Zapret2 fix:${NC}   $(zapret2_status)"
-    echo -e "  ${BOLD}Telemt сервис:${NC} $(_get_telemt_service_status)"
     if [ -n "$DETECTED_CONFIG_PATH" ] && [ -f "$DETECTED_CONFIG_PATH" ]; then
         local _mss_s _mssbulk_s
         _mss_s=$(_telemt_param_status "client_mss")
@@ -3550,31 +3755,59 @@ show_header() {
     if [ "$EXTRA_RULES_COUNT" -gt 0 ]; then
         echo ""; echo -e "  ${BOLD}Доп. правила:${NC}"
         local _i; for _i in $(seq 1 "$EXTRA_RULES_COUNT"); do
-            echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?} ip=${EXTRA_RULES_IP[$_i]:-любой} rate=${EXTRA_RULES_RATE[$_i]:-?} burst=${EXTRA_RULES_BURST[$_i]:-?}"
+            echo -e "    ${DIM}[$_i]${NC} порт=${EXTRA_RULES_PORT[$_i]:-?} ip=${EXTRA_RULES_IP[$_i]:-?} rate=${EXTRA_RULES_RATE[$_i]:-?} burst=${EXTRA_RULES_BURST[$_i]:-?}"
         done
     fi
     echo ""; echo -e "  ${DIM}────────────────────────────────────────${NC}"
 }
 
+show_legacy_settings_menu() {
+    while true; do
+        show_header
+        echo -e "  ${BOLD}Устаревшие настройки (неактуальные)${NC}"
+        echo ""
+        echo -e "  ${DIM}Эти настройки сохранены для обратной совместимости.${NC}"
+        echo -e "  ${DIM}При использовании Smart By-MEKO или Zapret2 fix они не нужны.${NC}"
+        echo ""
+        echo -e "  ${CYAN}[1]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
+        echo -e "  ${CYAN}[2]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
+        echo ""
+        echo -e "  ${DIM}[0]${NC}  Назад"
+        echo ""
+        echo -en "  Выбор: "; local _choice; read -r _choice
+        case "$_choice" in
+            1) show_ios_fix_menu ;;
+            2) show_ios2_fix_menu ;;
+            0|"") return ;;
+        esac
+    done
+}
+
 show_main_menu() {
     while true; do
         show_header
-        echo -e "  ${GREEN}[s]${NC}  ${BOLD}★ Smart By-MEKO${NC} ${DIM}(iOS/Android авторазделение + REJECT)${NC}"
+        echo -e "  ${CYAN}[Z]${NC}  ${BOLD}Zapret2 MTProto fix${NC} ${DIM}(TCP disorder + badsum + window control)${NC}"
+        echo -e "  ${GREEN}[S]${NC}  ${BOLD}★ Smart By-MEKO${NC} ${DIM}(iOS/Android авторазделение + REJECT)${NC}"        
         echo ""
         echo -e "  ${CYAN}[1]${NC}  Применить NFT правила"
         echo -e "  ${CYAN}[2]${NC}  Применить тюнинг Telemt"
         echo -e "  ${CYAN}[3]${NC}  Настройки"
         echo -e "  ${CYAN}[4]${NC}  Пресеты (жёсткий / средний / мягкий / smart)"
-        echo -e "  ${CYAN}[5]${NC}  Счётчик срабатывания правил (смотреть live) - выход ctrl+c"
+        local _counter_label="Счётчик срабатывания правил (смотреть live) - выход ctrl+c"
+        if [ "${ZAPRET2_APPLIED:-false}" = "true" ] && nft list table ip "${ZAPRET2_NFT_TABLE}" &>/dev/null; then
+            if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null; then
+                _counter_label="Счётчики правил: Zapret2 + SYN limiter (live) - выход ctrl+c"
+            else
+                _counter_label="Счётчик правил Zapret2 (live) - выход ctrl+c"
+            fi
+        fi
+        echo -e "  ${CYAN}[5]${NC}  ${_counter_label}"
         echo -e "  ${CYAN}[6]${NC}  Управление службой"
         echo -e "  ${CYAN}[7]${NC}  Доп. правила (добавить порт)"
         echo -e "  ${CYAN}[8]${NC}  Повторно обнаружить Telemt"
-        echo -e "  ${CYAN}[9]${NC}  Фикс для iOS вариант 1 (TCP keepalive)"
-        echo -e "  ${CYAN}[a]${NC}  Фикс для iOS вариант 2 (MSS + redirect)"
-        echo -e "  ${CYAN}[m]${NC}  Оптимизация системы By-MEKO"
-        echo ""       
-        echo -e "  ${CYAN}[Z]${NC}  Zapret2 MTProto fix by CHKRON"
-        echo ""        
+        echo -e "  ${CYAN}[9]${NC}  Оптимизация системы By-MEKO"
+        echo -e "  ${DIM}[o]${NC}  Устаревшие настройки (iOS фиксы)"
+        echo ""
         echo -e "  ${CYAN}[l]${NC}  Ссылки прокси, количество уникальных подключений и трафик сессии telemt (через API Telemt)"
         echo -e "  ${CYAN}[p]${NC}  Параметры Telemt (MSS)"
         echo -e "  ${CYAN}[x]${NC}  Проверка ограничений сервера (censorship)"
@@ -3597,7 +3830,24 @@ show_main_menu() {
             2) apply_tuning || true; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             3) show_settings_menu ;;
             4) show_preset_menu ;;
-            5) show_drop_counter || true ;;
+            5)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ] && nft list table ip "${ZAPRET2_NFT_TABLE}" &>/dev/null; then
+                    local _z_table="${ZAPRET2_NFT_TABLE}"
+                    local _l_table="${NFT_TABLE:-telemt_limit}"
+                    if nft list table inet "$_l_table" &>/dev/null; then
+                        echo ""
+                        echo -e "  ${BOLD}Счётчики всех активных правил (Ctrl+C для выхода):${NC}"
+                        echo ""
+                        watch -n 2 "echo '=== Zapret2 (ip $_z_table) ==='; nft list table ip $_z_table 2>/dev/null | grep -E 'counter|queue|notrack|ct mark'; echo ''; echo '=== SYN limiter (inet $_l_table) ==='; nft list table inet $_l_table 2>/dev/null | grep -E 'counter|comment'"
+                    else
+                        echo ""
+                        echo -e "  ${BOLD}Счётчик правил Zapret2 (Ctrl+C для выхода):${NC}"
+                        echo ""
+                        watch -n 2 "nft list table ip $_z_table 2>/dev/null | grep -E 'counter|queue|notrack|ct mark'"
+                    fi
+                else
+                    show_drop_counter || true
+                fi ;;
             6) show_service_menu ;;
             7) show_extra_rules_menu ;;
             8)
@@ -3612,10 +3862,9 @@ show_main_menu() {
                 save_settings
                 log_success "Обнаружено: режим=$DETECTED_MODE порт=${DETECTED_PORT:-?}"
                 echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
-            9) show_ios_fix_menu ;;
-            a|A) show_ios2_fix_menu ;;
+            9) show_meko_opt_menu ;;                
+            o|O) show_legacy_settings_menu ;;
             c|C) [ "${NFT_MODE:-classic}" = "smart" ] && show_smart_settings_menu ;;
-            m|M) show_meko_opt_menu ;;
             z|Z) show_zapret2_menu ;;
             l|L) show_proxy_links; echo ""; read -rsn1 -p "  Нажмите любую клавишу..." ;;
             p|P) show_telemt_params_menu ;;
@@ -3635,9 +3884,11 @@ show_settings_menu() {
             echo -e "  ${DIM}[1]${NC} Привязка к IPv4 [${SERVER_IP:-отключена}]"
         fi
         echo -e "  ${DIM}[2]${NC} Порт            [${SERVER_PORT:-не задан}]"
-        echo -e "  ${DIM}[3]${NC} Rate             [${NFT_RATE}]"
-        echo -e "  ${DIM}[4]${NC} Burst            [${NFT_BURST}]"
-        echo -e "  ${DIM}[5]${NC} Meter timeout    [${NFT_METER_TIMEOUT}]"
+        if [ "${NFT_MODE:-classic}" = "classic" ]; then
+            echo -e "  ${DIM}[3]${NC} Rate             [${NFT_RATE}]"
+            echo -e "  ${DIM}[4]${NC} Burst            [${NFT_BURST}]"
+            echo -e "  ${DIM}[5]${NC} Meter timeout    [${NFT_METER_TIMEOUT}]"
+        fi
         echo -e "  ${DIM}[6]${NC} tg_connect       [${TUNING_TG_CONNECT}]"
         echo -e "  ${DIM}[7]${NC} client_handshake [${TUNING_CLIENT_HANDSHAKE}]"
         echo -e "  ${DIM}[8]${NC} client_keepalive [${TUNING_CLIENT_KEEPALIVE}]"
@@ -3699,25 +3950,37 @@ show_settings_menu() {
                     log_success "Порт установлен: ${SERVER_PORT}"; prompt_apply_nft_rules
                 elif [ -n "$_val" ]; then log_error "Некорректный порт"; fi ;;
             3)
-                echo -en "  Новый rate (напр. 1/second, 2/second): "
-                local _val; read -r _val
-                if [ -n "$_val" ]; then
-                    NFT_RATE="$_val"; save_settings
-                    log_success "Rate установлен: ${NFT_RATE}"; prompt_apply_nft_rules
+                if [ "${NFT_MODE:-classic}" != "classic" ]; then
+                    log_info "Rate доступен только в Classic режиме. Используйте [c] для Smart."
+                else
+                    echo -en "  Новый rate (напр. 1/second, 2/second): "
+                    local _val; read -r _val
+                    if [ -n "$_val" ]; then
+                        NFT_RATE="$_val"; save_settings
+                        log_success "Rate установлен: ${NFT_RATE}"; prompt_apply_nft_rules
+                    fi
                 fi ;;
             4)
-                echo -en "  Новый burst: "
-                local _val; read -r _val
-                if [[ "$_val" =~ ^[0-9]+$ ]]; then
-                    NFT_BURST="$_val"; save_settings
-                    log_success "Burst установлен: ${NFT_BURST}"; prompt_apply_nft_rules
-                elif [ -n "$_val" ]; then log_error "Некорректный burst"; fi ;;
+                if [ "${NFT_MODE:-classic}" != "classic" ]; then
+                    log_info "Burst доступен только в Classic режиме. Используйте [c] для Smart."
+                else
+                    echo -en "  Новый burst: "
+                    local _val; read -r _val
+                    if [[ "$_val" =~ ^[0-9]+$ ]]; then
+                        NFT_BURST="$_val"; save_settings
+                        log_success "Burst установлен: ${NFT_BURST}"; prompt_apply_nft_rules
+                    elif [ -n "$_val" ]; then log_error "Некорректный burst"; fi
+                fi ;;
             5)
-                echo -en "  Новый meter timeout (напр. 30s, 60s, 120s): "
-                local _val; read -r _val
-                if [ -n "$_val" ]; then
-                    NFT_METER_TIMEOUT="$_val"; save_settings
-                    log_success "Meter timeout установлен: ${NFT_METER_TIMEOUT}"; prompt_apply_nft_rules
+                if [ "${NFT_MODE:-classic}" != "classic" ]; then
+                    log_info "Meter timeout доступен только в Classic режиме."
+                else
+                    echo -en "  Новый meter timeout (напр. 30s, 60s, 120s): "
+                    local _val; read -r _val
+                    if [ -n "$_val" ]; then
+                        NFT_METER_TIMEOUT="$_val"; save_settings
+                        log_success "Meter timeout установлен: ${NFT_METER_TIMEOUT}"; prompt_apply_nft_rules
+                    fi
                 fi ;;
             6) echo -en "  tg_connect [${TUNING_TG_CONNECT}]: "; local _val; read -r _val
                [[ "$_val" =~ ^[0-9]+$ ]] && { TUNING_TG_CONNECT="$_val"; save_settings; } ;;
@@ -3754,19 +4017,15 @@ show_settings_menu() {
 show_preset_menu() {
     show_header; echo -e "  ${BOLD}Пресеты${NC}"; echo ""
     echo -e "  ${GREEN}[s]${NC} ${BOLD}★ Smart By-MEKO${NC} ${DIM}(рекомендуется)${NC}"
-    echo -e "      ${DIM}iOS/Android авторазделение + REJECT. Подключение 3-8 сек.${NC}"; echo ""
-    echo -e "  ${RED}[1]${NC} Жёсткий (Classic)  — 1/second burst 1"
-    echo -e "  ${YELLOW}[2]${NC} Средний (Classic)  — 1/second burst 3"
-    echo -e "  ${GREEN}[3]${NC} Мягкий (Classic)   — 2/second burst 5"
-    echo -e "  ${DIM}[4]${NC} Свой вариант (Classic)"
+    echo -e "      ${DIM}iOS/Android и прочие устройства, авторазделение по отпечатку ios + REJECT. Подключение 3-8 сек.${NC}"; echo ""
+    echo -e "  ${DIM}[1]${NC} Classic — 1/second burst 1"
+    echo -e "  ${DIM}[2]${NC} Свой вариант (Classic)"
     echo -e "  ${DIM}[0]${NC} Назад"; echo ""
     echo -en "  Выбор: "; local _choice; read -r _choice
     case "$_choice" in
         s|S) enable_smart_mode; return ;;
         1) apply_preset hard ;;
-        2) apply_preset medium ;;
-        3) apply_preset soft ;;
-        4)
+        2)
             echo -en "  Rate (напр. 1/second): "; local _r; read -r _r
             echo -en "  Burst: "; local _b; read -r _b
             [ -n "$_r" ] && NFT_RATE="$_r"
@@ -4009,58 +4268,11 @@ first_run_wizard() {
         fi
     fi
 
-
-    # Пресет NFT
-    echo ""; echo -e "  ${BOLD}Режим NFT SYN Limiter:${NC}"; echo ""
-    echo -e "  ${GREEN}[s]${NC} ${BOLD}★ Smart By-MEKO${NC} ${DIM}(рекомендуется)${NC}"
-    echo -e "      ${DIM}iOS/Android авторазделение по TTL + REJECT. Подключение 3-8 сек.${NC}"
-    echo -e "      ${DIM}Один порт для всех клиентов.${NC}"; echo ""
-    echo -e "  ${DIM}Или Classic режим:${NC}"
-    echo -e "    ${RED}[1]${NC} Жёсткий  — 1/sec burst 1"
-    echo -e "    ${YELLOW}[2]${NC} Средний  — 1/sec burst 3"
-    echo -e "    ${GREEN}[3]${NC} Мягкий   — 2/sec burst 5"; echo ""
-    echo -en "  Выбор [s]: "; local _preset_input; read -r _preset_input
-    case "$_preset_input" in
-        1) apply_preset hard ;;
-        2) apply_preset medium ;;
-        3) apply_preset soft ;;
-        *) apply_preset smart ;;
-    esac
-
-    # Выбор действия для non-iOS (только для Smart режима)
-    if [ "${NFT_MODE:-classic}" = "smart" ]; then
-        echo ""
-        echo -e "  ${BOLD}Действие для non-iOS устройств (Android / Desktop):${NC}"; echo ""
-        echo -e "  ${GREEN}[1]${NC} ${BOLD}icmp-host-unreachable${NC} ${DIM}(рекомендуется — по умолчанию)${NC}"
-        echo -e "      ${DIM}Сервер притворяется недоступным узлом сети.${NC}"
-        echo -e "      ${DIM}Telegram сразу понимает что параллельный путь закрыт${NC}"
-        echo -e "      ${DIM}и переключается на основное соединение без задержек.${NC}"
-        echo -e "      ${DIM}Результат: медиа начинает отправляться быстро.${NC}"
-        echo ""
-        echo -e "  ${CYAN}[2]${NC} reject (tcp reset)  ${DIM}(оригинал By-MEKO)${NC}"
-        echo -e "      ${DIM}Жёсткий TCP сброс. Быстрый reconnect,${NC}"
-        echo -e "      ${DIM}но небольшая задержка при старте отправки медиа.${NC}"
-        echo ""
-        echo -e "  ${YELLOW}[3]${NC} drop  ${DIM}(не рекомендуется)${NC}"
-        echo -e "      ${DIM}Telegram зависает в ожидании — отправка медиа может не работать.${NC}"
-        echo ""
-        echo -en "  ${BOLD}Выбор [1]:${NC} "
-        local _action_choice; read -r _action_choice
-        case "${_action_choice:-1}" in
-            2) NFT_OTHER_ACTION="reject" ;;
-            3) NFT_OTHER_ACTION="drop" ;;
-            *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
-        esac
-        log_success "Other Action: ${NFT_OTHER_ACTION}"
-    fi
-
-    save_settings
-
-    # Zapret2 MTProto fix by CHIRON
+    # Zapret2 MTProto fix
     echo ""
     echo -e "  ${DIM}────────────────────────────────────────${NC}"
     echo ""
-    echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix by CHKRON${NC}"
+    echo -e "  ${CYAN}${BOLD}Zapret2 MTProto fix${NC}"
     echo ""
     echo -e "  ${DIM}Серверный обход для MTProto прокси.${NC}"
     echo -e "  ${DIM}Работает на уровне TCP пакетов — разрезает и перемешивает${NC}"
@@ -4070,23 +4282,14 @@ first_run_wizard() {
     echo -e "  ${DIM}Метод: disorder + badsum + TCP window control${NC}"
     echo -e "  ${DIM}Включает автоматический iOS bypass по TCP fingerprint.${NC}"
     echo ""
-    if [ "${NFT_MODE:-classic}" = "smart" ]; then
-        echo -e "  ${YELLOW}⚠ Если включить zapret2 fix, SYN limiter (Smart By-MEKO)${NC}"
-        echo -e "  ${YELLOW}  будет отключён — zapret2 работает на другом уровне${NC}"
-        echo -e "  ${YELLOW}  и заменяет его.${NC}"
-        echo ""
-    fi
-    echo -en "  ${BOLD}Установить Zapret2 MTProto fix? [y/N]:${NC} "
+    echo -en "  ${BOLD}Установить Zapret2 MTProto fix? [Y/n]:${NC} "
     local _yn_zapret2; read -r _yn_zapret2
-    if [[ "$_yn_zapret2" =~ ^[yY]$ ]]; then
-        # Zapret2 fix заменяет SYN limiter полностью
-        if [ "${NFT_MODE:-classic}" = "smart" ] || [ "${NFT_MODE:-classic}" = "classic" ]; then
-            log_info "Zapret2 fix заменяет SYN limiter — очищаю его состояние"
-            NFT_SERVICE_ENABLED="false"
-            remove_nft_rules 2>/dev/null || true
-            remove_service 2>/dev/null || true
-            save_settings
-        fi
+    if [[ ! "$_yn_zapret2" =~ ^[nN]$ ]]; then
+        log_info "Zapret2 fix заменяет SYN limiter — очищаю его состояние"
+        NFT_SERVICE_ENABLED="false"
+        remove_nft_rules 2>/dev/null || true
+        remove_service 2>/dev/null || true
+        save_settings
 
         zapret2_download_bundle
         if [ $? -eq 0 ]; then
@@ -4102,6 +4305,7 @@ first_run_wizard() {
                 ZAPRET2_SERVICE_ENABLED="true"
                 save_settings
                 log_success "Zapret2 MTProto fix установлен и запущен"
+                zapret2_check_wscale "false"
                 echo ""
                 echo -e "  ${BOLD}Параметры по умолчанию:${NC}"
                 echo -e "    out-range:   ${ZAPRET2_OUT_RANGE}"
@@ -4123,6 +4327,51 @@ first_run_wizard() {
         log_info "Zapret2 fix не установлен. Можно включить позже: меню → [z]"
     fi
 
+    # Пресет NFT (только если zapret2 fix не установлен)
+    if [ "${ZAPRET2_APPLIED:-false}" != "true" ]; then
+        echo ""; echo -e "  ${BOLD}Режим NFT SYN Limiter:${NC}"; echo ""
+        echo -e "  ${GREEN}[s]${NC} ${BOLD}★ Smart By-MEKO${NC} ${DIM}(рекомендуется)${NC}"
+        echo -e "      ${DIM}iOS/Android авторазделение по Отпечатку iOS + REJECT. Подключение 3-8 сек.${NC}"
+        echo -e "      ${DIM}Один порт для всех клиентов.${NC}"; echo ""
+        echo -e "  ${DIM}[1]${NC} Classic — 1/sec burst 1"; echo ""
+        echo -en "  Выбор [s]: "; local _preset_input; read -r _preset_input
+        case "$_preset_input" in
+            1) apply_preset hard ;;
+            *) apply_preset smart ;;
+        esac
+
+        # Выбор действия для non-iOS (только для Smart режима)
+        if [ "${NFT_MODE:-classic}" = "smart" ]; then
+            echo ""
+            echo -e "  ${BOLD}Действие для non-iOS устройств (Android / Desktop):${NC}"; echo ""
+            echo -e "  ${GREEN}[1]${NC} ${BOLD}icmp-host-unreachable${NC} ${DIM}(рекомендуется — по умолчанию)${NC}"
+            echo -e "      ${DIM}Сервер притворяется недоступным узлом сети.${NC}"
+            echo -e "      ${DIM}Telegram сразу понимает что параллельный путь закрыт${NC}"
+            echo -e "      ${DIM}и переключается на основное соединение без задержек.${NC}"
+            echo -e "      ${DIM}Результат: медиа начинает отправляться быстро.${NC}"
+            echo ""
+            echo -e "  ${CYAN}[2]${NC} reject (tcp reset)  ${DIM}(оригинал By-MEKO)${NC}"
+            echo -e "      ${DIM}Жёсткий TCP сброс. Быстрый reconnect,${NC}"
+            echo -e "      ${DIM}но небольшая задержка при старте отправки медиа.${NC}"
+            echo ""
+            echo -e "  ${YELLOW}[3]${NC} drop  ${DIM}(не рекомендуется)${NC}"
+            echo -e "      ${DIM}Telegram зависает в ожидании — отправка медиа может не работать.${NC}"
+            echo ""
+            echo -en "  ${BOLD}Выбор [1]:${NC} "
+            local _action_choice; read -r _action_choice
+            case "${_action_choice:-1}" in
+                2) NFT_OTHER_ACTION="reject" ;;
+                3) NFT_OTHER_ACTION="drop" ;;
+                *) NFT_OTHER_ACTION="icmp-host-unreachable" ;;
+            esac
+            log_success "Other Action: ${NFT_OTHER_ACTION}"
+        fi
+    else
+        log_info "SYN limiter пропущен — zapret2 fix уже активен"
+    fi
+
+    save_settings
+
     # Тюнинг
     echo ""
     echo -e "  ${BOLD}Тюнинг Telemt — будут применены следующие параметры:${NC}"; echo ""
@@ -4137,29 +4386,6 @@ first_run_wizard() {
     local _yn_tuning; read -r _yn_tuning
     if [[ ! "$_yn_tuning" =~ ^[nN] ]]; then apply_tuning || true; fi
 
-    # iOS Fix v1
-    echo ""
-    echo -en "  ${BOLD}Применить фикс для iOS вариант 1 (TCP keepalive)? [y/N]:${NC} "
-    local _yn_ios; read -r _yn_ios
-    if [[ "$_yn_ios" =~ ^[yY]$ ]]; then
-        if [ -z "$IOS_ORIG_TIME" ]; then
-            IOS_ORIG_TIME=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "7200")
-            IOS_ORIG_INTVL=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "75")
-            IOS_ORIG_PROBES=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "9")
-        fi
-        printf '# MTproxy-reanimation: фикс для iOS — TCP keepalive\nnet.ipv4.tcp_keepalive_time = 60\nnet.ipv4.tcp_keepalive_intvl = 15\nnet.ipv4.tcp_keepalive_probes = 3\n' \
-            > "$IOS_SYSCTL_FILE"
-        sysctl --system &>/dev/null || true
-        IOS_FIX_APPLIED="true"; save_settings
-        log_success "Фикс для iOS применён"
-    fi
-
-    # Подсказка про iOS Fix v2 при Classic режиме
-    if [ "${NFT_MODE:-classic}" = "classic" ]; then
-        echo ""
-        log_info "iOS Fix v2 (MSS + redirect) доступен в меню: [a] Фикс для iOS вариант 2"
-    fi
-
     # Оптимизация By-MEKO
     echo ""
     echo -e "  ${BOLD}Оптимизация системы By-MEKO${NC}"
@@ -4167,9 +4393,9 @@ first_run_wizard() {
     echo -e "  ${DIM}TCP keepalive 45s/15s×3, BBR, расширенные очереди.${NC}"
     echo -e "  ${DIM}Текущие значения будут сохранены для отката.${NC}"
     echo ""
-    echo -en "  ${BOLD}Применить оптимизацию By-MEKO? [y/N]:${NC} "
+    echo -en "  ${BOLD}Применить оптимизацию By-MEKO? [Y/n]:${NC} "
     local _yn_meko; read -r _yn_meko
-    if [[ "$_yn_meko" =~ ^[yY]$ ]]; then
+    if [[ ! "$_yn_meko" =~ ^[nN]$ ]]; then
         meko_opt_apply
     fi
 
