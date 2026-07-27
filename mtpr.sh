@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.2.2
+#  MTproxy-reanimation v1.2.3
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -2945,10 +2945,17 @@ _generate_smart_rules() {
     local _ios_detect="${NFT_IOS_DETECT:-fingerprint}"
 
     local _ip_match=""
-    [ -n "$_ip" ] && [ "$DETECTED_NETWORK_MODE" != "bridge" ] && _ip_match="ip daddr ${_ip} "
-
     if [ "$_bridge_precise" = "true" ]; then
-        log_warn "Smart режим в bridge/precise: ip daddr контейнера не используется"
+        local _cip
+        _cip=$(docker_container_ip "$DETECTED_CONTAINER")
+        if [ -n "$_cip" ]; then
+            _ip_match="ip daddr ${_cip} "
+            log_info "Smart режим в bridge/precise: ip daddr ${_cip}"
+        else
+            log_warn "Smart режим в bridge/precise: IP контейнера не определён, правила будут без ip daddr"
+        fi
+    elif [ -n "$_ip" ] && [ "$DETECTED_NETWORK_MODE" != "bridge" ]; then
+        _ip_match="ip daddr ${_ip} "
     fi
 
     # ── Выбор метода идентификации iOS ──────────────────────
