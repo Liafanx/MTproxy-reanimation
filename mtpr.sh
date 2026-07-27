@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.2.4
+#  MTproxy-reanimation v1.2.5
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -2107,6 +2107,7 @@ nft "add rule ip \$TABLE postrouting ct mark \$CT_MARK counter accept"
 nft "add rule ip \$TABLE postrouting meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue flags bypass to \$QNUM"
 
 nft "add chain ip \$TABLE prerouting { type filter hook prerouting priority mangle; policy accept; }"
+nft "add rule ip \$TABLE prerouting ct state invalid counter drop"
 nft "add rule ip \$TABLE prerouting ct mark \$CT_MARK counter accept"
 nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue flags bypass to \$QNUM"
 
@@ -2171,6 +2172,7 @@ zapret2_apply_nft() {
     nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue flags bypass to ${ZAPRET2_QNUM}"
 
     nft "add chain ip $_table prerouting { type filter hook prerouting priority mangle; policy accept; }"
+    nft "add rule ip $_table prerouting ct state invalid counter drop"
     nft "add rule ip $_table prerouting ct mark ${_ct_mark} counter accept"
     nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue flags bypass to ${ZAPRET2_QNUM}"
 
