@@ -2635,6 +2635,7 @@ show_zapret2_menu() {
             else
                 echo -e "  ${GREEN}[3]${NC}  Запустить zapret2"
             fi
+            
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua + NFT"
             echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
