@@ -1843,6 +1843,20 @@ zapret2_detect_arch() {
     esac
 }
 
+zapret2_find_free_queue() {
+    local _start="${1:-200}"
+    local _end="${2:-299}"
+    local _q
+
+    for ((_q=_start; _q<=_end; _q++)); do
+        if ! grep -q "^ *${_q} " /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
+            echo "$_q"
+            return 0
+        fi
+    done
+    return 1
+}
+
 zapret2_download_bundle() {
     local _arch
     _arch=$(zapret2_detect_arch)
@@ -2277,6 +2291,22 @@ zapret2_install() {
             log_success "SYN limiter отключён"
         else
             log_warn "SYN limiter оставлен — возможны конфликты"
+        fi
+    fi
+
+    # Проверяем занятость NFQUEUE
+    if grep -q "^ *${ZAPRET2_QNUM} " /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
+        local _old_q="$ZAPRET2_QNUM"
+        local _new_q
+        _new_q=$(zapret2_find_free_queue 200 299)
+        if [ -n "$_new_q" ]; then
+            log_warn "NFQUEUE ${_old_q} уже занята"
+            ZAPRET2_QNUM="$_new_q"
+            save_settings
+            log_success "Выбрана свободная очередь: ${ZAPRET2_QNUM}"
+        else
+            log_error "Все NFQUEUE 200-299 заняты"
+            return 1
         fi
     fi
 
