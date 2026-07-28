@@ -2640,13 +2640,12 @@ show_zapret2_menu() {
             else
                 echo -e "  ${GREEN}[3]${NC}  Запустить zapret2"
             fi
-        fi    
-        if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then    
+        fi        
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua"
             echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
             echo -e "  ${CYAN}[7]${NC}  Диагностика"
-        fi
+        if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
             if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
                 echo -e "  ${CYAN}[d]${NC}  Debug лог (tail -100)"
             fi
