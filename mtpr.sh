@@ -7,7 +7,7 @@
 set -eo pipefail
 
 VERSION="1.2.7"
-GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
+GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
 NFT_SCRIPT="/usr/local/sbin/mtpr-syn-limit.sh"
@@ -2097,7 +2097,8 @@ function lets_resend(ctx, desync)
 
     -- Пустые ACK от сервера: зажимаем окно, но отпускаем после первого payload клиента
     if direction_check(desync) and bitand(desync.dis.tcp.th_flags, TH_SYN + TH_ACK) == (TH_ACK) then
-        if desync.track and desync.dis.tcp.th_ack - desync.track.lua_state["ack0"] >= 1400 then
+        local ack0 = desync.track and desync.track.lua_state["ack0"]
+        if ack0 and (desync.dis.tcp.th_ack - ack0 >= 1400) then
             instance_cutoff(ctx, true)
             desync.arg.fwmark = 0x40000
             rawsend_dissect_segmented(desync)
@@ -2127,6 +2128,7 @@ end
 LUAEOF
     log_success "Lua скрипт записан: ${ZAPRET2_LUA}"
 }
+
 zapret2_write_service() {
     # Пишем скрипт запуска который применяет NFT и запускает nfqws2
     local _nft_script="/usr/local/sbin/mtpr-zapret2-start.sh"
