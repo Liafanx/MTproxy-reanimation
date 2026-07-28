@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.2.5
+#  MTproxy-reanimation v1.2.6
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.2.5"
+VERSION="1.2.6"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/main"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -1848,13 +1848,55 @@ zapret2_find_free_queue() {
     local _end="${2:-299}"
     local _q
 
+    modprobe nfnetlink_queue 2>/dev/null || true
+
     for ((_q=_start; _q<=_end; _q++)); do
-        if ! grep -q "^ *${_q} " /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
+        if ! awk -v q="$_q" '$1 == q { found=1 } END { exit found ? 0 : 1 }' /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
             echo "$_q"
             return 0
         fi
     done
     return 1
+}
+
+zapret2_queue_in_use() {
+    local _q="${1:-200}"
+    modprobe nfnetlink_queue 2>/dev/null || true
+    awk -v q="$_q" '$1 == q { found=1 } END { exit found ? 0 : 1 }' /proc/net/netfilter/nfnetlink_queue 2>/dev/null
+}
+
+zapret2_has_residue() {
+    nft list table ip "${ZAPRET2_NFT_TABLE}" &>/dev/null 2>&1 && return 0
+    systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1 && return 0
+    systemctl is-enabled "$ZAPRET2_SERVICE" &>/dev/null 2>&1 && return 0
+    [ -f "/etc/systemd/system/${ZAPRET2_SERVICE}" ] && return 0
+    [ -f "/usr/local/sbin/mtpr-zapret2-start.sh" ] && return 0
+    [ -d "$ZAPRET2_DIR" ] && return 0
+    [ -d "$ZAPRET2_ETC_DIR" ] && return 0
+    pgrep -f "$ZAPRET2_BIN" >/dev/null 2>&1 && return 0
+    pgrep -x nfqws2 >/dev/null 2>&1 && return 0
+    return 1
+}
+
+zapret2_cleanup_failed_install() {
+    systemctl stop "$ZAPRET2_SERVICE" 2>/dev/null || true
+    systemctl disable "$ZAPRET2_SERVICE" 2>/dev/null || true
+
+    pkill -9 -f "$ZAPRET2_BIN" 2>/dev/null || true
+    pkill -9 -x nfqws2 2>/dev/null || true
+
+    nft delete table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
+
+    rm -f "/etc/systemd/system/${ZAPRET2_SERVICE}"
+    rm -f "/usr/local/sbin/mtpr-zapret2-start.sh"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$ZAPRET2_SERVICE" 2>/dev/null || true
+
+    ZAPRET2_APPLIED="false"
+    ZAPRET2_SERVICE_ENABLED="false"
+    save_settings
+
+    log_success "Следы неудачной установки zapret2 очищены"
 }
 
 zapret2_download_bundle() {
@@ -2277,7 +2319,11 @@ zapret2_install() {
     zapret2_download_bundle || return 1
 
     # Zapret2 fix заменяет SYN limiter — отключаем его если активен
+    local _had_limiter="false"
+    local _had_limiter_service="false"
     if [ "${NFT_SERVICE_ENABLED:-false}" = "true" ] || nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null 2>&1; then
+        _had_limiter="true"
+        [ "${NFT_SERVICE_ENABLED:-false}" = "true" ] && _had_limiter_service="true"
         echo ""
         echo -e "  ${YELLOW}⚠ SYN limiter активен.${NC}"
         echo -e "  ${DIM}Zapret2 fix работает на уровне пакетов и заменяет SYN limiter.${NC}"
@@ -2290,22 +2336,26 @@ zapret2_install() {
             remove_service 2>/dev/null || true
             log_success "SYN limiter отключён"
         else
+            _had_limiter="false"
+            _had_limiter_service="false"
             log_warn "SYN limiter оставлен — возможны конфликты"
         fi
     fi
 
     # Проверяем занятость NFQUEUE
-    if grep -q "^ *${ZAPRET2_QNUM} " /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
+    if zapret2_queue_in_use "${ZAPRET2_QNUM}"; then
         local _old_q="$ZAPRET2_QNUM"
         local _new_q
-        _new_q=$(zapret2_find_free_queue 200 299)
+        _new_q=$(zapret2_find_free_queue 250 299)
+        [ -z "$_new_q" ] && _new_q=$(zapret2_find_free_queue 201 249)
+
         if [ -n "$_new_q" ]; then
             log_warn "NFQUEUE ${_old_q} уже занята"
             ZAPRET2_QNUM="$_new_q"
             save_settings
             log_success "Выбрана свободная очередь: ${ZAPRET2_QNUM}"
         else
-            log_error "Все NFQUEUE 200-299 заняты"
+            log_error "Не удалось найти свободную NFQUEUE в диапазоне 201..299"
             return 1
         fi
     fi
@@ -2313,7 +2363,19 @@ zapret2_install() {
     zapret2_write_conf
     zapret2_write_lua
     zapret2_write_service
-    zapret2_start || return 1
+
+    if ! zapret2_start; then
+        log_warn "zapret2 не запустился — выполняю откат"
+        zapret2_cleanup_failed_install || true
+
+        if [ "${NFT_SERVICE_ENABLED:-false}" = "true" ] || [ -n "${_had_limiter:-}" ]; then
+            log_info "Возвращаю SYN limiter..."
+            apply_nft_rules || true
+            [ "${_had_limiter_service:-false}" = "true" ] && install_service || true
+        fi
+
+        return 1
+    fi
 
     ZAPRET2_APPLIED="true"
     ZAPRET2_SERVICE_ENABLED="true"
@@ -2570,7 +2632,7 @@ show_zapret2_menu() {
         if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null 2>&1 || \
            systemctl is-active mtpr-syn-limit.service &>/dev/null 2>&1; then
             echo -e "  ${YELLOW}  ⚠ SYN limiter активен — zapret2 его заменит${NC}"
-        fi        
+        fi
         if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
             echo -e "  ${CYAN}[2]${NC}  Перезапустить zapret2"
             if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
@@ -2578,15 +2640,20 @@ show_zapret2_menu() {
             else
                 echo -e "  ${GREEN}[3]${NC}  Запустить zapret2"
             fi
+        fi    
+        if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then    
             echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
             echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua"
             echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
             echo -e "  ${CYAN}[7]${NC}  Диагностика"
+        fi
             if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
                 echo -e "  ${CYAN}[d]${NC}  Debug лог (tail -100)"
             fi
             echo -e "  ${CYAN}[r]${NC}  Сбросить настройки к значениям по умолчанию"
             echo -e "  ${RED}[8]${NC}  Удалить zapret2"
+        elif zapret2_has_residue; then
+            echo -e "  ${YELLOW}[8]${NC}  Очистить следы неудачной установки"
         fi
         echo -e "  ${DIM}[0]${NC}  Назад"
         echo ""
@@ -2677,7 +2744,19 @@ show_zapret2_menu() {
                         log_info "Отменено"
                     fi
                 fi ;;                
-            8) [ "${ZAPRET2_APPLIED:-false}" = "true" ] && zapret2_remove ;;
+            8)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    zapret2_remove
+                elif zapret2_has_residue; then
+                    echo ""
+                    echo -en "  ${BOLD}Очистить следы неудачной установки zapret2? [Y/n]:${NC} "
+                    local _yn; read -r _yn
+                    if [[ ! "$_yn" =~ ^[nN]$ ]]; then
+                        zapret2_cleanup_failed_install
+                    else
+                        log_info "Отменено"
+                    fi
+                fi ;;
             d|D)
                 if [ "${ZAPRET2_APPLIED:-false}" = "true" ] && [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
                     echo ""
