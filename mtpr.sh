@@ -2576,6 +2576,7 @@ zapret2_check_wscale() {
         fi
     fi
 }
+
 show_zapret2_menu() {
     while true; do
         show_header
@@ -2585,25 +2586,23 @@ show_zapret2_menu() {
         echo -e "  Статус: $(zapret2_status)"
         echo ""
 
-        # Параметры — показываем всегда
-        echo -e "  ${BOLD}Параметры:${NC}"
-        echo -e "    out-range:     ${GREEN}${ZAPRET2_OUT_RANGE}${NC}    ${DIM}(исходящие пакеты сервера)${NC}"
-        echo -e "    in-range:      ${ZAPRET2_IN_RANGE}    ${DIM}(входящие пакеты)${NC}"
-        echo -e "    split len:     ${GREEN}${ZAPRET2_SPLIT_LEN}${NC}       ${DIM}(размер частей ClientHello)${NC}"
-        echo -e "    win SYN+ACK:   ${ZAPRET2_WIN_SYNACK}      ${DIM}(TCP window в SYN+ACK)${NC}"
-        echo -e "    win ACK:       ${ZAPRET2_WIN_ACK}        ${DIM}(TCP window в пустых ACK)${NC}"
-        echo -e "    NFQUEUE num:   ${ZAPRET2_QNUM}       ${DIM}(номер очереди)${NC}"
-        echo -e "    fwmark:        ${ZAPRET2_FWMARK}    ${DIM}(маркировка пакетов)${NC}"
-        echo -e "    Порт:          ${SERVER_PORT:-${DIM}не задан${NC}}       ${DIM}(из настроек mtpr)${NC}"
-        if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
-            echo -e "    Debug:         ${YELLOW}включён${NC} → ${ZAPRET2_DEBUG_LOG}"
-        else
-            echo -e "    Debug:         ${DIM}выключен${NC}"
-        fi
-        echo ""
-
-        # Служба и NFT — показываем если установлен
         if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+            echo -e "  ${BOLD}Параметры:${NC}"
+            echo -e "    out-range:     ${GREEN}${ZAPRET2_OUT_RANGE}${NC}    ${DIM}(исходящие пакеты сервера)${NC}"
+            echo -e "    in-range:      ${ZAPRET2_IN_RANGE}    ${DIM}(входящие пакеты)${NC}"
+            echo -e "    split len:     ${GREEN}${ZAPRET2_SPLIT_LEN}${NC}       ${DIM}(размер частей ClientHello)${NC}"
+            echo -e "    win SYN+ACK:   ${ZAPRET2_WIN_SYNACK}      ${DIM}(TCP window в SYN+ACK)${NC}"
+            echo -e "    win ACK:       ${ZAPRET2_WIN_ACK}        ${DIM}(TCP window в пустых ACK)${NC}"
+            echo -e "    NFQUEUE num:   ${ZAPRET2_QNUM}       ${DIM}(номер очереди)${NC}"
+            echo -e "    fwmark:        ${ZAPRET2_FWMARK}    ${DIM}(маркировка пакетов)${NC}"
+            echo -e "    Порт:          ${SERVER_PORT:-${DIM}не задан${NC}}       ${DIM}(из настроек mtpr)${NC}"
+            if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
+                echo -e "    Debug:         ${YELLOW}включён${NC} → ${ZAPRET2_DEBUG_LOG}"
+            else
+                echo -e "    Debug:         ${DIM}выключен${NC}"
+            fi
+            echo ""
+
             local _svc_status="${DIM}не установлена${NC}"
             local _svc_enabled="${DIM}disabled${NC}"
 
@@ -2628,37 +2627,34 @@ show_zapret2_menu() {
                 echo -e "  ${BOLD}NFT:${NC}    ${RED}таблица ip ${ZAPRET2_NFT_TABLE} не найдена${NC}"
             fi
             echo ""
-        fi
 
-        # Меню — все пункты всегда видны
-        echo -e "  ${GREEN}[1]${NC}  Установить / переустановить zapret2"
-        if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null 2>&1 || \
-           systemctl is-active mtpr-syn-limit.service &>/dev/null 2>&1; then
-            echo -e "  ${YELLOW}  ⚠ SYN limiter активен — zapret2 его заменит${NC}"
-        fi
-
-        if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+            echo -e "  ${GREEN}[1]${NC}  Переустановить zapret2"
             echo -e "  ${CYAN}[2]${NC}  Перезапустить zapret2"
             if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
                 echo -e "  ${CYAN}[3]${NC}  Остановить zapret2"
             else
                 echo -e "  ${GREEN}[3]${NC}  Запустить zapret2"
             fi
-        fi
-
-        echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
-        echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua + NFT"
-        echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
-        echo -e "  ${CYAN}[7]${NC}  Диагностика (wscale + queue + NFT)"
-
-        if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+            echo -e "  ${CYAN}[4]${NC}  Настройки параметров"
+            echo -e "  ${CYAN}[5]${NC}  Показать конфиг + Lua + NFT"
+            echo -e "  ${CYAN}[6]${NC}  Логи службы (systemd journal)"
+            echo -e "  ${CYAN}[7]${NC}  Диагностика (wscale + queue + NFT)"
             if [ "${ZAPRET2_DEBUG:-false}" = "true" ]; then
                 echo -e "  ${CYAN}[d]${NC}  Debug лог (tail -100)"
             fi
             echo -e "  ${CYAN}[r]${NC}  Сбросить настройки к значениям по умолчанию"
             echo -e "  ${RED}[8]${NC}  Удалить zapret2"
-        elif zapret2_has_residue; then
-            echo -e "  ${YELLOW}[8]${NC}  Очистить следы неудачной установки"
+
+        else
+            # Не установлен
+            echo -e "  ${GREEN}[1]${NC}  Установить zapret2"
+            if nft list table inet "${NFT_TABLE:-telemt_limit}" &>/dev/null 2>&1 || \
+               systemctl is-active mtpr-syn-limit.service &>/dev/null 2>&1; then
+                echo -e "  ${YELLOW}  ⚠ SYN limiter активен — zapret2 его заменит${NC}"
+            fi
+            if zapret2_has_residue; then
+                echo -e "  ${YELLOW}[8]${NC}  Очистить следы неудачной установки"
+            fi
         fi
 
         echo -e "  ${DIM}[0]${NC}  Назад"
@@ -2685,47 +2681,64 @@ show_zapret2_menu() {
                 else
                     log_info "Zapret2 не установлен — используйте [1]"
                 fi ;;
-            4) show_zapret2_settings_menu ;;
-            5)
-                echo ""
-                echo -e "  ${BOLD}=== ${ZAPRET2_CONF} ===${NC}"
-                cat "$ZAPRET2_CONF" 2>/dev/null || echo "  (файл не найден)"
-                echo ""
-                echo -e "  ${BOLD}=== ${ZAPRET2_LUA} ===${NC}"
-                cat "$ZAPRET2_LUA" 2>/dev/null || echo "  (файл не найден)"
-                echo ""
-                echo -e "  ${BOLD}=== NFT table ip ${ZAPRET2_NFT_TABLE} ===${NC}"
-                nft list table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || echo "  (таблица не найдена)" ;;
-            6)
-                echo ""
-                journalctl -u "$ZAPRET2_SERVICE" -n 30 --no-pager 2>/dev/null || log_warn "Логов нет" ;;
-            7)
-                echo ""
-                echo -e "  ${BOLD}=== systemd ===${NC}"
-                systemctl status "$ZAPRET2_SERVICE" --no-pager -l 2>/dev/null || true
-                echo ""
-                echo -e "  ${BOLD}=== journal ===${NC}"
-                journalctl -u "$ZAPRET2_SERVICE" -n 30 --no-pager 2>/dev/null || true
-                echo ""
-                echo -e "  ${BOLD}=== queue ===${NC}"
-                modprobe nfnetlink_queue 2>/dev/null || true
-                echo -e "  ${DIM}Используемая очередь: ${ZAPRET2_QNUM}${NC}"
-                if grep -q "^ *${ZAPRET2_QNUM} " /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
-                    echo -e "  ${GREEN}Очередь ${ZAPRET2_QNUM} активна${NC}"
+            4)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    show_zapret2_settings_menu
                 else
-                    echo -e "  ${YELLOW}Очередь ${ZAPRET2_QNUM} не найдена в системе${NC}"
-                fi
-                echo -e "  ${DIM}Все очереди:${NC}"
-                cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null || echo "  queue info unavailable"
-                echo ""
-                echo -e "  ${BOLD}=== nft mtproto ===${NC}"
-                nft list table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
-                echo ""
-                echo -e "  ${BOLD}=== old limiter ===${NC}"
-                systemctl is-active mtpr-syn-limit.service 2>/dev/null || true
-                systemctl is-active mtpr-bridge-watch.service 2>/dev/null || true
-                nft list table inet "${NFT_TABLE:-telemt_limit}" 2>/dev/null || echo "  old limiter table отсутствует"
-                zapret2_check_wscale "true" ;;
+                    log_info "Zapret2 не установлен — используйте [1]"
+                fi ;;
+            5)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    echo ""
+                    echo -e "  ${BOLD}=== ${ZAPRET2_CONF} ===${NC}"
+                    cat "$ZAPRET2_CONF" 2>/dev/null || echo "  (файл не найден)"
+                    echo ""
+                    echo -e "  ${BOLD}=== ${ZAPRET2_LUA} ===${NC}"
+                    cat "$ZAPRET2_LUA" 2>/dev/null || echo "  (файл не найден)"
+                    echo ""
+                    echo -e "  ${BOLD}=== NFT table ip ${ZAPRET2_NFT_TABLE} ===${NC}"
+                    nft list table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || echo "  (таблица не найдена)"
+                else
+                    log_info "Zapret2 не установлен — используйте [1]"
+                fi ;;
+            6)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    echo ""
+                    journalctl -u "$ZAPRET2_SERVICE" -n 30 --no-pager 2>/dev/null || log_warn "Логов нет"
+                else
+                    log_info "Zapret2 не установлен — используйте [1]"
+                fi ;;
+            7)
+                if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
+                    echo ""
+                    echo -e "  ${BOLD}=== systemd ===${NC}"
+                    systemctl status "$ZAPRET2_SERVICE" --no-pager -l 2>/dev/null || true
+                    echo ""
+                    echo -e "  ${BOLD}=== journal ===${NC}"
+                    journalctl -u "$ZAPRET2_SERVICE" -n 30 --no-pager 2>/dev/null || true
+                    echo ""
+                    echo -e "  ${BOLD}=== queue ===${NC}"
+                    modprobe nfnetlink_queue 2>/dev/null || true
+                    echo -e "  ${DIM}Используемая очередь: ${ZAPRET2_QNUM}${NC}"
+                    if grep -q "^ *${ZAPRET2_QNUM} " /proc/net/netfilter/nfnetlink_queue 2>/dev/null; then
+                        echo -e "  ${GREEN}Очередь ${ZAPRET2_QNUM} активна${NC}"
+                    else
+                        echo -e "  ${YELLOW}Очередь ${ZAPRET2_QNUM} не найдена в системе${NC}"
+                    fi
+                    echo -e "  ${DIM}Все очереди:${NC}"
+                    cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null || echo "  queue info unavailable"
+                    echo ""
+                    echo -e "  ${BOLD}=== nft mtproto ===${NC}"
+                    nft list table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
+                    echo ""
+                    echo -e "  ${BOLD}=== old limiter ===${NC}"
+                    systemctl is-active mtpr-syn-limit.service 2>/dev/null || true
+                    systemctl is-active mtpr-bridge-watch.service 2>/dev/null || true
+                    nft list table inet "${NFT_TABLE:-telemt_limit}" 2>/dev/null || echo "  old limiter table отсутствует"
+                    zapret2_check_wscale "true"
+                else
+                    log_info "Zapret2 не установлен — используйте [1]"
+                fi ;;
             r|R)
                 if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
                     echo ""
