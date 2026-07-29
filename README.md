@@ -56,13 +56,13 @@ mtpr
 
 ## Обновления
 
-<details>
+<details> 
 <summary><b>1.2.5-1.2.7 от 29.07.2026</b></summary>
 
-- Перевод ссылок установки и автообновления скрипта на ветку **dev**.
-- В цепочку `forward` таблицы `MTProto` для Docker bridge добавлена поддержка фильтрации по IP контейнера в точном режиме (`DOCKER_BRIDGE_MODE="precise"` → заполнение `ip daddr` и `ip saddr` адресом контейнера).
-- Проверена и обеспечена полная совместимость службы отслеживания смены IP контейнера (`generate_bridge_watch_script` / `mtpr-bridge-watch.service`) с Zapret2 (`mtpr-zapret2.service`).
-- Улучшена функция `lets_resend` в Lua-скрипте Zapret2 (`ack0` проверяется на nil перед вычитанием `desync.dis.tcp.th_ack - ack0 >= 1400`).
+- Добавлена поддержка работы Zapret2 для Telemt в контейнере в режиме Bridge.
+- В цепочку forward таблицы MTProto для Docker bridge добавлена поддержка фильтрации по IP контейнера в точном режиме (DOCKER_BRIDGE_MODE="precise" → заполнение ip daddr и ip saddr адресом контейнера).
+- Проверена и обеспечена полная совместимость службы отслеживания смены IP контейнера (generate_bridge_watch_script / mtpr-bridge-watch.service) с Zapret2 (mtpr-zapret2.service).
+- Исправлены некоторые баги, улучшено управление Zapret2.
 
 </details>
 
