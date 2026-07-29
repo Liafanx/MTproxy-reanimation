@@ -1,12 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  MTproxy-reanimation v1.2.7
+#  MTproxy-reanimation v1.2.8
 #  Telemt inbound SYN limiter + tuning manager
 #  https://github.com/Liafanx/MTproxy-reanimation
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail
 
-VERSION="1.2.7"
+VERSION="1.2.8"
 GITHUB_RAW="https://raw.githubusercontent.com/Liafanx/MTproxy-reanimation/dev"
 INSTALL_DIR="/opt/mtproxy-reanimation"
 SETTINGS_FILE="${INSTALL_DIR}/settings.conf"
@@ -2128,13 +2128,17 @@ end
 LUAEOF
     log_success "Lua скрипт записан: ${ZAPRET2_LUA}"
 }
-
 zapret2_write_service() {
     # Пишем скрипт запуска который применяет NFT и запускает nfqws2
     local _nft_script="/usr/local/sbin/mtpr-zapret2-start.sh"
     local _ct_mark="0x00040000"
     local _combined_mark
     printf -v _combined_mark '0x%08x' "$(( ZAPRET2_FWMARK | _ct_mark ))"
+
+    local _is_bridge="false"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] || [ "${NFT_HOOK:-input}" = "forward" ]; then
+        _is_bridge="true"
+    fi
 
     cat > "$_nft_script" << NFTSTART
 #!/bin/bash
@@ -2146,6 +2150,7 @@ PORT="${SERVER_PORT:-443}"
 QNUM="${ZAPRET2_QNUM}"
 CT_MARK="${_ct_mark}"
 COMBINED_MARK="${_combined_mark}"
+IS_BRIDGE="${_is_bridge}"
 
 # Удаляем старую таблицу если есть
 nft delete table ip "\$TABLE" 2>/dev/null || true
@@ -2160,16 +2165,24 @@ nft "add rule ip \$TABLE predefrag meta mark and \$FWMARK != 0x00000000 counter 
 nft "add chain ip \$TABLE output { type route hook output priority mangle; policy accept; }"
 nft "add rule ip \$TABLE output meta mark and \$COMBINED_MARK == \$COMBINED_MARK ct mark set \$CT_MARK counter accept"
 
-nft "add chain ip \$TABLE postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
-nft "add rule ip \$TABLE postrouting ct mark \$CT_MARK counter accept"
-nft "add rule ip \$TABLE postrouting meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue num \$QNUM bypass"
+if [ "\$IS_BRIDGE" = "true" ]; then
+    nft "add chain ip \$TABLE forward { type filter hook forward priority mangle; policy accept; }"
+    nft "add rule ip \$TABLE forward ct state invalid counter drop"
+    nft "add rule ip \$TABLE forward ct mark \$CT_MARK counter accept"
+    nft "add rule ip \$TABLE forward meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue num \$QNUM bypass"
+    nft "add rule ip \$TABLE forward meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue num \$QNUM bypass"
+else
+    nft "add chain ip \$TABLE postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
+    nft "add rule ip \$TABLE postrouting ct mark \$CT_MARK counter accept"
+    nft "add rule ip \$TABLE postrouting meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue num \$QNUM bypass"
 
-nft "add chain ip \$TABLE prerouting { type filter hook prerouting priority mangle; policy accept; }"
-nft "add rule ip \$TABLE prerouting ct state invalid counter drop"
-nft "add rule ip \$TABLE prerouting ct mark \$CT_MARK counter accept"
-nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue num \$QNUM bypass"
+    nft "add chain ip \$TABLE prerouting { type filter hook prerouting priority mangle; policy accept; }"
+    nft "add rule ip \$TABLE prerouting ct state invalid counter drop"
+    nft "add rule ip \$TABLE prerouting ct mark \$CT_MARK counter accept"
+    nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue num \$QNUM bypass"
+fi
 
-echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM fwmark=\$FWMARK ctmark=\$CT_MARK)"
+echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM fwmark=\$FWMARK ctmark=\$CT_MARK bridge=\$IS_BRIDGE)"
 
 # Запускаем nfqws2
 exec ${ZAPRET2_BIN} @${ZAPRET2_CONF}
@@ -2225,16 +2238,24 @@ zapret2_apply_nft() {
     nft "add chain ip $_table output { type route hook output priority mangle; policy accept; }"
     nft "add rule ip $_table output meta mark and ${_combined_mark} == ${_combined_mark} ct mark set ${_ct_mark} counter accept"
 
-    nft "add chain ip $_table postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
-    nft "add rule ip $_table postrouting ct mark ${_ct_mark} counter accept"
-    nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] || [ "${NFT_HOOK:-input}" = "forward" ]; then
+        nft "add chain ip $_table forward { type filter hook forward priority mangle; policy accept; }"
+        nft "add rule ip $_table forward ct state invalid counter drop"
+        nft "add rule ip $_table forward ct mark ${_ct_mark} counter accept"
+        nft "add rule ip $_table forward meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
+        nft "add rule ip $_table forward meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
+        log_success "NFT таблица ${_table} применена для Docker bridge (forward: порт=${_port} qnum=${ZAPRET2_QNUM} fwmark=${_fwmark} ctmark=${_ct_mark})"
+    else
+        nft "add chain ip $_table postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
+        nft "add rule ip $_table postrouting ct mark ${_ct_mark} counter accept"
+        nft "add rule ip $_table postrouting meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
 
-    nft "add chain ip $_table prerouting { type filter hook prerouting priority mangle; policy accept; }"
-    nft "add rule ip $_table prerouting ct state invalid counter drop"
-    nft "add rule ip $_table prerouting ct mark ${_ct_mark} counter accept"
-    nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
-
-    log_success "NFT таблица ${_table} применена (порт=${_port} qnum=${ZAPRET2_QNUM} fwmark=${_fwmark} ctmark=${_ct_mark})"
+        nft "add chain ip $_table prerouting { type filter hook prerouting priority mangle; policy accept; }"
+        nft "add rule ip $_table prerouting ct state invalid counter drop"
+        nft "add rule ip $_table prerouting ct mark ${_ct_mark} counter accept"
+        nft "add rule ip $_table prerouting meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
+        log_success "NFT таблица ${_table} применена (порт=${_port} qnum=${ZAPRET2_QNUM} fwmark=${_fwmark} ctmark=${_ct_mark})"
+    fi
 }
 
 zapret2_remove_nft() {
