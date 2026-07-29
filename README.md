@@ -57,7 +57,7 @@ mtpr
 ## Обновления
 
 <details> 
-<summary><b>1.2.5-1.2.7 от 29.07.2026</b></summary>
+<summary><b>1.2.5-1.2.8 от 29.07.2026</b></summary>
 
 - Добавлена поддержка работы Zapret2 для Telemt в контейнере в режиме Bridge.
 - В цепочку forward таблицы MTProto для Docker bridge добавлена поддержка фильтрации по IP контейнера в точном режиме (DOCKER_BRIDGE_MODE="precise" → заполнение ip daddr и ip saddr адресом контейнера).
