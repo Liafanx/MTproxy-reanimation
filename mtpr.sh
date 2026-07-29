@@ -2362,15 +2362,15 @@ zapret2_start_existing() {
         log_error "Zapret2 не установлен — используйте [1] Установить"
         return 1
     fi
-    zapret2_apply_nft || return 1
     systemctl daemon-reload
     systemctl enable "$ZAPRET2_SERVICE" >/dev/null 2>&1 || true
     systemctl start "$ZAPRET2_SERVICE" 2>/dev/null || true
     sleep 1
+    zapret2_apply_nft || return 1
     if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null; then
         ZAPRET2_SERVICE_ENABLED="true"
         save_settings
-        log_success "zapret2 запущен"
+        log_success "zapret2 запущен и NFT правила применены"
     else
         log_error "zapret2 не запустился"
         journalctl -u "$ZAPRET2_SERVICE" -n 10 --no-pager 2>/dev/null || true
@@ -2428,6 +2428,15 @@ zapret2_install() {
             _had_limiter_service="false"
             log_warn "SYN limiter оставлен — возможны конфликты"
         fi
+    fi
+
+    # Если переустановка — останавливаем работающую службу zapret2 перед проверкой очереди
+    if [ "${ZAPRET2_APPLIED:-false}" = "true" ] || systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null 2>&1; then
+        log_info "Остановка службы $ZAPRET2_SERVICE для переустановки..."
+        systemctl stop "$ZAPRET2_SERVICE" 2>/dev/null || true
+        nft delete table ip "${ZAPRET2_NFT_TABLE}" 2>/dev/null || true
+        pkill -f "$ZAPRET2_BIN" 2>/dev/null || true
+        sleep 1
     fi
 
     # Проверяем занятость NFQUEUE
@@ -2532,13 +2541,13 @@ zapret2_update_config() {
     zapret2_write_conf
     zapret2_write_lua
     zapret2_write_service
-    zapret2_apply_nft
     systemctl daemon-reload
     systemctl enable "$ZAPRET2_SERVICE" >/dev/null 2>&1 || true
     systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
     sleep 1
+    zapret2_apply_nft
     if systemctl is-active "$ZAPRET2_SERVICE" &>/dev/null; then
-        log_success "Конфигурация обновлена, zapret2 перезапущен"
+        log_success "Конфигурация обновлена, zapret2 перезапущен, NFT правила переприменены"
     else
         log_error "zapret2 не запустился после обновления конфигурации"
         journalctl -u "$ZAPRET2_SERVICE" -n 10 --no-pager 2>/dev/null || true
@@ -2753,9 +2762,9 @@ show_zapret2_menu() {
             1) zapret2_install ;;
             2)
                 if [ "${ZAPRET2_APPLIED:-false}" = "true" ]; then
-                    zapret2_apply_nft
                     systemctl restart "$ZAPRET2_SERVICE" 2>/dev/null || true
                     sleep 1
+                    zapret2_apply_nft
                     systemctl status "$ZAPRET2_SERVICE" --no-pager -l 2>/dev/null || true
                 else
                     log_info "Zapret2 не установлен — используйте [1]"
@@ -3006,8 +3015,6 @@ show_zapret2_settings_menu() {
                     ZAPRET2_QNUM="$_v"
                     save_settings
                     log_success "NFQUEUE num = ${_v}"
-                    zapret2_remove_nft
-                    zapret2_apply_nft
                     zapret2_update_config
                 elif [ -n "$_v" ]; then
                     log_error "Допустимый диапазон: 0..65535"
@@ -3019,8 +3026,6 @@ show_zapret2_settings_menu() {
                     ZAPRET2_FWMARK="$_v"
                     save_settings
                     log_success "fwmark = ${_v}"
-                    zapret2_remove_nft
-                    zapret2_apply_nft
                     zapret2_update_config
                 fi ;;
             8)
