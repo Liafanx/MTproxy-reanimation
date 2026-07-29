@@ -1,6 +1,6 @@
 # MTproxy-reanimation
 
-**MTproxy-reanimation** — утилита для серверов с **[Telemt](https://github.com/drkctrl/telemt) / [MTProxyMax](https://mtproxymax.com) / других ТГ прокси**, которая стабилизирует первичное TCP-подключение клиентов с помощью **inbound SYN limiter через nftables** или **Zapret2** и применяет базовый безопасный тюнинг Telemt.
+**MTproxy-reanimation** — утилита для серверов с **[Telemt](https://github.com/drkctrl/telemt) / [MTProxyMax](https://github.com/SamNet-dev/MTProxyMax) / других ТГ прокси**, которая стабилизирует первичное TCP-подключение клиентов с помощью **inbound SYN limiter через nftables** или **Zapret2** и применяет базовый безопасный тюнинг Telemt.
 
 За основу взяты мануалы сообщества: [Ссылка №1](https://h1de0x.github.io/telemt-tune) · [Ссылка №2](https://assyoucandy.github.io/telemt-server-guide/) · [Ссылка №3](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [MTPROTO-FIX-By-MEKO](https://github.com/Mekotofeuka/MTPR-FIX-By-MEKO)
 
@@ -57,6 +57,16 @@ mtpr
 ## Обновления
 
 <details>
+<summary><b>1.2.5-1.2.7 от 29.07.2026</b></summary>
+
+- Перевод ссылок установки и автообновления скрипта на ветку **dev**.
+- В цепочку `forward` таблицы `MTProto` для Docker bridge добавлена поддержка фильтрации по IP контейнера в точном режиме (`DOCKER_BRIDGE_MODE="precise"` → заполнение `ip daddr` и `ip saddr` адресом контейнера).
+- Проверена и обеспечена полная совместимость службы отслеживания смены IP контейнера (`generate_bridge_watch_script` / `mtpr-bridge-watch.service`) с Zapret2 (`mtpr-zapret2.service`).
+- Улучшена функция `lets_resend` в Lua-скрипте Zapret2 (`ack0` проверяется на nil перед вычитанием `desync.dis.tcp.th_ack - ack0 >= 1400`).
+
+</details>
+
+<details>
 <summary><b>1.2.3-1.2.4 от 27.07.2026</b></summary>
 
 -исправлен Ip адрес контейнера в правилах NFT Smart
@@ -86,8 +96,11 @@ mtpr
 table ip MTProto {
     chain predefrag   # output priority -401: fwmark accept + notrack
     chain output      # route mangle: ct mark set для marked пакетов
-    chain postrouting # srcnat+1: ct mark accept + queue
-    chain prerouting  # mangle: ct mark accept + queue
+    # Для режима Host / Local:
+    chain postrouting # srcnat+1: ct mark accept + queue на sport
+    chain prerouting  # mangle: ct mark accept + queue на dport
+    # Для режима Docker bridge:
+    chain forward     # filter forward priority mangle: ct mark accept + queue на dport/sport
 }
 ```
 
@@ -176,7 +189,7 @@ Zapret2 fix **заменяет** SYN limiter (Smart By-MEKO / Classic) — пр�
 Zapret2 fix использует [zapret2](https://github.com/bol-van/zapret2) — пакетный манипулятор с Lua-скриптами. Бинарники скачиваются автоматически из официального репозитория при установке.
 
 - Требует Linux с `nftables`
-- Работает с любым Telemt / MTProxyL / MTProxyMax / Docker (нет тестов в режиме bridge), и в теории с другими MTProto прокси
+- Работает с любым Telemt / MTProxyL / MTProxyMax / Docker (включая режим bridge с nft цепочкой forward), и в теории с другими MTProto прокси
 
 </details>
 
@@ -466,8 +479,11 @@ iOS-клиенты автоматически определяются по TCP 
 table ip MTProto {
     chain predefrag   # output -401: пропуск помеченных + notrack
     chain output      # route mangle: ct mark set для marked пакетов
+    # Режим host/local:
     chain postrouting # srcnat+1: ct mark accept + queue на порт
     chain prerouting  # mangle: ct mark accept + queue на порт
+    # Режим Docker bridge:
+    chain forward     # filter forward priority mangle: ct mark accept + queue на dport/sport
 }
 ```
 
