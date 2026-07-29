@@ -2139,6 +2139,11 @@ zapret2_write_service() {
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ] || [ "${NFT_HOOK:-input}" = "forward" ]; then
         _is_bridge="true"
     fi
+    local _is_precise="false"
+    if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
+        _is_precise="true"
+    fi
+    local _container="${DETECTED_CONTAINER}"
 
     cat > "$_nft_script" << NFTSTART
 #!/bin/bash
@@ -2151,6 +2156,8 @@ QNUM="${ZAPRET2_QNUM}"
 CT_MARK="${_ct_mark}"
 COMBINED_MARK="${_combined_mark}"
 IS_BRIDGE="${_is_bridge}"
+IS_PRECISE="${_is_precise}"
+CONTAINER="${_container}"
 
 # Удаляем старую таблицу если есть
 nft delete table ip "\$TABLE" 2>/dev/null || true
@@ -2166,11 +2173,32 @@ nft "add chain ip \$TABLE output { type route hook output priority mangle; polic
 nft "add rule ip \$TABLE output meta mark and \$COMBINED_MARK == \$COMBINED_MARK ct mark set \$CT_MARK counter accept"
 
 if [ "\$IS_BRIDGE" = "true" ]; then
+    DADDR_MATCH=""
+    SADDR_MATCH=""
+    if [ "\$IS_PRECISE" = "true" ] && [ -n "\$CONTAINER" ]; then
+        CIP=""
+        for i in \$(seq 1 30); do
+            RUNNING="\$(docker inspect -f '{{.State.Running}}' "\$CONTAINER" 2>/dev/null || true)"
+            if [ "\$RUNNING" = "true" ]; then
+                CIP="\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "\$CONTAINER" 2>/dev/null | awk 'NF {print; exit}')"
+                [ -n "\$CIP" ] && break
+            fi
+            sleep 1
+        done
+        if [ -n "\$CIP" ]; then
+            DADDR_MATCH="ip daddr \$CIP "
+            SADDR_MATCH="ip saddr \$CIP "
+            echo "MTproxy-reanimation: zapret2 bridge precise mode with container IP \$CIP"
+        else
+            echo "MTproxy-reanimation: warning - could not detect container IP for \$CONTAINER, applying without IP match" >&2
+        fi
+    fi
+
     nft "add chain ip \$TABLE forward { type filter hook forward priority mangle; policy accept; }"
     nft "add rule ip \$TABLE forward ct state invalid counter drop"
     nft "add rule ip \$TABLE forward ct mark \$CT_MARK counter accept"
-    nft "add rule ip \$TABLE forward meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue num \$QNUM bypass"
-    nft "add rule ip \$TABLE forward meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue num \$QNUM bypass"
+    nft "add rule ip \$TABLE forward \${DADDR_MATCH}meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue num \$QNUM bypass"
+    nft "add rule ip \$TABLE forward \${SADDR_MATCH}meta mark and \$FWMARK == 0x00000000 tcp sport \$PORT counter queue num \$QNUM bypass"
 else
     nft "add chain ip \$TABLE postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
     nft "add rule ip \$TABLE postrouting ct mark \$CT_MARK counter accept"
@@ -2182,7 +2210,7 @@ else
     nft "add rule ip \$TABLE prerouting meta mark and \$FWMARK == 0x00000000 tcp dport \$PORT counter queue num \$QNUM bypass"
 fi
 
-echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM fwmark=\$FWMARK ctmark=\$CT_MARK bridge=\$IS_BRIDGE)"
+echo "MTproxy-reanimation: NFT table \$TABLE applied (port=\$PORT qnum=\$QNUM fwmark=\$FWMARK ctmark=\$CT_MARK bridge=\$IS_BRIDGE precise=\$IS_PRECISE)"
 
 # Запускаем nfqws2
 exec ${ZAPRET2_BIN} @${ZAPRET2_CONF}
@@ -2212,6 +2240,30 @@ EOF
     systemctl daemon-reload
     systemctl reset-failed "${ZAPRET2_SERVICE}" 2>/dev/null || true
     log_success "Служба создана: ${ZAPRET2_SERVICE}"
+
+    if [ "$DETECTED_NETWORK_MODE" = "bridge" ] && [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
+        generate_bridge_watch_script
+        cat > "/etc/systemd/system/${WATCHER_UNIT}" << EOF
+[Unit]
+Description=MTproxy-reanimation Docker bridge watcher
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${WATCHER_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable "$WATCHER_UNIT" 2>/dev/null || true
+        systemctl restart "$WATCHER_UNIT" 2>/dev/null || true
+        log_success "Установлена watcher-служба для точного Docker-режима (zapret2)"
+    fi
 }
 
 zapret2_apply_nft() {
@@ -2239,11 +2291,24 @@ zapret2_apply_nft() {
     nft "add rule ip $_table output meta mark and ${_combined_mark} == ${_combined_mark} ct mark set ${_ct_mark} counter accept"
 
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ] || [ "${NFT_HOOK:-input}" = "forward" ]; then
+        local _daddr_match="" _saddr_match=""
+        if [ "${DOCKER_BRIDGE_MODE:-simple}" = "precise" ]; then
+            local _cip
+            _cip=$(docker_container_ip "$DETECTED_CONTAINER" 2>/dev/null || true)
+            if [ -n "$_cip" ]; then
+                _daddr_match="ip daddr ${_cip} "
+                _saddr_match="ip saddr ${_cip} "
+                log_info "Zapret2 bridge/precise: IP контейнера ${_cip}"
+            else
+                log_warn "Zapret2 bridge/precise: IP контейнера не определён, правила будут без ip daddr/saddr"
+            fi
+        fi
+
         nft "add chain ip $_table forward { type filter hook forward priority mangle; policy accept; }"
         nft "add rule ip $_table forward ct state invalid counter drop"
         nft "add rule ip $_table forward ct mark ${_ct_mark} counter accept"
-        nft "add rule ip $_table forward meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
-        nft "add rule ip $_table forward meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
+        nft "add rule ip $_table forward ${_daddr_match}meta mark and $_fwmark == 0x00000000 tcp dport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
+        nft "add rule ip $_table forward ${_saddr_match}meta mark and $_fwmark == 0x00000000 tcp sport ${_port} counter queue num ${ZAPRET2_QNUM} bypass"
         log_success "NFT таблица ${_table} применена для Docker bridge (forward: порт=${_port} qnum=${ZAPRET2_QNUM} fwmark=${_fwmark} ctmark=${_ct_mark})"
     else
         nft "add chain ip $_table postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }"
@@ -3526,7 +3591,11 @@ while true; do
 
         if [ -n "\$IP" ] && [ "\$IP" != "\$LAST_IP" ]; then
             echo "Container IP changed: \${LAST_IP:-none} -> \$IP"
-            /bin/sh "\$NFT_SCRIPT" || true
+            if systemctl is-active mtpr-zapret2.service >/dev/null 2>&1 || systemctl is-enabled mtpr-zapret2.service >/dev/null 2>&1; then
+                systemctl restart mtpr-zapret2.service || true
+            elif [ -f "\$NFT_SCRIPT" ]; then
+                /bin/sh "\$NFT_SCRIPT" || true
+            fi
             LAST_IP="\$IP"
         fi
     else
