@@ -3960,6 +3960,9 @@ show_header() {
     local _ios_status;  _ios_status=$(ios_fix_status)
     local _ios2_status; _ios2_status=$(ios2_fix_status)
 
+    echo -e "${YELLOW}⚠ MTproxy-reanimation больше не развивается отдельно.${NC}"
+    echo -e "${YELLOW}  Функционал перенесён в MTProxyL (режим Reanimator): https://github.com/Liafanx/MTProxyL${NC}"
+    echo ""
     echo -e "  ${BOLD}Обнаружение:${NC}   ${DETECTED_MODE:-не найден}$([ -n "$DETECTED_CONTAINER" ] && echo " (${DETECTED_CONTAINER})")"
     if [ "$DETECTED_NETWORK_MODE" = "bridge" ]; then
         echo -e "  ${BOLD}Сеть:${NC}          bridge → hook ${NFT_HOOK} (${DOCKER_BRIDGE_MODE})"
