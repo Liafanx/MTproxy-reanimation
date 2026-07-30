@@ -1,5 +1,7 @@
 # MTproxy-reanimation
 
+> ⚠️ **Проект больше не развивается отдельно.** Весь функционал (детект существующей установки telemt + NFT SYN limiter + Zapret2 MTProto fix + iOS/By-MEKO фиксы) перенесён в **[MTProxyL](https://github.com/Liafanx/MTProxyL)** как режим **Reanimator** (`mtproxyl mode reanimator`). Новые фиксы и обновления выходят только там — переходите на MTProxyL. Текущая версия этого репозитория (1.2.9) финальная.
+
 **MTproxy-reanimation** — утилита для серверов с **[Telemt](https://github.com/drkctrl/telemt) / [MTProxyMax](https://github.com/SamNet-dev/MTProxyMax) / других ТГ прокси**, которая стабилизирует первичное TCP-подключение клиентов с помощью **inbound SYN limiter через nftables** или **Zapret2** и применяет базовый безопасный тюнинг Telemt.
 
 За основу взяты мануалы сообщества: [Ссылка №1](https://h1de0x.github.io/telemt-tune) · [Ссылка №2](https://assyoucandy.github.io/telemt-server-guide/) · [Ссылка №3](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [MTPROTO-FIX-By-MEKO](https://github.com/Mekotofeuka/MTPR-FIX-By-MEKO)

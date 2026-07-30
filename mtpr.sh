@@ -4744,6 +4744,9 @@ check_for_update() {
 # ── Главная точка входа ───────────────────────────────────────
 main() {
     check_root
+    echo -e "${YELLOW}⚠ MTproxy-reanimation больше не развивается отдельно.${NC}"
+    echo -e "${YELLOW}  Функционал перенесён в MTProxyL (режим Reanimator): https://github.com/Liafanx/MTProxyL${NC}"
+    echo ""
     mkdir -p "$INSTALL_DIR"
     local _self="${BASH_SOURCE[0]}"
     if [ -f "$_self" ] && \
